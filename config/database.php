@@ -54,6 +54,15 @@ return [
             'unix_socket' => env('DB_SOCKET', ''),
             'charset' => env('DB_CHARSET', 'utf8mb4'),
             'collation' => env('DB_COLLATION', 'utf8mb4_unicode_ci'),
+            // Without this, MySQL's own session time_zone (its "SYSTEM"
+            // default) governs how TIMESTAMP columns like upload_date
+            // convert on read/write — separate from APP_TIMEZONE entirely.
+            // Locally that server default happens to already be Asia/Manila
+            // (coincidence, not configuration); Railway's managed MySQL
+            // defaults to UTC, an 8-hour gap from APP_TIMEZONE, which is
+            // why "just uploaded" showed as "8 hours ago" there. Forcing it
+            // here matches APP_TIMEZONE everywhere, not just by luck.
+            'timezone' => '+08:00',
             'prefix' => '',
             'prefix_indexes' => true,
             'strict' => true,

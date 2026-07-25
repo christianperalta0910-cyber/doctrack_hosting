@@ -1,0 +1,11 @@
+Company Job Order Form
+Job Order No: JO-2026-0001
+
+SAMPLE UPLOAD DOCUMENT — for testing file upload only, not a real request.
+
+Requested by: Sample Requester (Test Upload), on behalf of Sample Department.
+Date requested: Sample Date.
+
+Description of work: this placeholder document exists to verify that PDF,
+DOCX, DOC, TXT, PNG, JPG, and JPEG uploads are all processed correctly by
+the system for the Job Order category.
