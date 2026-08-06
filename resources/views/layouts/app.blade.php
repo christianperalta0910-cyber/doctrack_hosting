@@ -134,6 +134,9 @@
 </div>
 @auth
     <x-document-viewer-modal />
+    @if(auth()->user()->isAdmin())
+        <x-kpi-drilldown-modal />
+    @endif
 @endauth
 <script>
     // Live relative-time updater (Feature: SLA countdowns/expiries update in

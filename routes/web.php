@@ -127,6 +127,7 @@ Route::middleware('auth')->group(function () {
         // Same live-poll pair pattern as the approver/originator dashboards.
         Route::get('/dashboard/poll', [AdminController::class, 'overviewPoll'])->middleware('throttle:30,1')->name('dashboard.poll');
         Route::get('/dashboard/refresh', [AdminController::class, 'overviewRefresh'])->middleware('throttle:30,1')->name('dashboard.refresh');
+        Route::get('/dashboard/drilldown/{type}', [AdminController::class, 'dashboardDrilldown'])->middleware('throttle:30,1')->name('dashboard.drilldown');
 
         Route::get('/users', [AdminController::class, 'users'])->name('users');
         Route::get('/users/refresh', [AdminController::class, 'usersRefresh'])->name('users.refresh');

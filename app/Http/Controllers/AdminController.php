@@ -51,6 +51,8 @@ class AdminController extends Controller
             'approved' => DocumentRepository::whereIn('global_status', ['approved', 'auto_approved'])->count(),
             'rejected' => DocumentRepository::where('global_status', 'rejected')->count(),
             'active_users' => User::where('is_active', true)->count(),
+            'ml_review_count' => DocumentRepository::where('ml_review_status', 'pending')->count(),
+            'violations_count' => SlaViolation::count(),
         ];
 
         $slaAlerts = DocumentAssignment::where('escalated_to_admin', true)
@@ -65,13 +67,82 @@ class AdminController extends Controller
         return [$stats, $slaAlerts, $reviewCount];
     }
 
+    /**
+     * Heavier "module overview" data — category breakdown, approver
+     * workload, and a recent-activity feed — split out from overviewData()
+     * so overviewPoll() (fired every ~45-75s purely to detect change)
+     * stays cheap; only the full-page dashboard() and its live-swap
+     * counterpart overviewRefresh() need this.
+     */
+    private function dashboardExtras(): array
+    {
+        $categoryBreakdown = DocumentRepository::whereNotNull('ml_category')
+            ->selectRaw('ml_category, count(*) as total')
+            ->groupBy('ml_category')
+            ->pluck('total', 'ml_category');
+
+        $approverWorkload = User::where('role', 'approver')->where('is_active', true)
+            ->withCount(['assignmentsAsApprover as pending_count' => function ($q) {
+                $q->where('individual_status', 'pending');
+            }])
+            ->orderByDesc('pending_count')
+            ->get();
+
+        $recentActivity = AuditLog::with(['user', 'document'])->orderByDesc('timestamp')->limit(8)->get();
+
+        return [$categoryBreakdown, $approverWorkload, $recentActivity];
+    }
+
     /** Admin control-center overview. */
     public function dashboard()
     {
         [$stats, $slaAlerts, $reviewCount] = $this->overviewData();
+        [$categoryBreakdown, $approverWorkload, $recentActivity] = $this->dashboardExtras();
         $activeModel = MlModelRepository::active();
 
-        return view('admin.dashboard', compact('stats', 'slaAlerts', 'reviewCount', 'activeModel'));
+        return view('admin.dashboard', compact(
+            'stats', 'slaAlerts', 'reviewCount', 'activeModel',
+            'categoryBreakdown', 'approverWorkload', 'recentActivity'
+        ));
+    }
+
+    /**
+     * Fragment listing the documents/users behind a clicked KPI card
+     * (Feature: clickable dashboard cards) — reuses the exact same
+     * global_status groupings as overviewData()'s stats, so the list
+     * shown always matches what the card's own number counted.
+     */
+    public function dashboardDrilldown(string $type)
+    {
+        $labels = [
+            'total' => 'All Documents',
+            'pending' => 'In Progress',
+            'approved' => 'Approved',
+            'rejected' => 'Rejected',
+            'users' => 'Active Users',
+        ];
+        abort_unless(array_key_exists($type, $labels), 404);
+
+        if ($type === 'users') {
+            $users = User::where('is_active', true)->orderBy('full_name')->limit(100)->get();
+
+            return view('admin.partials.dashboard-drilldown-users', ['users' => $users, 'label' => $labels[$type]]);
+        }
+
+        $query = DocumentRepository::with('originator')->orderByDesc('upload_date');
+        match ($type) {
+            'pending' => $query->whereIn('global_status', ['processing', 'classified_validated']),
+            'approved' => $query->whereIn('global_status', ['approved', 'auto_approved']),
+            'rejected' => $query->where('global_status', 'rejected'),
+            default => null, // 'total' — no filter
+        };
+
+        $total = $query->count();
+        $documents = $query->limit(50)->get();
+
+        return view('admin.partials.dashboard-drilldown-documents', [
+            'documents' => $documents, 'total' => $total, 'label' => $labels[$type],
+        ]);
     }
 
     /**
@@ -87,9 +158,13 @@ class AdminController extends Controller
     public function overviewRefresh()
     {
         [$stats, $slaAlerts, $reviewCount] = $this->overviewData();
+        [$categoryBreakdown, $approverWorkload, $recentActivity] = $this->dashboardExtras();
         $activeModel = MlModelRepository::active();
 
-        return view('admin.partials.overview', compact('stats', 'slaAlerts', 'reviewCount', 'activeModel'));
+        return view('admin.partials.overview', compact(
+            'stats', 'slaAlerts', 'reviewCount', 'activeModel',
+            'categoryBreakdown', 'approverWorkload', 'recentActivity'
+        ));
     }
 
     /**
@@ -102,7 +177,21 @@ class AdminController extends Controller
     {
         [$stats, $slaAlerts, $reviewCount] = $this->overviewData();
 
-        return response()->json(['stats' => $stats, 'sla_alert_count' => $slaAlerts->count(), 'review_count' => $reviewCount]);
+        return response()->json([
+            'stats' => $stats,
+            'sla_alert_count' => $slaAlerts->count(),
+            'review_count' => $reviewCount,
+            // Fallback-path signals for what AdminActivityLogged covers over
+            // the WebSocket — the poll can't "listen" for that event, so it
+            // detects the same changes structurally instead: a new audit
+            // log row covers logins/uploads/decisions/escalations/etc.,
+            // and a busy-flag signature covers is_busy toggles specifically
+            // (that path writes no audit log, so latest_log_id alone
+            // wouldn't catch it — see User::booted()).
+            'latest_log_id' => AuditLog::max('log_id'),
+            'busy_signature' => User::where('role', 'approver')->orderBy('user_id')
+                ->pluck('is_busy')->map(fn ($busy) => $busy ? '1' : '0')->implode(','),
+        ]);
     }
 
     // ---------------------------------------------------------------

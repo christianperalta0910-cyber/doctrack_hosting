@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(php artisan test)",
+      "Bash(php artisan test *)",
+      "Bash(npm run build)",
+      "Bash(php artisan route:list)",
+      "Bash(php artisan route:list *)",
+      "Bash(php artisan migrate:status)",
+      "Bash(composer show)",
+      "Bash(composer show *)",
+      "Bash(crontab -l)",
+      "Bash(systemctl status *)",
+      "Bash(systemctl --user status *)"
+    ]
+  }
+}

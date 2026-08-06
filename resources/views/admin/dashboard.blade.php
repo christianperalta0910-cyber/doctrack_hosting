@@ -32,6 +32,11 @@
         };
 
         startLiveChannel('admin-dashboard', '.document.status-changed', opts);
+        // Covers everything else on this page — logins, uploads, decisions,
+        // SLA escalations, approver availability toggles — that isn't a
+        // document status change but still needs Recent Activity/Approver
+        // Workload/etc. to update live (see AdminActivityLogged).
+        startLiveChannel('admin-dashboard', '.admin.activity-logged', opts);
         startLivePoll({ ...opts, pollUrl: overviewEl.dataset.pollUrl });
     });
 </script>

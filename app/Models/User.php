@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Events\AdminActivityLogged;
 use App\Mail\ResetPasswordMail;
 use App\Mail\VerifyAccountMail;
 use Illuminate\Contracts\Auth\MustVerifyEmail;
@@ -38,6 +39,21 @@ class User extends Authenticatable implements MustVerifyEmail
         'is_busy' => 'boolean',
         'email_verified_at' => 'datetime',
     ];
+
+    /**
+     * toggleAvailability() (ApprovalController) flips is_busy without
+     * writing an audit log entry — this is the only path that changes,
+     * so unlike everything else the admin dashboard's Approver Workload
+     * panel depends on, it needs its own explicit live-update hook.
+     */
+    protected static function booted(): void
+    {
+        static::updated(function (self $user) {
+            if ($user->wasChanged('is_busy')) {
+                event(new AdminActivityLogged());
+            }
+        });
+    }
 
     /**
      * Laravel's auth guard expects a `password` attribute/column by default.

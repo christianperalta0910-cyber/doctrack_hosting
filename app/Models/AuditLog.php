@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Events\AdminActivityLogged;
 use Illuminate\Database\Eloquent\Model;
 
 class AuditLog extends Model
@@ -43,6 +44,15 @@ class AuditLog extends Model
 
         static::deleting(function () {
             throw new \LogicException('Audit log entries are immutable and cannot be deleted.');
+        });
+
+        // Nearly every meaningful admin-relevant action writes an audit
+        // log row (login, upload, decision, escalation, override, ...) —
+        // one hook here keeps the admin dashboard's Recent Activity feed
+        // (and everything else in that fragment) live without needing a
+        // broadcast call added at every individual call site.
+        static::created(function (self $log) {
+            event(new AdminActivityLogged());
         });
     }
 
