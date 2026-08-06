@@ -129,7 +129,12 @@ class AdminController extends Controller
             return view('admin.partials.dashboard-drilldown-users', ['users' => $users, 'label' => $labels[$type]]);
         }
 
+        $showDecision = in_array($type, ['approved', 'rejected'], true);
+
         $query = DocumentRepository::with('originator')->orderByDesc('upload_date');
+        if ($showDecision) {
+            $query->with(['assignments.approver', 'assignments.adminOverrideBy']);
+        }
         match ($type) {
             'pending' => $query->whereIn('global_status', ['processing', 'classified_validated']),
             'approved' => $query->whereIn('global_status', ['approved', 'auto_approved']),
@@ -140,9 +145,53 @@ class AdminController extends Controller
         $total = $query->count();
         $documents = $query->limit(50)->get();
 
+        $decisions = $showDecision
+            ? $documents->mapWithKeys(fn (DocumentRepository $doc) => [$doc->document_id => $this->resolveDecision($doc)])
+            : null;
+
         return view('admin.partials.dashboard-drilldown-documents', [
-            'documents' => $documents, 'total' => $total, 'label' => $labels[$type],
+            'documents' => $documents, 'total' => $total, 'label' => $labels[$type], 'decisions' => $decisions,
         ]);
+    }
+
+    /**
+     * Who actually decided a document's fate, and when — used by the
+     * Approved/Rejected dashboard drill-downs. Not simply "the last stage
+     * on record": a rejection auto-closes every other pending stage with a
+     * system-generated "Auto-closed" comment (see WorkflowService::
+     * completeStage()), and stages can complete out of sequence order, so
+     * the deciding assignment is whichever one actually has the latest
+     * acted_at among the ones that genuinely drove the outcome.
+     */
+    private function resolveDecision(DocumentRepository $doc): array
+    {
+        if ($doc->is_legacy_import) {
+            return ['by' => 'Admin (Legacy Import)', 'at' => $doc->upload_date];
+        }
+
+        $wantStatus = $doc->global_status === 'rejected' ? 'rejected' : 'approved';
+
+        $decisive = $doc->assignments
+            ->where('individual_status', $wantStatus)
+            ->when($wantStatus === 'rejected', fn ($c) => $c->filter(
+                fn (DocumentAssignment $a) => !str_starts_with((string) $a->comments, 'Auto-closed')
+            ))
+            ->sortByDesc('acted_at')
+            ->first();
+
+        if (!$decisive) {
+            return ['by' => '—', 'at' => null];
+        }
+
+        if ($decisive->admin_override_by) {
+            return ['by' => ($decisive->adminOverrideBy->full_name ?? 'Admin') . ' (Override)', 'at' => $decisive->admin_override_at];
+        }
+
+        if ($decisive->auto_approved) {
+            return ['by' => 'System (Auto-Approved)', 'at' => $decisive->acted_at];
+        }
+
+        return ['by' => $decisive->approver->full_name ?? '—', 'at' => $decisive->acted_at];
     }
 
     /**

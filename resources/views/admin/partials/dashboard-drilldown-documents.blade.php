@@ -11,6 +11,10 @@
                 <th class="px-4 py-2">Originator</th>
                 <th class="px-4 py-2">Uploaded</th>
                 <th class="px-4 py-2">Status</th>
+                @if($decisions)
+                    <th class="px-4 py-2">{{ $label === 'Rejected' ? 'Rejected By' : 'Approved By' }}</th>
+                    <th class="px-4 py-2">Decided At</th>
+                @endif
             </tr>
         </thead>
         <tbody class="divide-y divide-surface-100">
@@ -21,9 +25,14 @@
                     <td class="px-4 py-2.5 text-surface-600">{{ $doc->originator->full_name ?? '—' }}</td>
                     <td class="px-4 py-2.5 text-surface-500 whitespace-nowrap">{{ $doc->upload_date?->format('M j, Y g:i A') }}</td>
                     <td class="px-4 py-2.5"><x-status-badge :status="$doc->global_status" /></td>
+                    @if($decisions)
+                        @php $decision = $decisions[$doc->document_id]; @endphp
+                        <td class="px-4 py-2.5 text-surface-600">{{ $decision['by'] }}</td>
+                        <td class="px-4 py-2.5 text-surface-500 whitespace-nowrap">{{ $decision['at']?->format('M j, Y g:i A') ?? '—' }}</td>
+                    @endif
                 </tr>
             @empty
-                <tr><td colspan="5" class="px-6 py-10 text-center text-sm text-surface-400">No documents in this category yet.</td></tr>
+                <tr><td colspan="{{ $decisions ? 7 : 5 }}" class="px-6 py-10 text-center text-sm text-surface-400">No documents in this category yet.</td></tr>
             @endforelse
         </tbody>
     </table>
