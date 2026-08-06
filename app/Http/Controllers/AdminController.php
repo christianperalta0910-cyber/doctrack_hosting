@@ -184,11 +184,11 @@ class AdminController extends Controller
         }
 
         if ($decisive->admin_override_by) {
-            return ['by' => ($decisive->adminOverrideBy->full_name ?? 'Admin') . ' (Override)', 'at' => $decisive->admin_override_at];
+            return ['by' => 'Admin Override', 'at' => $decisive->admin_override_at];
         }
 
         if ($decisive->auto_approved) {
-            return ['by' => 'System (Auto-Approved)', 'at' => $decisive->acted_at];
+            return ['by' => 'System Auto-Approval', 'at' => $decisive->acted_at];
         }
 
         return ['by' => $decisive->approver->full_name ?? '—', 'at' => $decisive->acted_at];
