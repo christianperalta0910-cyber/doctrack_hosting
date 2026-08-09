@@ -11,10 +11,12 @@ use Symfony\Component\Process\Process;
  * {timestamp} matches the suffix backup:run produced, e.g.
  * "2026-07-16_143000" for db_2026-07-16_143000.sql.gz.
  *
- * Destructive: overwrites the live database and storage/app/{documents,
- * ml_models,ml_datasets} with the backup's contents. Requires --force
- * because there's no reasonable default here — a mistyped timestamp
- * pointed at production would be a real incident, not a rounding error.
+ * Destructive: overwrites the live database and storage/app/{ml_models,
+ * ml_datasets} with the backup's contents (uploaded documents aren't part
+ * of this backup at all — see BackupSystem's class docblock for why).
+ * Requires --force because there's no reasonable default here — a
+ * mistyped timestamp pointed at production would be a real incident, not
+ * a rounding error.
  */
 class RestoreBackup extends Command
 {

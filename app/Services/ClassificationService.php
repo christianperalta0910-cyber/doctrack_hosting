@@ -148,13 +148,23 @@ class ClassificationService
         //    We store the SVM via php-ml's ModelManager and the fitted
         //    vectorizer + tfidf objects in a serialized sidecar.
         $stamp = (string) now()->timestamp;
-        $svmPath = storage_path("app/ml_models/svm_{$stamp}.model");
+        $diskModelPath = "ml_models/svm_{$stamp}.model";
         $sidecarPath = "ml_models/pipeline_{$stamp}.bin";
 
-        @mkdir(dirname($svmPath), 0775, true);
-        (new ModelManager())->saveToFile($svm, $svmPath);
+        // ModelManager (php-ai/php-ml) only knows how to write to a real
+        // local filesystem path — it has no concept of Laravel's Storage
+        // disks. Save to a local temp file first, then push those bytes
+        // onto whichever disk is actually configured (S3-compatible object
+        // storage in production, e.g. Cloudflare R2, since local disk
+        // doesn't survive a Railway redeploy — same reasoning as
+        // WorkflowService::ingest()'s matching fix for uploaded documents),
+        // and clean up the temp copy. classify() below reverses this.
+        $tempModelPath = tempnam(sys_get_temp_dir(), 'svm_train_');
+        (new ModelManager())->saveToFile($svm, $tempModelPath);
+        Storage::put($diskModelPath, file_get_contents($tempModelPath));
+        @unlink($tempModelPath);
 
-        Storage::disk('local')->put($sidecarPath, serialize([
+        Storage::put($sidecarPath, serialize([
             'vectorizer' => $vectorizer, // fitted — reused verbatim at inference
             'tfidf' => $tfIdf,           // fitted IDF weights
         ]));
@@ -171,7 +181,9 @@ class ClassificationService
             // staged sample; only this accuracy estimate uses temporary
             // held-out folds, discarded once the score is computed.
             'accuracy_score' => $this->estimateAccuracyViaCrossValidation($samplesByCategory),
-            'model_file_path' => $svmPath,
+            // Disk-relative path (config('filesystems.default')), not an
+            // absolute local filesystem path — see classify() below.
+            'model_file_path' => $diskModelPath,
             'training_sample_count' => count($samples),
             'is_active' => true,
             'last_trained' => now(),
@@ -187,26 +199,35 @@ class ClassificationService
     {
         $model = MlModelRepository::active();
 
-        if (!$model || !$model->model_file_path || !file_exists($model->model_file_path)) {
+        if (!$model || !$model->model_file_path || !Storage::exists($model->model_file_path)) {
             return ['category' => 'Unclassified', 'confidence' => 0.0, 'model_id' => null];
         }
 
         $stamp = preg_replace('/\D/', '', basename($model->model_file_path));
         $sidecarPath = "ml_models/pipeline_{$stamp}.bin";
-        if (!Storage::disk('local')->exists($sidecarPath)) {
+        if (!Storage::exists($sidecarPath)) {
             return ['category' => 'Unclassified', 'confidence' => 0.0, 'model_id' => $model->model_id];
         }
 
         // Reuse the exact fitted vectorizer + tfidf objects from training so
         // feature indices align with what the SVM learned.
-        $pipeline = unserialize(Storage::disk('local')->get($sidecarPath));
+        $pipeline = unserialize(Storage::get($sidecarPath));
         /** @var TokenCountVectorizer $vectorizer */
         $vectorizer = $pipeline['vectorizer'];
         /** @var TfIdfTransformer $tfIdf */
         $tfIdf = $pipeline['tfidf'];
 
-        /** @var SVC $svm */
-        $svm = (new ModelManager())->restoreFromFile($model->model_file_path);
+        // ModelManager only knows how to read a real local filesystem path —
+        // download from the configured disk to a local temp file first,
+        // same reasoning as train() above, then clean up.
+        $tempModelPath = tempnam(sys_get_temp_dir(), 'svm_restore_');
+        file_put_contents($tempModelPath, Storage::get($model->model_file_path));
+        try {
+            /** @var SVC $svm */
+            $svm = (new ModelManager())->restoreFromFile($tempModelPath);
+        } finally {
+            @unlink($tempModelPath);
+        }
 
         $sample = [$this->preprocess($text)];
         $vectorizer->transform($sample); // uses the already-fitted vocabulary
