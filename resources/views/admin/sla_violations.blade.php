@@ -17,17 +17,17 @@
         <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
             <p class="text-xs text-surface-500 mb-1">Top Approver</p>
             <p class="text-sm font-semibold text-surface-900">{{ optional($byApprover->first()?->approver)->full_name ?? '—' }}</p>
-            <p class="text-xs text-surface-400">{{ $byApprover->first()->total ?? 0 }} breach(es)</p>
+            <p class="text-xs text-surface-400">{{ $byApprover->first()->total ?? 0 }} violation(s)</p>
         </div>
         <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
             <p class="text-xs text-surface-500 mb-1">Top Bottleneck Stage</p>
             <p class="text-sm font-semibold text-surface-900">{{ $byStage->first()->stage_name ?? '—' }}</p>
-            <p class="text-xs text-surface-400">{{ $byStage->first()->total ?? 0 }} breach(es)</p>
+            <p class="text-xs text-surface-400">{{ $byStage->first()->total ?? 0 }} violation(s)</p>
         </div>
         <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
             <p class="text-xs text-surface-500 mb-1">Top Category</p>
             <p class="text-sm font-semibold text-surface-900">{{ $byCategory->ml_category ?? '—' }}</p>
-            <p class="text-xs text-surface-400">{{ $byCategory->total ?? 0 }} breach(es)</p>
+            <p class="text-xs text-surface-400">{{ $byCategory->total ?? 0 }} violation(s)</p>
         </div>
         <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
             <p class="text-xs text-surface-500 mb-1">Disputed</p>
@@ -41,7 +41,7 @@
     <details class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden group [&_summary::-webkit-details-marker]:hidden">
         <summary class="px-6 py-4 cursor-pointer select-none text-sm font-semibold text-primary-700 hover:bg-surface-50 flex items-center gap-2">
             <svg class="w-4 h-4 transition-transform group-open:rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
-            View All Approvers &amp; Breach Counts
+            View All Approvers &amp; Violation Counts
         </summary>
 
         <div class="px-6 py-4 bg-surface-50/50 border-t border-surface-200">
@@ -61,7 +61,7 @@
                                     </div>
                                 </div>
                                 <div class="text-right shrink-0">
-                                    <p class="font-semibold {{ $approver->breach_count > 0 ? 'text-rejected-700' : 'text-approved-700' }}">{{ $approver->breach_count }} breach{{ $approver->breach_count === 1 ? '' : 'es' }}</p>
+                                    <p class="font-semibold {{ $approver->violation_count > 0 ? 'text-rejected-700' : 'text-approved-700' }}">{{ $approver->violation_count }} violation{{ $approver->violation_count === 1 ? '' : 's' }}</p>
                                     <p class="text-surface-400">of {{ $approver->assignment_count }} assigned</p>
                                 </div>
                             </summary>
@@ -70,10 +70,10 @@
                                 @forelse($categoryBreakdown as $row)
                                     <p class="text-[11px] text-surface-600 flex items-center justify-between py-1 border-b border-surface-100 last:border-0">
                                         <span>{{ $row->ml_category }}</span>
-                                        <span class="font-semibold text-rejected-700">{{ $row->total }} breach{{ $row->total === 1 ? '' : 'es' }}</span>
+                                        <span class="font-semibold text-rejected-700">{{ $row->total }} violation{{ $row->total === 1 ? '' : 's' }}</span>
                                     </p>
                                 @empty
-                                    <p class="text-[11px] text-surface-400 py-1">No breaches recorded.</p>
+                                    <p class="text-[11px] text-surface-400 py-1">No violations recorded.</p>
                                 @endforelse
                             </div>
                         </details>
@@ -113,7 +113,7 @@
                     <div class="w-24 h-6 ml-5 rounded-t-lg bg-gradient-to-br from-primary-300 to-primary-500 group-hover:from-primary-400 group-hover:to-primary-600 transition-colors"></div>
                     <div class="-mt-px h-32 rounded-b-xl rounded-tr-xl bg-gradient-to-br from-primary-400 to-primary-600 group-hover:from-primary-500 group-hover:to-primary-700 shadow-lg group-hover:shadow-xl group-hover:-translate-y-0.5 transition-all flex flex-col items-center justify-center text-center px-4">
                         <h3 class="text-sm font-semibold text-white drop-shadow-sm">{{ $folder->category }}</h3>
-                        <p class="text-xs text-primary-100 mt-0.5">{{ $folder->total }} breach{{ $folder->total === 1 ? '' : 'es' }}</p>
+                        <p class="text-xs text-primary-100 mt-0.5">{{ $folder->total }} violation{{ $folder->total === 1 ? '' : 's' }}</p>
                     </div>
                 </a>
             @endforeach
@@ -161,7 +161,7 @@
                 </form>
             </div>
 
-            <div id="violations-results" data-refresh-url="{{ route('admin.sla.violations.refresh') }}">
+            <div id="violations-results" data-refresh-url="{{ route('admin.sla.violations.refresh') }}" data-poll-url="{{ route('admin.sla.violations.poll') }}">
                 @include('admin.partials.violations_results')
             </div>
         </div>
@@ -175,7 +175,16 @@
     // for the full reasoning. Keyword is debounced; category/date fire
     // immediately on change. The <form>/Filter button remain a working
     // no-JS fallback.
-    (function () {
+    //
+    // Wrapped in DOMContentLoaded, not a bare IIFE — app.js (which defines
+    // startLiveChannel/startLivePoll) loads as a deferred Vite module, so
+    // a plain inline script reaching those calls before the page finishes
+    // parsing throws a silent ReferenceError and never runs — everything
+    // below that call silently never executes. The search/filter/
+    // pagination bindings above don't depend on app.js, so they kept
+    // working and made the page look fully wired when the realtime half
+    // never was.
+    document.addEventListener('DOMContentLoaded', function () {
         const resultsEl = document.getElementById('violations-results');
         if (!resultsEl) return;
 
@@ -234,6 +243,24 @@
                 })
                 .catch(() => {});
         });
-    })();
+
+        // Live-updates the moment a new violation/override happens anywhere
+        // else — same 'admin-dashboard' channel every other admin module
+        // uses. preserveQueryString picks up whatever runSearch() above
+        // last set via replaceState, so a live swap still respects the
+        // currently applied filters/search term instead of clobbering them
+        // with the unfiltered list. Skipped entirely while the admin is
+        // actively typing a search term, same reasoning as Document
+        // Tracking — the debounced search already owns the fragment then.
+        const opts = {
+            refreshUrl,
+            target: resultsEl,
+            preserveQueryString: true,
+            isBusy: () => document.activeElement === documentInput,
+        };
+
+        startLiveChannel('admin-dashboard', '.admin.activity-logged', opts);
+        startLivePoll({ ...opts, pollUrl: resultsEl.dataset.pollUrl });
+    });
 </script>
 @endsection

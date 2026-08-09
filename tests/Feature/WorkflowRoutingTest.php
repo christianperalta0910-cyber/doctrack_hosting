@@ -42,25 +42,114 @@ test('a validated document is routed to every configured stage for its category'
     expect(DocumentAssignment::where('document_id', $document->document_id)->count())->toBe(2);
 });
 
-test('a stage is routed to whichever eligible approver currently has the fewest pending assignments', function () {
+test('a stage is routed to every eligible approver simultaneously, not just one', function () {
     $originator = User::factory()->originator()->create();
-    $busyApprover = User::factory()->approver('Job Order')->create();
-    $freeApprover = User::factory()->approver('Job Order')->create();
+    $approverA = User::factory()->approver('Job Order')->create();
+    $approverB = User::factory()->approver('Job Order')->create();
+    $approverC = User::factory()->approver('Job Order')->create();
     $workflow = app(WorkflowService::class);
 
-    // Give the first approver existing pending assignments so they're no
-    // longer the least-busy eligible candidate for the next document.
-    $first = classifiedJobOrder($originator);
-    $workflow->routeToWorkflow($first);
-    DocumentAssignment::where('document_id', $first->document_id)
-        ->update(['user_id' => $busyApprover->user_id]);
+    $document = classifiedJobOrder($originator);
+    $workflow->routeToWorkflow($document);
 
-    $second = classifiedJobOrder($originator);
-    $workflow->routeToWorkflow($second);
+    $stage = WorkflowStage::where('stage_name', 'Technical Review')->first();
+    $seats = DocumentAssignment::where('document_id', $document->document_id)
+        ->where('stage_id', $stage->stage_id)
+        ->get();
 
-    $secondApprovers = DocumentAssignment::where('document_id', $second->document_id)->pluck('user_id')->unique();
+    expect($seats->pluck('user_id')->sort()->values()->all())
+        ->toBe(collect([$approverA->user_id, $approverB->user_id, $approverC->user_id])->sort()->values()->all())
+        ->and($seats->pluck('sla_expires_at')->unique())->toHaveCount(1); // identical window for every seat
+});
 
-    expect($secondApprovers->all())->toBe([$freeApprover->user_id]);
+test('a stage does not finalize the document until every seat has approved, and finalizes exactly once the last one does', function () {
+    $originator = User::factory()->originator()->create();
+    $approverA = User::factory()->approver('Job Order')->create();
+    $approverB = User::factory()->approver('Job Order')->create();
+    $approverC = User::factory()->approver('Job Order')->create();
+    $workflow = app(WorkflowService::class);
+
+    // Single-stage category so there's nothing else that could independently
+    // keep the document from finalizing — isolates the stage-scoped gate.
+    WorkflowStage::create(['document_category' => 'Solo Stage Category', 'stage_name' => 'Only Stage', 'sequence_order' => 1]);
+    $document = DocumentRepository::create([
+        'originator_id' => $originator->user_id, 'title' => 'solo.txt', 'file_path' => 'documents/solo.txt',
+        'mime_type' => 'text/plain', 'ml_category' => 'Solo Stage Category', 'is_validated' => true,
+        'due_date' => now()->addMinutes(30), 'global_status' => 'classified_validated',
+    ]);
+    $approverA->update(['assigned_category' => 'Solo Stage Category']);
+    $approverB->update(['assigned_category' => 'Solo Stage Category']);
+    $approverC->update(['assigned_category' => 'Solo Stage Category']);
+    $workflow->routeToWorkflow($document);
+
+    $seats = DocumentAssignment::where('document_id', $document->document_id)->orderBy('user_id')->get();
+    expect($seats)->toHaveCount(3);
+
+    $workflow->decide($seats[0], $approverA, 'approved');
+    expect($document->fresh()->global_status)->toBe('classified_validated'); // 1 of 3 — not done
+
+    $workflow->decide($seats[1], $approverB, 'approved');
+    expect($document->fresh()->global_status)->toBe('classified_validated'); // 2 of 3 — still not done
+
+    $workflow->decide($seats[2], $approverC, 'approved');
+    expect($document->fresh()->global_status)->toBe('approved'); // 3rd and last — now it's done
+});
+
+test('the safety-net stage-assignment path waits for every sibling on the CURRENT stage before opening a stage added after routing', function () {
+    $originator = User::factory()->originator()->create();
+    $approverA = User::factory()->approver('Job Order')->create();
+    $approverB = User::factory()->approver('Job Order')->create();
+    $workflow = app(WorkflowService::class);
+
+    // Only one stage exists at routing time.
+    WorkflowStage::query()->where('stage_name', 'Final Approval')->delete();
+    $document = classifiedJobOrder($originator);
+    $workflow->routeToWorkflow($document);
+
+    // Admin adds a new stage to the pipeline AFTER this document was
+    // already routed — completeStage()'s safety net is what assigns it.
+    $lateStage = WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Late-Added Review', 'sequence_order' => 2]);
+
+    $seats = DocumentAssignment::where('document_id', $document->document_id)->orderBy('user_id')->get();
+    expect($seats)->toHaveCount(2);
+
+    $workflow->decide($seats[0], $approverA, 'approved');
+    // 1 of 2 approved on the only existing stage — the late-added stage
+    // must NOT be assigned yet, even though this decision made it look
+    // like "nothing pending on this stage from this seat's perspective".
+    expect(DocumentAssignment::where('document_id', $document->document_id)->where('stage_id', $lateStage->stage_id)->exists())
+        ->toBeFalse();
+
+    $workflow->decide($seats[1], $approverB, 'approved');
+    // 2nd and last seat on the original stage — now the late-added stage opens.
+    expect(DocumentAssignment::where('document_id', $document->document_id)->where('stage_id', $lateStage->stage_id)->exists())
+        ->toBeTrue();
+});
+
+test('a single rejection kills the whole document even while sibling seats on the same stage are still pending', function () {
+    $originator = User::factory()->originator()->create();
+    $approverA = User::factory()->approver('Job Order')->create();
+    $approverB = User::factory()->approver('Job Order')->create();
+    $approverC = User::factory()->approver('Job Order')->create();
+    $workflow = app(WorkflowService::class);
+
+    $document = classifiedJobOrder($originator);
+    $workflow->routeToWorkflow($document);
+
+    $stage = WorkflowStage::where('stage_name', 'Technical Review')->first();
+    $seats = DocumentAssignment::where('document_id', $document->document_id)
+        ->where('stage_id', $stage->stage_id)->orderBy('user_id')->get();
+
+    // A approves, B rejects — C never gets to weigh in, and B's sibling
+    // stage-mate A (who already approved) still ends up rejected too, since
+    // any single rejection kills the whole document regardless of what
+    // already happened on other seats.
+    $workflow->decide($seats[0], $approverA, 'approved');
+    $workflow->decide($seats[1], $approverB, 'rejected');
+
+    expect($document->fresh()->global_status)->toBe('rejected')
+        ->and($seats[2]->fresh()->individual_status)->toBe('rejected')
+        ->and($seats[2]->fresh()->cascade_closed_by)->toBe($approverB->user_id);
 });
 
 test('approving every stage finalizes the document as approved', function () {
@@ -101,5 +190,5 @@ test('rejecting one stage terminates the whole document and auto-closes every ot
     expect($document->fresh()->global_status)->toBe('rejected')
         ->and($stillPendingCount)->toBe(0)
         ->and($assignments->last()->fresh()->individual_status)->toBe('rejected')
-        ->and($assignments->last()->fresh()->comments)->toContain('Auto-closed');
+        ->and($assignments->last()->fresh()->cascade_closed_by)->toBe($approver->user_id);
 });

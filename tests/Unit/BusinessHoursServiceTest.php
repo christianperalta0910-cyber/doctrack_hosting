@@ -1,18 +1,11 @@
 <?php
 
 use App\Models\SlaHoliday;
-use App\Models\SlaSetting;
 use App\Services\BusinessHoursService;
 use Carbon\Carbon;
 
-// Mon–Sat 9:00–17:00, Sunday off — matches this app's default configuration.
-beforeEach(function () {
-    SlaSetting::current()->update([
-        'work_start_time' => '09:00:00',
-        'work_end_time' => '17:00:00',
-        'working_days' => [1, 2, 3, 4, 5, 6],
-    ]);
-});
+// Mon–Sat 9:00–17:00, Sunday off — the fixed config('sla.php') default
+// (no longer admin-editable), so no setup is needed beyond that.
 
 test('a working day within the configured days is recognized', function () {
     $service = app(BusinessHoursService::class);

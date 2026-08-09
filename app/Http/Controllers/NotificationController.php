@@ -17,7 +17,12 @@ class NotificationController extends Controller
 {
     public function index(Request $request)
     {
-        $notifications = $request->user()->notifications()->with('document')->paginate(20);
+        // Real page route, not the implicit current-request path — this
+        // list is also built from within refresh() (the live-poll
+        // fragment route); see AdminController::paginateContainers()'s
+        // docblock for the full reasoning.
+        $notifications = $request->user()->notifications()->with('document')->paginate(10)
+            ->withPath(route('notifications.index'));
 
         return view('notifications.index', compact('notifications'));
     }

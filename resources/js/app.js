@@ -192,6 +192,11 @@ function applyLiveRefresh(opts, signalData) {
         })
         .catch(() => {});
 }
+// Exposed for callers outside this module (e.g. an inline page script that
+// wants to trigger the exact same fragment-swap after its own action
+// succeeds — a form submit, for instance — instead of only reacting to a
+// poll/channel signal).
+window.applyLiveRefresh = applyLiveRefresh;
 
 /**
  * Real-time, primary update mechanism: subscribes to a private Reverb
@@ -259,3 +264,65 @@ function startLivePoll(opts) {
     scheduleNext();
 }
 window.startLivePoll = startLivePoll;
+
+/**
+ * Intercepts clicks on pagination links (see vendor/pagination/custom.blade.php
+ * — the app-wide custom pagination view) inside `container`, fetching
+ * `opts.refreshUrl` with the CLICKED link's own query string instead of
+ * letting the browser navigate. Fixes the same scroll-jump-to-top problem
+ * decide()/decideBatch() had (see approver/dashboard.blade.php): a plain
+ * pagination `<a>` causes a full page navigation, which always reloads
+ * scrolled to the top.
+ *
+ * Swaps `container`'s innerHTML (reusing the exact same fragment route
+ * every poll/channel refresh on that page already uses — both paginated
+ * sections on a page like SLA Queue or ML Training render inside the SAME
+ * shared container, and the clicked link's own href already carries BOTH
+ * pagination params correctly merged — see AdminController::
+ * paginateContainers()), then updates the visible URL via
+ * history.pushState so back/forward/refresh/bookmark all still resolve to
+ * the real page + that exact page number, not the fragment route. A
+ * `popstate` listener (registered once, shared by every container that
+ * calls this) re-syncs content on browser back/forward, since pushState
+ * alone only changes the address bar, not the DOM.
+ *
+ * @param {Element} container - swapped via innerHTML, same as applyLiveRefresh's opts.target
+ * @param {Object} opts
+ * @param {string} opts.refreshUrl - returns an HTML fragment (this page's own .../refresh route)
+ * @param {Function} [opts.onSwap] - called after a successful swap
+ */
+const __ajaxPaginationContainers = [];
+
+function __refreshAjaxPaginationContainer(container, opts, search) {
+    fetch(opts.refreshUrl + search, { headers: { Accept: 'text/html' } })
+        .then((res) => (res.ok ? res.text() : Promise.reject(res)))
+        .then((html) => {
+            container.innerHTML = html;
+            if (opts.onSwap) opts.onSwap();
+        })
+        .catch(() => { window.location.reload(); }); // fetch failed — fall back to a real navigation rather than leave stale content up
+}
+
+function enableAjaxPagination(container, opts) {
+    __ajaxPaginationContainers.push({ container, opts });
+
+    container.addEventListener('click', function (e) {
+        const link = e.target.closest('a[rel="prev"], a[rel="next"], a[aria-label^="Go to page"]');
+        if (!link || !link.closest('nav[aria-label="Pagination Navigation"]')) return;
+
+        e.preventDefault();
+        const url = new URL(link.href, window.location.href);
+        // link.href's pathname is already the real page route, not the
+        // fragment route — every paginator in this app is built with the
+        // real route() as its `path` specifically so this holds.
+        history.pushState({}, '', url.pathname + url.search);
+        __refreshAjaxPaginationContainer(container, opts, url.search);
+    });
+}
+window.enableAjaxPagination = enableAjaxPagination;
+
+window.addEventListener('popstate', () => {
+    __ajaxPaginationContainers.forEach(({ container, opts }) => {
+        __refreshAjaxPaginationContainer(container, opts, window.location.search);
+    });
+});

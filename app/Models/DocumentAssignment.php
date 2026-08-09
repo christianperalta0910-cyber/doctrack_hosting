@@ -7,12 +7,13 @@ use App\Events\DocumentStatusChanged;
 use Illuminate\Database\Eloquent\Model;
 
 /**
- * Exactly ONE row per document per stage ("single-assignment routing").
- * When a document enters a stage, it is routed to whichever eligible
- * approver in that category currently has the fewest pending assignments
- * (see WorkflowService::selectApproverForStage()) — never to more than one
- * approver at once, so a document can't be picked up or acted on by two
- * approvers simultaneously.
+ * One row per (document, stage, eligible approver) — a stage with 3
+ * eligible approvers gets 3 rows, one per seat. A stage only completes
+ * once every one of its rows is non-pending (see
+ * WorkflowService::completeStage()); a single rejection on any row
+ * immediately rejects the whole document. Each row keeps its own
+ * independent SLA window, escalation, and admin-override — see
+ * WorkflowService::assignStage().
  */
 class DocumentAssignment extends Model
 {
@@ -81,7 +82,8 @@ class DocumentAssignment extends Model
         'individual_status', 'comments', 'sla_expires_at', 'admin_override_at',
         'admin_override_by', 'escalated_to_admin', 'escalated_at', 'escalation_reason', 'auto_approved', 'acted_at',
         'admin_reviewed_at', 'admin_reviewed_by', 'admin_review_note', 'admin_review_outcome',
-        'reassigned_at', 'reassigned_from', 'reassignment_reason',
+        'reassigned_at', 'reassigned_from', 'reassignment_reason', 'needs_approver', 'needs_approver_at',
+        'cascade_closed_by',
     ];
 
     protected $casts = [
@@ -94,6 +96,8 @@ class DocumentAssignment extends Model
         'auto_approved' => 'boolean',
         'admin_reviewed_at' => 'datetime',
         'reassigned_at' => 'datetime',
+        'needs_approver' => 'boolean',
+        'needs_approver_at' => 'datetime',
     ];
 
     public function document()
@@ -131,7 +135,13 @@ class DocumentAssignment extends Model
         return $this->belongsTo(User::class, 'reassigned_from', 'user_id');
     }
 
-    /** Seconds remaining before SLA breach — used for the countdown UI. */
+    /** Who ACTUALLY made the rejection that cascade-closed this seat — see completeStage()'s rejection branch. Null unless this row was auto-closed by a sibling's reject. */
+    public function cascadeClosedBy()
+    {
+        return $this->belongsTo(User::class, 'cascade_closed_by', 'user_id');
+    }
+
+    /** Seconds remaining before SLA violation — used for the countdown UI. */
     public function getSecondsRemainingAttribute(): ?int
     {
         if (!$this->sla_expires_at) {
@@ -141,6 +151,58 @@ class DocumentAssignment extends Model
         // ($absolute=false) form; round explicitly rather than let PHP's
         // implicit float->int narrowing throw a deprecation warning.
         return (int) round(now()->diffInSeconds($this->sla_expires_at, false));
+    }
+
+    /**
+     * How much actual WORKING time is left before this seat's SLA
+     * deadline — unlike seconds_remaining above (a raw wall-clock diff,
+     * which can look wildly inflated whenever it crosses an evening or
+     * weekend), this only counts seconds inside real business hours. This
+     * is the number the Urgent/Normal/Low/Expired badge and the "SLA
+     * expires" countdown are both based on (see urgencyRank() below), so
+     * they can never disagree with each other the way the badge and the
+     * old wall-clock countdown used to.
+     */
+    public function realSecondsRemaining(): int
+    {
+        if (!$this->sla_expires_at) {
+            return 0;
+        }
+
+        return app(\App\Services\BusinessHoursService::class)
+            ->businessSecondsRemaining(now(), $this->sla_expires_at);
+    }
+
+    /** Below this many real seconds left, the badge reads "Urgent" regardless of window size. */
+    private const URGENT_THRESHOLD_SECONDS = 1800; // 30 minutes
+
+    /** Below this many real seconds left (and above the Urgent threshold), the badge reads "Normal". */
+    private const NORMAL_THRESHOLD_SECONDS = 7200; // 2 hours
+
+    /**
+     * Urgent=1, Normal=2, Low=3, Expired=4 — absolute thresholds against
+     * realSecondsRemaining(), chosen relative to the SLA window's actual
+     * range (a flat 15 minutes at the shortest, capped at 6 hours at the
+     * longest — see WorkflowService's tieredApproverSlaMinutes()): 30
+     * minutes left is "about to run out" no matter how big the original
+     * window was, and 2 hours left is already more than a short window's
+     * ENTIRE budget, so it's still a meaningful cutoff for those too.
+     */
+    public function urgencyRank(): int
+    {
+        $remaining = $this->realSecondsRemaining();
+
+        return match(true) {
+            $remaining <= 0 => 4,
+            $remaining <= self::URGENT_THRESHOLD_SECONDS => 1,
+            $remaining <= self::NORMAL_THRESHOLD_SECONDS => 2,
+            default => 3,
+        };
+    }
+
+    public function urgencyLabel(): string
+    {
+        return [1 => 'Urgent', 2 => 'Normal', 3 => 'Low', 4 => 'Expired'][$this->urgencyRank()];
     }
 
     /**

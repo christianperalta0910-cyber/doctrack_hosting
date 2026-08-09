@@ -8,6 +8,7 @@ use App\Mail\DocumentDecisionMail;
 use App\Mail\SlaEscalationMail;
 use App\Models\AuditLog;
 use App\Models\DocumentAssignment;
+use App\Models\DocumentReviewSession;
 use App\Models\NotificationRecord;
 use App\Models\SlaViolation;
 use App\Models\User;
@@ -19,11 +20,15 @@ use Illuminate\Support\Facades\Mail;
  * -----------
  * The second half of the Section 5 safety net (the first half — flagging
  * an individual expired assignment as escalated_to_admin — is handled by
- * the `workflow:check-parallel-slas` command). Since each document is now
- * routed to exactly one approver per stage (single-assignment,
- * load-balanced routing — see WorkflowService), each escalation
- * corresponds to exactly one stuck assignment, with no sibling rows to
- * reconcile.
+ * the `workflow:check-parallel-slas` command). A stage can have more than
+ * one seat (see WorkflowService — every eligible approver is assigned at
+ * once), but every method here still operates strictly per-assignment-row
+ * — each seat escalates/auto-approves/gets overridden completely
+ * independently of any sibling seats on the same stage, which is exactly
+ * the "each approver keeps their own independent SLA window" behavior the
+ * multi-approver model requires. No cross-row coordination happens here;
+ * WorkflowService::completeStage() is what decides whether an entire
+ * stage is actually done once a given row resolves.
  *
  *   escalated_to_admin = true (set by workflow:check-parallel-slas)
  *     -> Admin may override: approve/reject on the approver's behalf
@@ -47,7 +52,7 @@ class SlaService
 
     /**
      * Flags a single expired-but-not-yet-escalated assignment: sets
-     * escalated_to_admin, logs the breach to sla_violations, and notifies
+     * escalated_to_admin, logs the violation to sla_violations, and notifies
      * Admins (in-app + email). This is the same logic the scheduled
      * `workflow:check-parallel-slas` command runs in bulk — factored out
      * here so it can ALSO be triggered on-demand (see ApprovalController)
@@ -90,7 +95,7 @@ class SlaService
 
             foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
                 NotificationRecord::send($admin->user_id, $assignment->document_id,
-                    "SLA breach: '{$assignment->document->title}' at stage '{$assignment->stage->stage_name}' " .
+                    "SLA violation: '{$assignment->document->title}' at stage '{$assignment->stage->stage_name}' " .
                     '(approver: ' . ($assignment->approver->full_name ?? 'unassigned') . ') needs Admin attention.',
                     'high');
 
@@ -102,56 +107,9 @@ class SlaService
             // DocumentAssignment::booted() only broadcasts on an
             // individual_status change — escalating to Admin never touches
             // that column, so without this the Admin dashboard's SLA alert
-            // widget would only learn about the breach via a bell
+            // widget would only learn about the violation via a bell
             // notification, never a live list refresh. Reuses the same
             // event/channel the dashboard already listens on.
-            event(new DocumentStatusChanged($assignment->document));
-        });
-    }
-
-    /**
-     * Deactivation handoff (Feature) — an approver was deactivated while
-     * holding a pending assignment, and WorkflowService::
-     * findReplacementApprover() found nobody else eligible for that stage.
-     * Escalates to Admin immediately rather than waiting for the SLA
-     * deadline to actually pass (which may still be hours/days away).
-     *
-     * Deliberately does NOT create an SlaViolation row, unlike escalate()
-     * above — the original approver didn't fail to act in time, they were
-     * deactivated before their deadline hit, so counting this as a breach
-     * would unfairly skew the Violations Report's stats (breach counts,
-     * Top Approver, etc.). escalation_reason records why this one's
-     * different so the SLA Override Queue can show it as such rather than
-     * a misleading "SLA Breached" badge.
-     */
-    public function escalateForReassignmentFailure(DocumentAssignment $assignment): void
-    {
-        DB::transaction(function () use ($assignment) {
-            $escalatedAt = now();
-            $assignment->escalated_to_admin = true;
-            $assignment->escalated_at = $escalatedAt;
-            $assignment->escalation_reason = 'no_eligible_approver';
-            $assignment->save();
-
-            AuditLog::record(null, $assignment->document_id, 'sla_escalation',
-                "Approver assignment #{$assignment->assignment_id} (stage '{$assignment->stage->stage_name}') " .
-                'escalated to Admin immediately — no eligible replacement approver was available after the ' .
-                'original approver\'s account was deactivated.');
-
-            $graceExpiresAt = $escalatedAt->copy()->addHours(config('sla.admin_grace_hours', 12));
-            AutoApproveAssignmentJob::dispatch($assignment->assignment_id, $graceExpiresAt)->delay($graceExpiresAt);
-
-            foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
-                NotificationRecord::send($admin->user_id, $assignment->document_id,
-                    "'{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') needs a new approver — " .
-                    'the assigned approver was deactivated and no eligible replacement was available.',
-                    'high');
-
-                if ($admin->email) {
-                    Mail::to($admin->email)->queue(new SlaEscalationMail($assignment));
-                }
-            }
-
             event(new DocumentStatusChanged($assignment->document));
         });
     }
@@ -166,6 +124,12 @@ class SlaService
         $count = 0;
         $graceCutoff = now()->subHours(config('sla.admin_grace_hours', 12));
 
+        // No ->unique('document_id') — a stage can now have more than one
+        // eligible-approver seat (see WorkflowService::assignStage()), so
+        // more than one row on the SAME document (even the same stage) can
+        // legitimately qualify for auto-approval in the same sweep; each
+        // needs its own independent auto-approval, not just the first one
+        // found per document.
         DocumentAssignment::query()
             ->where('individual_status', 'pending')
             ->where('escalated_to_admin', true)
@@ -173,7 +137,6 @@ class SlaService
             ->where('sla_expires_at', '<=', $graceCutoff)
             ->with(['document', 'stage'])
             ->get()
-            ->unique('document_id')
             ->each(function (DocumentAssignment $assignment) use (&$count) {
                 $this->autoApproveOne($assignment);
                 $count++;
@@ -196,7 +159,7 @@ class SlaService
                 "System auto-approved stage '{$assignment->stage->stage_name}' after Admin grace window elapsed with no response.");
 
             NotificationRecord::send($document->originator_id, $document->document_id,
-                "Your document '{$document->title}' had a stage auto-approved by the system after an unresolved SLA breach.", 'high');
+                "Your document '{$document->title}' had a stage auto-approved by the system after an unresolved SLA violation.", 'high');
 
             foreach (User::whereIn('role', ['admin', 'approver'])->where('is_active', true)->get() as $u) {
                 NotificationRecord::send($u->user_id, $document->document_id,
@@ -236,6 +199,7 @@ class SlaService
             $assignment->save();
 
             $document = $assignment->document;
+            DocumentReviewSession::closeFor($document, $admin);
             AuditLog::record($admin->user_id, $document->document_id, 'admin_override',
                 "Admin {$admin->full_name} overrode stage '{$assignment->stage->stage_name}' -> {$decision}." . ($comments ? " Notes: {$comments}" : ''));
 

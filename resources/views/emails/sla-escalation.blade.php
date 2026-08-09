@@ -1,7 +1,7 @@
 @component('mail::message')
-# SLA Breach — Admin Attention Needed
+# SLA Violation — Admin Attention Needed
 
-**{{ $assignment->document->title }}** has breached its SLA at stage **{{ $assignment->stage->stage_name }}**.
+**{{ $assignment->document->title }}** has violated its SLA at stage **{{ $assignment->stage->stage_name }}**.
 
 - Approver: {{ $assignment->approver->full_name ?? 'Unassigned' }}
 - SLA expired: {{ optional($assignment->sla_expires_at)->toDayDateTimeString() }}

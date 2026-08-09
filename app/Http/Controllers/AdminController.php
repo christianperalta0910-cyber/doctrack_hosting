@@ -8,12 +8,13 @@ use App\Mail\AutoApprovalDisputedMail;
 use App\Models\AuditLog;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentRepository;
+use App\Models\DocumentReviewSession;
 use App\Models\MlModelRepository;
 use App\Models\MlStagingSample;
 use App\Models\NotificationRecord;
 use App\Models\SlaHoliday;
-use App\Models\SlaSetting;
 use App\Models\SlaViolation;
+use App\Models\SystemSetting;
 use App\Models\User;
 use App\Models\WorkflowStage;
 use App\Services\ClassificationService;
@@ -23,6 +24,7 @@ use App\Services\ValidationService;
 use App\Services\WorkflowService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Validation\Rule;
@@ -34,6 +36,7 @@ class AdminController extends Controller
         private TextExtractionService $extractor,
         private SlaService $sla,
         private WorkflowService $workflow,
+        private ValidationService $validator,
     ) {
     }
 
@@ -52,6 +55,7 @@ class AdminController extends Controller
             'rejected' => DocumentRepository::where('global_status', 'rejected')->count(),
             'active_users' => User::where('is_active', true)->count(),
             'ml_review_count' => DocumentRepository::where('ml_review_status', 'pending')->count(),
+            'readability_review_count' => DocumentRepository::where('readability_review_status', 'pending')->count(),
             'violations_count' => SlaViolation::count(),
         ];
 
@@ -68,41 +72,148 @@ class AdminController extends Controller
     }
 
     /**
-     * Heavier "module overview" data — category breakdown, approver
-     * workload, and a recent-activity feed — split out from overviewData()
-     * so overviewPoll() (fired every ~45-75s purely to detect change)
-     * stays cheap; only the full-page dashboard() and its live-swap
-     * counterpart overviewRefresh() need this.
+     * Heavier "module overview" data — analytics and a recent-activity
+     * feed — split out from overviewData() so overviewPoll() (fired every
+     * ~45-75s purely to detect change) stays cheap; only the full-page
+     * dashboard() and its live-swap counterpart overviewRefresh() need
+     * this.
      */
     private function dashboardExtras(): array
     {
-        $categoryBreakdown = DocumentRepository::whereNotNull('ml_category')
-            ->selectRaw('ml_category, count(*) as total')
-            ->groupBy('ml_category')
-            ->pluck('total', 'ml_category');
+        $recentActivity = $this->recentActivityRows();
 
-        $approverWorkload = User::where('role', 'approver')->where('is_active', true)
-            ->withCount(['assignmentsAsApprover as pending_count' => function ($q) {
-                $q->where('individual_status', 'pending');
-            }])
-            ->orderByDesc('pending_count')
-            ->get();
+        $analytics = $this->analyticsData();
 
-        $recentActivity = AuditLog::with(['user', 'document'])->orderByDesc('timestamp')->limit(8)->get();
+        return [$recentActivity, $analytics];
+    }
 
-        return [$categoryBreakdown, $approverWorkload, $recentActivity];
+    /**
+     * Recent Activity (Feature: match the Audit Trail's own row shape/
+     * styling exactly — same $row->kind ('document'/'system') shape
+     * buildAuditRows() produces, rendered through the same shared
+     * admin.partials.audit-row partial) — bounded to the last $limit
+     * DOCUMENT uploads and $limit SYSTEM log entries before merging/
+     * sorting/trimming, unlike buildAuditRows() itself, which deliberately
+     * pulls every document/log unfiltered since it expects to paginate a
+     * full page. That's too heavy to run on every dashboard load/poll —
+     * this stays cheap by bounding each side of the union before the merge.
+     */
+    private function recentActivityRows(int $limit = 5): \Illuminate\Support\Collection
+    {
+        $documentRows = DocumentRepository::with('originator')
+            ->orderByDesc('upload_date')
+            ->limit($limit)
+            ->get()
+            ->map(fn (DocumentRepository $doc) => (object) [
+                'kind' => 'document',
+                'sort_at' => $doc->upload_date,
+                'document' => $doc,
+            ]);
+
+        $systemRows = AuditLog::with('user')
+            ->whereNull('document_id')
+            ->orderByDesc('timestamp')
+            ->limit($limit)
+            ->get()
+            ->map(fn (AuditLog $log) => (object) [
+                'kind' => 'system',
+                'sort_at' => $log->timestamp,
+                'log' => $log,
+            ]);
+
+        return $documentRows->concat($systemRows)->sortByDesc('sort_at')->take($limit)->values();
+    }
+
+    /**
+     * Uploaded/approved/rejected/auto-approved counts, average
+     * time-to-decision, and SLA violation counts, bucketed by day/month/
+     * year — replaces the old Approver Workload panel (Section 10:
+     * "analytics reports of the documents being upload, approve, rejected
+     * per day, per month, per year"). Approval/rejection/auto-approval
+     * are bucketed by DocumentRepository.updated_at as a stand-in for
+     * "when it was decided" — there's no dedicated finalized_at column,
+     * and global_status changing is normally the last thing that happens
+     * to a document, so this is a reasonable heuristic rather than an
+     * exact record (same "statistical estimate, not a perfect ledger"
+     * spirit as the rest of this app's analytics-flavored features).
+     */
+    private function analyticsData(): array
+    {
+        // Bucketing is done in PHP via Carbon's own format(), not
+        // DB-specific SQL (no DATE_FORMAT()/DAYNAME()/HOUR()) — this app's
+        // test suite runs against SQLite while dev/prod runs MySQL, and
+        // those functions aren't portable between the two. At this
+        // project's scale, pulling the raw rows and grouping them in PHP
+        // is simple and avoids maintaining two SQL dialects for one page.
+        $granularities = [
+            'day' => ['format' => 'Y-m-d', 'since' => now()->subDays(13)->startOfDay()],
+            'week' => ['format' => 'o-\WW', 'since' => now()->subWeeks(11)->startOfWeek()],
+            'month' => ['format' => 'Y-m', 'since' => now()->subMonths(11)->startOfMonth()],
+            'year' => ['format' => 'Y', 'since' => now()->subYears(4)->startOfYear()],
+        ];
+
+        $series = [];
+        foreach ($granularities as $key => $cfg) {
+            $series[$key] = $this->analyticsBuckets($cfg['format'], $cfg['since']);
+        }
+
+        $uploadDates = DocumentRepository::pluck('upload_date');
+        $peakDay = $uploadDates->countBy(fn ($d) => $d->format('l'))->sortDesc()->keys()->first();
+        $peakHour = $uploadDates->countBy(fn ($d) => (int) $d->format('G'))->sortDesc()->keys()->first();
+
+        return [
+            'series' => $series,
+            'peak_day' => $peakDay,
+            'peak_hour' => $peakHour !== null ? sprintf('%02d:00–%02d:00', $peakHour, ($peakHour + 1) % 24) : null,
+        ];
+    }
+
+    /** One row per period bucket: uploaded/approved/rejected/auto-approved counts, avg minutes to decide, and SLA violations. */
+    private function analyticsBuckets(string $carbonFormat, \Carbon\Carbon $since): array
+    {
+        $uploadBuckets = DocumentRepository::where('upload_date', '>=', $since)
+            ->pluck('upload_date')
+            ->groupBy(fn ($d) => $d->format($carbonFormat));
+
+        $decidedBuckets = DocumentRepository::whereIn('global_status', ['approved', 'rejected', 'auto_approved'])
+            ->where('updated_at', '>=', $since)
+            ->get(['upload_date', 'updated_at', 'global_status'])
+            ->groupBy(fn ($d) => $d->updated_at->format($carbonFormat));
+
+        $violationBuckets = SlaViolation::where('violation_timestamp', '>=', $since)
+            ->pluck('violation_timestamp')
+            ->groupBy(fn ($v) => $v->format($carbonFormat));
+
+        $buckets = $uploadBuckets->keys()->merge($decidedBuckets->keys())->merge($violationBuckets->keys())
+            ->unique()->sort()->values();
+
+        return $buckets->map(function ($bucket) use ($uploadBuckets, $decidedBuckets, $violationBuckets) {
+            $decided = $decidedBuckets->get($bucket, collect());
+
+            return (object) [
+                'bucket' => $bucket,
+                'uploaded' => $uploadBuckets->get($bucket, collect())->count(),
+                'approved' => $decided->whereIn('global_status', ['approved', 'auto_approved'])->count(),
+                'rejected' => $decided->where('global_status', 'rejected')->count(),
+                'auto_approved' => $decided->where('global_status', 'auto_approved')->count(),
+                'avg_minutes' => $decided->isNotEmpty()
+                    ? (int) round($decided->avg(fn ($d) => $d->upload_date->diffInMinutes($d->updated_at)))
+                    : null,
+                'violations' => $violationBuckets->get($bucket, collect())->count(),
+            ];
+        })->all();
     }
 
     /** Admin control-center overview. */
     public function dashboard()
     {
         [$stats, $slaAlerts, $reviewCount] = $this->overviewData();
-        [$categoryBreakdown, $approverWorkload, $recentActivity] = $this->dashboardExtras();
+        [$recentActivity, $analytics] = $this->dashboardExtras();
         $activeModel = MlModelRepository::active();
 
         return view('admin.dashboard', compact(
             'stats', 'slaAlerts', 'reviewCount', 'activeModel',
-            'categoryBreakdown', 'approverWorkload', 'recentActivity'
+            'recentActivity', 'analytics'
         ));
     }
 
@@ -155,13 +266,38 @@ class AdminController extends Controller
     }
 
     /**
+     * Fragment listing every document uploaded on one calendar date
+     * (Feature: click a date on the Admin Calendar, see what came in that
+     * day) — reuses the same drill-down modal and document-list fragment
+     * as dashboardDrilldown() above, just filtered by upload_date instead
+     * of global_status. No decision context here — the calendar is about
+     * volume/timing, not outcomes.
+     */
+    public function documentsOnDate(string $date)
+    {
+        $documents = DocumentRepository::with('originator')
+            ->whereDate('upload_date', $date)
+            ->orderByDesc('upload_date')
+            ->get();
+
+        return view('admin.partials.dashboard-drilldown-documents', [
+            'documents' => $documents,
+            'total' => $documents->count(),
+            'label' => \Carbon\Carbon::parse($date)->format('M j, Y'),
+            'decisions' => null,
+        ]);
+    }
+
+    /**
      * Who actually decided a document's fate, and when — used by the
      * Approved/Rejected dashboard drill-downs. Not simply "the last stage
-     * on record": a rejection auto-closes every other pending stage with a
-     * system-generated "Auto-closed" comment (see WorkflowService::
-     * completeStage()), and stages can complete out of sequence order, so
-     * the deciding assignment is whichever one actually has the latest
-     * acted_at among the ones that genuinely drove the outcome.
+     * on record": a rejection auto-closes every other pending stage (see
+     * WorkflowService::completeStage()), and stages can complete out of
+     * sequence order, so the deciding assignment is whichever one
+     * genuinely drove the outcome — identified via cascade_closed_by
+     * being null, not by sniffing the comment text (which now carries the
+     * real rejection reason, copied over to every cascade-closed seat too
+     * — see completeStage()'s docblock).
      */
     private function resolveDecision(DocumentRepository $doc): array
     {
@@ -174,7 +310,7 @@ class AdminController extends Controller
         $decisive = $doc->assignments
             ->where('individual_status', $wantStatus)
             ->when($wantStatus === 'rejected', fn ($c) => $c->filter(
-                fn (DocumentAssignment $a) => !str_starts_with((string) $a->comments, 'Auto-closed')
+                fn (DocumentAssignment $a) => is_null($a->cascade_closed_by)
             ))
             ->sortByDesc('acted_at')
             ->first();
@@ -207,12 +343,12 @@ class AdminController extends Controller
     public function overviewRefresh()
     {
         [$stats, $slaAlerts, $reviewCount] = $this->overviewData();
-        [$categoryBreakdown, $approverWorkload, $recentActivity] = $this->dashboardExtras();
+        [$recentActivity, $analytics] = $this->dashboardExtras();
         $activeModel = MlModelRepository::active();
 
         return view('admin.partials.overview', compact(
             'stats', 'slaAlerts', 'reviewCount', 'activeModel',
-            'categoryBreakdown', 'approverWorkload', 'recentActivity'
+            'recentActivity', 'analytics'
         ));
     }
 
@@ -290,7 +426,11 @@ class AdminController extends Controller
         }
 
         return [
-            'users' => $query->paginate(15)->withQueryString(),
+            // Real page route, not the implicit current-request path —
+            // also built from within usersRefresh() (the live-poll
+            // fragment route); see paginateContainers()'s docblock for
+            // the full reasoning.
+            'users' => $query->paginate(5)->withQueryString()->withPath(route('admin.users')),
             'showInactive' => $showInactive,
             'inactiveCount' => User::where('is_active', false)->count(),
         ];
@@ -435,14 +575,21 @@ class AdminController extends Controller
 
     /**
      * Deactivation handoff (Feature): deactivating an approver who's
-     * holding pending work automatically hands each assignment to the same
-     * least-busy-eligible-approver a brand-new document would get routed
-     * to (see WorkflowService::findReplacementApprover()), or escalates it
-     * straight to Admin if nobody's eligible (see SlaService::
-     * escalateForReassignmentFailure()) — rather than leaving it stuck in a
-     * queue nobody can reach anymore. is_active is flipped BEFORE the
-     * reassignment loop runs, not after — otherwise the approver being
-     * deactivated could still show up as their own eligible replacement.
+     * holding pending work resolves each assignment one of three ways —
+     * reassigns it to another eligible approver who doesn't already hold
+     * their own seat on that stage (see WorkflowService::
+     * findReplacementApprover() — rare under the unanimous-approval model,
+     * since every eligible approver was normally already seated at routing
+     * time), withdraws it with no Admin involvement if a sibling approver
+     * already covers that same stage independently (see WorkflowService::
+     * withdrawAssignment() — the common case), or — only if genuinely
+     * nobody is eligible under the normal category+stage rule — flags it
+     * needs_approver and moves it to the separate Unassigned Documents
+     * module (see WorkflowService::markNeedsApprover()) rather than the SLA
+     * Override Queue, since this was never an SLA failure and shouldn't be
+     * recorded as one. is_active is flipped BEFORE this loop runs, not
+     * after — otherwise the approver being deactivated could still show up
+     * as their own eligible replacement.
      */
     public function toggleUser(Request $request, User $user)
     {
@@ -462,7 +609,8 @@ class AdminController extends Controller
         }
 
         $reassignedCount = 0;
-        $escalatedCount = 0;
+        $withdrawnCount = 0;
+        $needsApproverCount = 0;
 
         if ($wasActive && $user->role === 'approver') {
             $pendingAssignments = DocumentAssignment::where('user_id', $user->user_id)
@@ -477,9 +625,12 @@ class AdminController extends Controller
                 if ($replacement) {
                     $this->workflow->reassignAssignment($assignment, $replacement, $user, $reason);
                     $reassignedCount++;
+                } elseif ($this->workflow->hasSiblingSeat($assignment)) {
+                    $this->workflow->withdrawAssignment($assignment, $user, $reason);
+                    $withdrawnCount++;
                 } else {
-                    $this->sla->escalateForReassignmentFailure($assignment);
-                    $escalatedCount++;
+                    $this->workflow->markNeedsApprover($assignment, $user, $reason);
+                    $needsApproverCount++;
                 }
             }
         }
@@ -488,11 +639,12 @@ class AdminController extends Controller
             "Account #{$user->user_id} ({$user->username}) set to " . ($user->is_active ? 'active' : 'inactive') . '.' .
             ($reason ? " Reason: \"{$reason}\"" : '') .
             ($reassignedCount > 0 ? " {$reassignedCount} pending assignment(s) reassigned." : '') .
-            ($escalatedCount > 0 ? " {$escalatedCount} escalated to Admin (no eligible replacement)." : ''));
+            ($withdrawnCount > 0 ? " {$withdrawnCount} withdrawn (already covered by another approver on the same stage)." : '') .
+            ($needsApproverCount > 0 ? " {$needsApproverCount} moved to Unassigned Documents (no eligible approver)." : ''));
 
         $status = 'Account status updated.';
-        if ($reassignedCount > 0 || $escalatedCount > 0) {
-            $status .= " {$reassignedCount} assignment(s) reassigned, {$escalatedCount} escalated to Admin.";
+        if ($reassignedCount > 0 || $withdrawnCount > 0 || $needsApproverCount > 0) {
+            $status .= " {$reassignedCount} reassigned, {$withdrawnCount} withdrawn (already covered), {$needsApproverCount} moved to Unassigned Documents.";
         }
 
         return back()->with('status', $status);
@@ -533,7 +685,7 @@ class AdminController extends Controller
     // across two scans/formats of the literal same real document.
     private const EXACT_DUPLICATE_THRESHOLD = 0.97;
 
-    public function mlTraining()
+    public function mlTraining(Request $request)
     {
         $categories = ValidationService::knownCategories();
         $activeModel = MlModelRepository::active();
@@ -552,7 +704,7 @@ class AdminController extends Controller
 
         return view('admin.ml_training', array_merge(compact(
             'categories', 'activeModel', 'history', 'stagedSamples', 'minPerCategory', 'batchUploadLimit'
-        ), $this->mlReviewQueueData()));
+        ), $this->mlReviewQueueData($request)));
     }
 
     /**
@@ -566,24 +718,32 @@ class AdminController extends Controller
      * an admin sitting on this page would only see a newly-held document
      * after manually reloading.
      */
-    public function mlReviewQueueRefresh()
+    public function mlReviewQueueRefresh(Request $request)
     {
         return view('admin.partials.ml_review_panels', array_merge(
-            $this->mlReviewQueueData(),
+            $this->mlReviewQueueData($request),
             ['categories' => ValidationService::knownCategories()]
         ));
     }
 
-    /** Lightweight JSON signal for the poll fallback — see overviewPoll()'s docblock for the same reasoning. */
+    /**
+     * Lightweight JSON signal for the poll fallback — see overviewPoll()'s
+     * docblock for the same reasoning. Deliberately reads the FULL
+     * unpaginated queues (buildReviewQueueGroups() directly, not
+     * mlReviewQueueData()'s paginated 'reviewQueue'/'readabilityQueue') —
+     * a change on page 2 of either list still needs to trigger a live
+     * refresh even while an admin is sitting on page 1.
+     */
     public function mlReviewQueuePoll()
     {
-        $data = $this->mlReviewQueueData();
+        $priorityThreshold = config('ml.review_priority_threshold', 30);
+        $reviewQueue = $this->buildReviewQueueGroups($priorityThreshold);
 
         // Includes grouped-away "similar" document ids too, not just each
         // group's primary — a new upload that gets absorbed into an
         // EXISTING group wouldn't otherwise change this signal at all
         // (the primary ids stay the same), silently missing a live refresh.
-        $pendingIds = $data['reviewQueue']
+        $pendingIds = $reviewQueue
             ->flatMap(fn ($entry) => [
                 $entry->document->document_id,
                 ...$entry->similar->pluck('document_id'),
@@ -593,17 +753,37 @@ class AdminController extends Controller
 
         return response()->json([
             'pending_ids' => $pendingIds,
-            'confirmed_ids' => $data['stagedFromReview']->pluck('document_id')->all(),
+            'confirmed_ids' => DocumentRepository::where('ml_review_status', 'confirmed')
+                ->whereNull('ml_recheck_dismissed_at')->pluck('document_id')->all(),
+            'readability_pending_ids' => DocumentRepository::where('readability_review_status', 'pending')->pluck('document_id')->all(),
         ]);
     }
 
-    /** @return array{reviewQueue: \Illuminate\Support\Collection, priorityThreshold: int, stagedFromReview: \Illuminate\Support\Collection} */
-    private function mlReviewQueueData(): array
+    /**
+     * @return array{reviewQueue: LengthAwarePaginator, priorityThreshold: int,
+     *     stagedFromReview: \Illuminate\Support\Collection, readabilityQueue: LengthAwarePaginator}
+     */
+    private function mlReviewQueueData(Request $request): array
     {
         $priorityThreshold = config('ml.review_priority_threshold', 30);
+        $perPage = 5;
+
+        $reviewQueueFull = $this->buildReviewQueueGroups($priorityThreshold);
+        $reviewQueue = $this->paginateContainers($reviewQueueFull, $request, $perPage, route('admin.ml.training'), 'ml_page');
+
+        // Deliberately no near-duplicate grouping here unlike
+        // buildReviewQueueGroups() above — a readability hold is
+        // already a much rarer event (only fires once a category has
+        // enough training data to score against at all), so the extra
+        // complexity of bulk-resolving copies hasn't been worth it yet.
+        $readabilityQueueFull = DocumentRepository::where('readability_review_status', 'pending')
+            ->orderBy('readability_score')
+            ->with('originator')
+            ->get();
+        $readabilityQueue = $this->paginateContainers($readabilityQueueFull, $request, $perPage, route('admin.ml.training'), 'readability_page');
 
         return [
-            'reviewQueue' => $this->buildReviewQueueGroups($priorityThreshold),
+            'reviewQueue' => $reviewQueue,
             'priorityThreshold' => $priorityThreshold,
             // Documents already confirmed + routed from the review queue,
             // so an admin can "Re-check" them once the model has been
@@ -619,7 +799,40 @@ class AdminController extends Controller
             // view only offers "Re-check" once this has actually changed
             // since confirmation — see recheckFlaggedDocument()'s gate.
             'activeModelId' => MlModelRepository::active()?->model_id,
+            'readabilityQueue' => $readabilityQueue,
         ];
+    }
+
+    /**
+     * Wraps an already-built Collection in a LengthAwarePaginator — shared
+     * by every admin queue that groups results into containers before
+     * paginating (ML Review, Readability Review, SLA Queue's auto-approved
+     * section, Unassigned Documents). $pageName lets two independently
+     * paginated lists coexist on the same page/URL (e.g. ML Review +
+     * Readability Review both live on ml_training.blade.php) without their
+     * ?page= query params colliding.
+     *
+     * $path is the REAL page route (e.g. route('admin.ml.training')) —
+     * deliberately never $request->url(), since every one of these lists
+     * is also rendered via a separate .../refresh route for the live-poll
+     * JS to swap in place (see e.g. mlReviewQueueRefresh()). Building the
+     * path from the current request would bake THAT fragment URL into the
+     * Next/Previous links whenever a live swap happens to be what
+     * generated this page's markup — clicking one then navigates straight
+     * to the bare fragment endpoint (no layout, no CSS) instead of the
+     * real page.
+     */
+    private function paginateContainers(\Illuminate\Support\Collection $items, Request $request, int $perPage, string $path, string $pageName = 'page'): LengthAwarePaginator
+    {
+        $page = (int) $request->input($pageName, 1);
+
+        return new LengthAwarePaginator(
+            $items->forPage($page, $perPage)->values(),
+            $items->count(),
+            $perPage,
+            $page,
+            ['path' => $path, 'query' => $request->query(), 'pageName' => $pageName]
+        );
     }
 
     /**
@@ -721,6 +934,15 @@ class AdminController extends Controller
 
         $admin = $request->user();
 
+        // Checked against the PRIMARY document only — exact-duplicate
+        // siblings get resolved as a side effect of this one decision (see
+        // below), not individually reviewed, so there's nothing else to
+        // time here.
+        $minSeconds = config('review.min_review_seconds', 10);
+        $secondsReviewed = DocumentReviewSession::secondsSpentSoFar($document->document_id, $admin->user_id);
+        abort_if($secondsReviewed < $minSeconds, 422,
+            "You need to view the document for at least {$minSeconds} seconds before deciding — {$secondsReviewed}s recorded so far.");
+
         // Genuinely-identical siblings still pending review — one decision
         // resolves all of them together, since repeating the same call for
         // what is functionally the same document is pure busywork. Each
@@ -784,6 +1006,8 @@ class AdminController extends Controller
 
     private function rejectReviewedDocument(DocumentRepository $document, User $admin): void
     {
+        DocumentReviewSession::closeFor($document, $admin);
+
         $document->ml_review_status = 'dismissed';
         $document->global_status = 'rejected';
         $document->save();
@@ -800,6 +1024,8 @@ class AdminController extends Controller
     /** @return string|null A near-duplicate-in-training-staging warning, only when $stageForTraining. */
     private function confirmReviewedDocument(DocumentRepository $document, string $category, User $admin, bool $stageForTraining): ?string
     {
+        DocumentReviewSession::closeFor($document, $admin);
+
         $duplicateWarning = null;
 
         if ($stageForTraining) {
@@ -835,9 +1061,14 @@ class AdminController extends Controller
         $document->confirmed_at_model_id = MlModelRepository::active()?->model_id;
         $document->save();
 
-        // Only now — the whole point of holding it — does this document
-        // actually reach any approver's dashboard.
-        $this->workflow->routeToWorkflow($document);
+        // Only routes once EVERY hold on it has cleared — a document can be
+        // pending both this review and the readability review at once (see
+        // WorkflowService::ingest()), and confirming one doesn't mean the
+        // other has been looked at yet.
+        $stillAwaitingReadability = $document->readability_review_status === 'pending';
+        if (!$stillAwaitingReadability) {
+            $this->workflow->routeToWorkflow($document);
+        }
 
         // ml_review_status changing isn't global_status/disputed_at, so
         // DocumentRepository::booted() won't broadcast this on its own —
@@ -847,11 +1078,14 @@ class AdminController extends Controller
         event(new DocumentStatusChanged($document));
 
         AuditLog::record($admin->user_id, $document->document_id, 'ml_review_confirm',
-            "Confirmed '{$document->title}' as '{$category}' (originally classified as '{$originalCategory}' at {$originalConfidence}%) " .
-            'and routed it for approval.' . ($stageForTraining ? ' Added to training staging.' : ' Identical to another document already staged for training in this batch.'));
+            "Confirmed '{$document->title}' as '{$category}' (originally classified as '{$originalCategory}' at {$originalConfidence}%)" .
+            ($stillAwaitingReadability ? ', still awaiting readability review before it routes.' : ' and routed it for approval.') .
+            ($stageForTraining ? ' Added to training staging.' : ' Identical to another document already staged for training in this batch.'));
 
         NotificationRecord::send($document->originator_id, $document->document_id,
-            "Your document '{$document->title}' was confirmed as '{$category}' by an admin and has been routed for approval.");
+            $stillAwaitingReadability
+                ? "Your document '{$document->title}' was confirmed as '{$category}' by an admin, but is still awaiting a separate content readability review before it's routed for approval."
+                : "Your document '{$document->title}' was confirmed as '{$category}' by an admin and has been routed for approval.");
 
         return $duplicateWarning;
     }
@@ -921,6 +1155,134 @@ class AdminController extends Controller
         event(new DocumentStatusChanged($document));
 
         return back()->with('status', "Dismissed '{$document->title}' from the re-check list.");
+    }
+
+    /**
+     * Admin confirms or rejects a document held ONLY because its
+     * readability score fell below the vocabulary threshold (required
+     * sections present, word count met — see WorkflowService::ingest() and
+     * ValidationService::validate()'s readability_only_failure flag).
+     *
+     * 'confirm' stages the document into the same MlStagingSample pool the
+     * classifier trains from (see confirmReviewedDocument()'s identical
+     * reasoning) — an admin confirming this content IS legitimate for its
+     * category is exactly what teaches the vocabulary those words for
+     * every future document, not just this one.
+     *
+     * 'reject' sets global_status to 'rejected' — the same terminal state
+     * a rejected-by-approver document reaches, so it reuses the
+     * originator's existing resubmit flow.
+     */
+    public function reviewReadability(Request $request, DocumentRepository $document)
+    {
+        abort_unless($document->readability_review_status === 'pending', 404);
+
+        $validated = $request->validate([
+            'action' => ['required', 'in:confirm,reject'],
+        ]);
+
+        $admin = $request->user();
+
+        $minSeconds = config('review.min_review_seconds', 10);
+        $secondsReviewed = DocumentReviewSession::secondsSpentSoFar($document->document_id, $admin->user_id);
+        abort_if($secondsReviewed < $minSeconds, 422,
+            "You need to view the document for at least {$minSeconds} seconds before deciding — {$secondsReviewed}s recorded so far.");
+
+        if ($validated['action'] === 'reject') {
+            $this->rejectReadabilityReview($document, $admin);
+
+            return back()->with('status', "Rejected '{$document->title}' — the originator has been notified to resubmit.");
+        }
+
+        $oldScore = $document->readability_score;
+        $this->confirmReadabilityReview($document, $admin);
+
+        return back()->with('status', "Confirmed '{$document->title}' — readability score improved from {$oldScore}% to {$document->readability_score}%.");
+    }
+
+    private function rejectReadabilityReview(DocumentRepository $document, User $admin): void
+    {
+        DocumentReviewSession::closeFor($document, $admin);
+
+        $document->readability_review_status = 'dismissed';
+        $document->global_status = 'rejected';
+        $document->save();
+
+        AuditLog::record($admin->user_id, $document->document_id, 'readability_review_reject',
+            "Rejected '{$document->title}' during content readability review (scored {$document->readability_score}% for " .
+            "'{$document->ml_category}'). Not routed for approval.");
+
+        NotificationRecord::send($document->originator_id, $document->document_id,
+            "Your document '{$document->title}' did not pass an admin's content readability review and was not routed for approval. " .
+            'Please review it and resubmit a corrected version.');
+    }
+
+    private function confirmReadabilityReview(DocumentRepository $document, User $admin): void
+    {
+        DocumentReviewSession::closeFor($document, $admin);
+
+        $category = $document->ml_category;
+        $oldScore = $document->readability_score;
+        $vocabularyBefore = ValidationService::vocabularySize($category);
+
+        $duplicateWarning = null;
+        foreach (MlStagingSample::where('category', $category)->get(['original_filename', 'extracted_text']) as $existing) {
+            $similarity = $this->classifier->wordOverlapSimilarity((string) $document->ocr_text, $existing->extracted_text);
+            if ($similarity >= self::NEAR_DUPLICATE_THRESHOLD) {
+                $duplicateWarning = sprintf(
+                    '"%s" looks like a near-duplicate of already-staged "%s" (%d%% word overlap) — staged anyway, but consider whether a more varied example would help more.',
+                    $document->title,
+                    $existing->original_filename,
+                    round($similarity * 100)
+                );
+                break;
+            }
+        }
+
+        MlStagingSample::create([
+            'category' => $category,
+            'original_filename' => $document->original_filename ?? $document->title,
+            'extracted_text' => (string) $document->ocr_text,
+            'staged_by' => $admin->user_id,
+        ]);
+
+        // Recomputed AFTER staging, against the now-grown vocabulary — this
+        // document's own words are trivially all "known" now (it just
+        // taught them to itself), which is expected: the meaningful part
+        // is that every FUTURE document sharing this vocabulary benefits
+        // too, tracked via vocabularyBefore/After below.
+        $revalidation = $this->validator->validate($category, (string) $document->ocr_text);
+        $vocabularyAfter = ValidationService::vocabularySize($category);
+
+        $document->readability_review_status = 'confirmed';
+        $document->readability_score = $revalidation['readability_score'];
+        $document->is_validated = true;
+        $document->validation_errors = $revalidation['errors'];
+
+        $stillAwaitingClassification = $document->ml_review_status === 'pending';
+        $document->global_status = 'classified_validated';
+        $document->save();
+
+        if (!$stillAwaitingClassification) {
+            $this->workflow->routeToWorkflow($document);
+        }
+
+        event(new DocumentStatusChanged($document));
+
+        $newWords = $vocabularyAfter - $vocabularyBefore;
+        AuditLog::record($admin->user_id, $document->document_id, 'readability_review_confirm',
+            "Confirmed '{$document->title}' during content readability review — score improved from {$oldScore}% to " .
+            "{$document->readability_score}% ({$newWords} new term(s) added to the '{$category}' vocabulary)." .
+            ($stillAwaitingClassification ? ' Still awaiting classification confidence review before it routes.' : ' Routed for approval.'));
+
+        NotificationRecord::send($document->originator_id, $document->document_id,
+            $stillAwaitingClassification
+                ? "Your document '{$document->title}' passed an admin's content readability review, but is still awaiting a separate classification confidence review before it's routed for approval."
+                : "Your document '{$document->title}' passed an admin's content readability review and has been routed for approval.");
+
+        if ($duplicateWarning) {
+            session()->flash('warning', [$duplicateWarning]);
+        }
     }
 
     /**
@@ -1046,22 +1408,23 @@ class AdminController extends Controller
     // ---------------------------------------------------------------
 
     /**
-     * SLA Override Queue. Breached assignments are nested the same way as
+     * SLA Override Queue. Violated assignments are nested the same way as
      * the Approver dashboard: documents an Originator uploaded together in
      * one SubmissionBatch stay grouped under one container so Admins can
-     * see at a glance which breach belongs to which original request,
+     * see at a glance which violation belongs to which original request,
      * rather than a flat list of unrelated-looking rows.
      */
-    public function slaQueue(Request $request)
+    /** Shared by slaQueue() and slaQueueRefresh() — one place, can't drift. */
+    private function slaQueueData(Request $request): array
     {
-        $breached = DocumentAssignment::where('escalated_to_admin', true)
+        $violated = DocumentAssignment::where('escalated_to_admin', true)
             ->whereNull('admin_override_at')
             ->where('individual_status', 'pending')
             ->with(['document.batch', 'document.originator', 'document.assignments.approver', 'stage', 'approver'])
             ->orderBy('sla_expires_at')
             ->get();
 
-        $containers = $breached
+        $containers = $violated
             ->groupBy(fn (DocumentAssignment $a) => $a->document->batch_id ? 'batch-' . $a->document->batch_id : 'doc-' . $a->document_id)
             ->map(function ($groupAssignments) {
                 $first = $groupAssignments->first();
@@ -1078,7 +1441,7 @@ class AdminController extends Controller
             ->sortBy(fn ($c) => $c->due_date)
             ->values();
 
-        $perPage = 10;
+        $perPage = 2;
         $page = (int) $request->input('page', 1);
 
         $assignments = new \Illuminate\Pagination\LengthAwarePaginator(
@@ -1086,7 +1449,13 @@ class AdminController extends Controller
             $containers->count(),
             $perPage,
             $page,
-            ['path' => $request->url(), 'query' => $request->query()]
+            // Real page route, not $request->url() — see paginateContainers()'s
+            // docblock for why: this data is also built from within
+            // slaQueueRefresh() (a separate .../refresh route for the
+            // live-poll JS), and a path derived from THAT request would
+            // bake the bare-fragment URL into Next/Previous whenever a
+            // live swap happens to be what rendered this page.
+            ['path' => route('admin.sla.queue'), 'query' => $request->query()]
         );
 
         // Grouped by document, same reasoning as $containers above: a
@@ -1107,7 +1476,36 @@ class AdminController extends Controller
             ->sortBy(fn ($c) => $c->assignments->first()->acted_at)
             ->values();
 
+        // Distinct pageName from the escalated section above — both lists
+        // live on the same sla_queue.blade.php page/URL, so a shared
+        // 'page' query param would make paging one silently page the other.
+        $reviewContainers = $this->paginateContainers($reviewContainers, $request, 2, route('admin.sla.queue'), 'auto_approved_page');
+
+        return [$assignments, $reviewContainers];
+    }
+
+    public function slaQueue(Request $request)
+    {
+        [$assignments, $reviewContainers] = $this->slaQueueData($request);
+
         return view('admin.sla_queue', compact('assignments', 'reviewContainers'));
+    }
+
+    /** Live-refresh fragment (Feature: realtime) — same data as slaQueue(), just the results. */
+    public function slaQueueRefresh(Request $request)
+    {
+        [$assignments, $reviewContainers] = $this->slaQueueData($request);
+
+        return view('admin.partials.sla-queue-results', compact('assignments', 'reviewContainers'));
+    }
+
+    /** Cheap change-signal for the live-poll fallback — same pattern as overviewPoll(). */
+    public function slaQueuePoll()
+    {
+        return response()->json([
+            'violated' => DocumentAssignment::where('escalated_to_admin', true)->whereNull('admin_override_at')->where('individual_status', 'pending')->count(),
+            'awaiting_review' => DocumentAssignment::where('auto_approved', true)->whereNull('admin_reviewed_at')->count(),
+        ]);
     }
 
     /**
@@ -1184,8 +1582,15 @@ class AdminController extends Controller
     {
         $validated = $request->validate([
             'decision' => ['required', 'in:approved,rejected'],
-            'comments' => ['nullable', 'string', 'max:1000'],
+            // Same rule as the approver's own decide() — a reject with no
+            // explanation leaves the originator nothing to act on.
+            'comments' => [Rule::requiredIf(fn () => $request->input('decision') === 'rejected'), 'nullable', 'string', 'max:1000'],
         ]);
+
+        $minSeconds = config('review.min_review_seconds', 10);
+        $secondsReviewed = DocumentReviewSession::secondsSpentSoFar($assignment->document_id, $request->user()->user_id);
+        abort_if($secondsReviewed < $minSeconds, 422,
+            "You need to view the document for at least {$minSeconds} seconds before deciding — {$secondsReviewed}s recorded so far.");
 
         $this->sla->adminOverride($assignment, $request->user(), $validated['decision'], $validated['comments'] ?? null);
 
@@ -1193,11 +1598,11 @@ class AdminController extends Controller
     }
 
     /**
-     * Overrides every breached stage assigned to the SAME approver for one
+     * Overrides every violated stage assigned to the SAME approver for one
      * document in a single action — mirrors
      * ApprovalController::decideBatch() so the SLA queue doesn't show one
      * override form per stage when a single approver is holding more than
-     * one breached stage for the same document.
+     * one violated stage for the same document.
      */
     public function overrideBatch(Request $request)
     {
@@ -1205,7 +1610,7 @@ class AdminController extends Controller
             'assignment_ids' => ['required', 'array', 'min:1'],
             'assignment_ids.*' => ['integer', 'exists:document_assignments,assignment_id'],
             'decision' => ['required', 'in:approved,rejected'],
-            'comments' => ['nullable', 'string', 'max:1000'],
+            'comments' => [Rule::requiredIf(fn () => $request->input('decision') === 'rejected'), 'nullable', 'string', 'max:1000'],
         ]);
 
         $assignments = DocumentAssignment::whereIn('assignment_id', $validated['assignment_ids'])
@@ -1216,20 +1621,121 @@ class AdminController extends Controller
 
         abort_if($assignments->isEmpty(), 409, 'These assignments have already been actioned.');
 
+        $minSeconds = config('review.min_review_seconds', 10);
+        $skippedUnreviewed = 0;
+
         foreach ($assignments as $assignment) {
             $assignment->refresh();
             if ($assignment->individual_status !== 'pending') {
                 continue; // already closed as a side effect of an earlier iteration (e.g. rejection cascade)
             }
+            if (DocumentReviewSession::secondsSpentSoFar($assignment->document_id, $request->user()->user_id) < $minSeconds) {
+                $skippedUnreviewed++;
+                continue;
+            }
             $this->sla->adminOverride($assignment, $request->user(), $validated['decision'], $validated['comments'] ?? null);
         }
 
-        return back()->with('status', 'Override applied: ' . ucfirst($validated['decision']) . '.');
+        $status = 'Override applied: ' . ucfirst($validated['decision']) . '.';
+        if ($skippedUnreviewed > 0) {
+            $status .= " {$skippedUnreviewed} assignment(s) were skipped — you need to view the document for at least {$minSeconds} seconds before deciding.";
+        }
+
+        return back()->with('status', $status);
+    }
+
+    // ---------------------------------------------------------------
+    // Unassigned Documents — seats deactivation left with genuinely no
+    // eligible approver (strict category+stage match — see WorkflowService
+    // ::markNeedsApprover()). Deliberately separate from the SLA Override
+    // Queue: these were never an SLA failure, so they must never be
+    // recorded as one.
+    // ---------------------------------------------------------------
+
+    /** Shared by unassignedDocuments() and unassignedDocumentsRefresh() — one place, can't drift. */
+    private function unassignedDocumentsData(Request $request): LengthAwarePaginator
+    {
+        $containers = DocumentAssignment::where('needs_approver', true)
+            ->where('individual_status', 'pending')
+            ->with(['document.originator', 'stage', 'reassignedFrom'])
+            ->orderBy('needs_approver_at')
+            ->get()
+            ->groupBy('document_id')
+            ->map(fn ($stageAssignments) => (object) [
+                'document' => $stageAssignments->first()->document,
+                'assignments' => $stageAssignments->sortBy(fn ($a) => $a->stage->sequence_order)->values(),
+            ])
+            ->sortBy(fn ($c) => $c->assignments->first()->needs_approver_at)
+            ->values();
+
+        return $this->paginateContainers($containers, $request, 2, route('admin.unassigned.index'));
+    }
+
+    public function unassignedDocuments(Request $request)
+    {
+        $containers = $this->unassignedDocumentsData($request);
+
+        return view('admin.unassigned_documents', compact('containers'));
+    }
+
+    public function unassignedDocumentsRefresh(Request $request)
+    {
+        $containers = $this->unassignedDocumentsData($request);
+
+        return view('admin.partials.unassigned-documents', compact('containers'));
+    }
+
+    /** Cheap change-signal for the live-poll fallback — same pattern as overviewPoll(). */
+    public function unassignedDocumentsPoll()
+    {
+        return response()->json([
+            'count' => DocumentAssignment::where('needs_approver', true)->where('individual_status', 'pending')->count(),
+        ]);
+    }
+
+    public function decideUnassigned(Request $request, DocumentAssignment $assignment)
+    {
+        abort_if(!$assignment->needs_approver || $assignment->individual_status !== 'pending', 409, 'This assignment has already been actioned.');
+
+        $validated = $request->validate([
+            'decision' => ['required', 'in:approved,rejected'],
+            'comments' => [Rule::requiredIf(fn () => $request->input('decision') === 'rejected'), 'nullable', 'string', 'max:1000'],
+        ]);
+
+        $minSeconds = config('review.min_review_seconds', 10);
+        $secondsReviewed = DocumentReviewSession::secondsSpentSoFar($assignment->document_id, $request->user()->user_id);
+        abort_if($secondsReviewed < $minSeconds, 422,
+            "You need to view the document for at least {$minSeconds} seconds before deciding — {$secondsReviewed}s recorded so far.");
+
+        $this->workflow->adminDecideUnassigned($assignment, $request->user(), $validated['decision'], $validated['comments'] ?? null);
+
+        return back()->with('status', 'Decision applied: ' . ucfirst($validated['decision']) . '.');
     }
 
     // ---------------------------------------------------------------
     // Workflow stage configuration
     // ---------------------------------------------------------------
+
+    /**
+     * Feature: toggle whether an approver's Approve/Reject is restricted to
+     * business hours (see ApprovalController::requireBusinessHoursIfEnforced()).
+     * Off by default on a fresh install — an Admin opts in deliberately.
+     * A plain checkbox toggle, not AJAX — this is a rare, deliberate
+     * configuration change, not something that needs a live-updating UI.
+     */
+    public function updateBusinessHoursEnforcement(Request $request)
+    {
+        $setting = SystemSetting::current();
+        $setting->enforce_business_hours_decisions = $request->boolean('enforce_business_hours_decisions');
+        $setting->updated_by = $request->user()->user_id;
+        $setting->save();
+
+        \App\Events\SystemSettingsChanged::dispatch();
+
+        return back()->with('status', $setting->enforce_business_hours_decisions
+            ? 'Approver decisions are now restricted to business hours (9 AM–5 PM, Mon–Sat).'
+            : 'Approver decisions are no longer restricted to business hours.');
+    }
 
     public function workflowConfig()
     {
@@ -1253,7 +1759,35 @@ class AdminController extends Controller
             ->get()
             ->groupBy('stage_id');
 
-        return view('admin.workflow_config', compact('stages', 'categories', 'activeCounts', 'historyCounts', 'pendingByStage'));
+        $businessHoursEnforced = SystemSetting::current()->enforce_business_hours_decisions;
+
+        return view('admin.workflow_config', compact('stages', 'categories', 'activeCounts', 'historyCounts', 'pendingByStage', 'businessHoursEnforced'));
+    }
+
+    /** Live-refresh fragment (Feature: realtime) — same stage-list data, just the results panel. */
+    public function workflowConfigRefresh()
+    {
+        $stages = WorkflowStage::orderBy('document_category')->orderBy('sequence_order')->get()->groupBy('document_category');
+
+        $activeCounts = DocumentAssignment::where('individual_status', 'pending')
+            ->select('stage_id')->selectRaw('count(*) as cnt')->groupBy('stage_id')->pluck('cnt', 'stage_id');
+        $historyCounts = DocumentAssignment::select('stage_id')->selectRaw('count(*) as cnt')->groupBy('stage_id')->pluck('cnt', 'stage_id');
+
+        $pendingByStage = DocumentAssignment::where('individual_status', 'pending')
+            ->with('document')
+            ->get()
+            ->groupBy('stage_id');
+
+        return view('admin.partials.workflow-config-results', compact('stages', 'activeCounts', 'historyCounts', 'pendingByStage'));
+    }
+
+    /** Cheap change-signal for the live-poll fallback — same pattern as overviewPoll(). */
+    public function workflowConfigPoll()
+    {
+        return response()->json([
+            'stages' => WorkflowStage::count(),
+            'pending' => DocumentAssignment::where('individual_status', 'pending')->count(),
+        ]);
     }
 
     public function storeStage(Request $request)
@@ -1431,28 +1965,32 @@ class AdminController extends Controller
             ->get()
             ->keyBy(fn (SlaHoliday $h) => $h->holiday_date->toDateString());
 
-        $settings = SlaSetting::current();
-
-        return view('admin.calendar', compact('month', 'holidays', 'settings'));
+        return view('admin.calendar', compact('month', 'holidays'));
     }
 
-    public function updateSlaSettings(Request $request)
+    /** Live-refresh fragment (Feature: realtime) — same grid data for the currently-viewed month, just the results. */
+    public function calendarRefresh(Request $request)
     {
-        $validated = $request->validate([
-            'work_start_time' => ['required', 'date_format:H:i'],
-            'work_end_time' => ['required', 'date_format:H:i', 'after:work_start_time'],
-            'working_days' => ['required', 'array', 'min:1'],
-            'working_days.*' => ['integer', 'between:0,6'],
+        $month = $request->filled('month') ? Carbon::parse($request->string('month') . '-01') : now()->startOfMonth();
+
+        $holidays = SlaHoliday::whereBetween('holiday_date', [$month->copy()->startOfMonth(), $month->copy()->endOfMonth()])
+            ->get()
+            ->keyBy(fn (SlaHoliday $h) => $h->holiday_date->toDateString());
+
+        return view('admin.partials.calendar-grid', compact('month', 'holidays'));
+    }
+
+    /** Cheap change-signal for the live-poll fallback, scoped to the visible month — same pattern as overviewPoll(). */
+    public function calendarPoll(Request $request)
+    {
+        $month = $request->filled('month') ? Carbon::parse($request->string('month') . '-01') : now()->startOfMonth();
+
+        $holidays = SlaHoliday::whereBetween('holiday_date', [$month->copy()->startOfMonth(), $month->copy()->endOfMonth()]);
+
+        return response()->json([
+            'count' => (clone $holidays)->count(),
+            'latest' => (clone $holidays)->max('updated_at'),
         ]);
-
-        $settings = SlaSetting::current();
-        $settings->update($validated + ['updated_by' => $request->user()->user_id]);
-
-        AuditLog::record($request->user()->user_id, null, 'sla_settings_update', 'Updated business-hours working window.');
-
-        $sync = $this->workflow->syncDueDatesWithCalendar();
-
-        return back()->with('status', 'Working hours updated.' . $this->calendarSyncSummary($sync));
     }
 
     public function storeHoliday(Request $request)
@@ -1526,7 +2064,12 @@ class AdminController extends Controller
 
         $violations = $showFolders ? null : (clone $query)
             ->with(['document', 'approver', 'assignment.adminOverrideBy', 'assignment.approver'])
-            ->orderByDesc('violation_timestamp')->paginate(20)->withQueryString();
+            ->orderByDesc('violation_timestamp')->paginate(5)->withQueryString()
+            // Real page route, not the implicit current-request path —
+            // also built from within violationsRefresh() (the live-poll
+            // fragment route); see paginateContainers()'s docblock for
+            // the full reasoning.
+            ->withPath(route('admin.sla.violations'));
 
         return view('admin.sla_violations', array_merge($this->violationStats($query, $request), [
             'showFolders' => $showFolders,
@@ -1545,9 +2088,31 @@ class AdminController extends Controller
     {
         $violations = (clone $this->violationsQuery($request))
             ->with(['document', 'approver', 'assignment.adminOverrideBy', 'assignment.approver'])
-            ->orderByDesc('violation_timestamp')->paginate(20)->withQueryString();
+            ->orderByDesc('violation_timestamp')->paginate(5)->withQueryString()
+            // Real page route, not the implicit current-request path —
+            // also built from within violationsRefresh() (the live-poll
+            // fragment route); see paginateContainers()'s docblock for
+            // the full reasoning.
+            ->withPath(route('admin.sla.violations'));
 
         return view('admin.partials.violations_results', compact('violations'));
+    }
+
+    /**
+     * Cheap change-signal for the live-poll fallback — scoped to the SAME
+     * filters currently applied (category/document/date range), same
+     * reasoning as Document Tracking's poll: an unrelated category's new
+     * violation shouldn't trigger a swap of a filtered view that wouldn't
+     * even show it.
+     */
+    public function violationsPoll(Request $request)
+    {
+        $query = $this->violationsQuery($request);
+
+        return response()->json([
+            'count' => (clone $query)->count(),
+            'latest' => (clone $query)->max('violation_timestamp'),
+        ]);
     }
 
     private function violationsQuery(Request $request)
@@ -1602,7 +2167,7 @@ class AdminController extends Controller
             ->orderByDesc('total')
             ->first();
 
-        // Disputed — how many of these breaches were later flagged by an
+        // Disputed — how many of these violations were later flagged by an
         // Admin as a bad auto-approval (see AdminController::
         // reviewAutoApproval()). Otherwise only visible per-row as a badge,
         // never as a total anywhere on this page.
@@ -1612,16 +2177,16 @@ class AdminController extends Controller
         $avgOverdue = (clone $query)->avg('duration_overdue');
 
         // Full roster for the "Top Approver" card's expanded view — EVERY
-        // approver, not just the ones with breaches, so a clean record is
-        // visible too, not just a leaderboard of offenders. breach_count
+        // approver, not just the ones with violations, so a clean record is
+        // visible too, not just a leaderboard of offenders. violation_count
         // respects the same filters as the rest of this report (so
         // narrowing the date range/category above narrows this too);
         // assignment_count is unfiltered by date (a lifetime total) so
-        // "0 breaches" can be read against "0 of 0 assignments" (never
+        // "0 violations" can be read against "0 of 0 assignments" (never
         // given work yet) vs "0 of 50" (a genuinely clean record).
         $approverRoster = User::where('role', 'approver')
             ->withCount([
-                'slaViolations as breach_count' => function ($q) use ($request) {
+                'slaViolations as violation_count' => function ($q) use ($request) {
                     if ($request->filled('document')) {
                         $term = $request->string('document');
                         $q->whereHas('document', fn ($dq) => $dq->where('title', 'like', "%{$term}%"));
@@ -1644,7 +2209,7 @@ class AdminController extends Controller
                     }
                 },
             ])
-            ->orderByDesc('breach_count')
+            ->orderByDesc('violation_count')
             ->orderBy('full_name')
             ->get();
 
@@ -1652,9 +2217,9 @@ class AdminController extends Controller
         // reveal. Not redundant with assigned_category: approvers can be
         // reassigned to a different category over time (see
         // AdminController::updateApproverStages()), but a SlaViolation
-        // records the category the DOCUMENT was in at breach time, not the
+        // records the category the DOCUMENT was in at violation time, not the
         // approver's current assignment — so someone reassigned mid-tenure
-        // can legitimately have breach history split across categories
+        // can legitimately have violation history split across categories
         // that the roster's single lumped total would otherwise hide.
         $byApproverCategory = (clone $query)
             ->join('document_repository', 'sla_violations.document_id', '=', 'document_repository.document_id')
@@ -1681,56 +2246,230 @@ class AdminController extends Controller
     // ---------------------------------------------------------------
 
     /**
-     * Session/auth events — hidden by default (see auditLogs()) since they
-     * dominate the list without being what's usually being audited for.
-     * Covers both the web session login/logout and the API's token-based
-     * equivalents (Api\AuthController) — same "routine noise" category,
-     * just a different transport, so the "Show login/logout events"
-     * checkbox should hide/reveal both consistently rather than only
-     * filtering the web ones.
+     * Every document-linked audit entry (upload, classify, validate,
+     * route, approve, stage_complete, ...) used to get its own top-level
+     * row — with several dozen entries per document, that buried the
+     * actual "what happened to this document" question under a wall of
+     * near-duplicate rows, especially once the nested "Movements" panel
+     * already showed the exact same data in one place. Now each document
+     * collapses to ONE row, anchored to its upload (or legacy import), and
+     * the full history lives in the expandable panel underneath — same
+     * data, once, not scattered across N rows. System-level entries with
+     * no document (workflow config, SLA settings, account changes, ML
+     * training) have nothing to collapse into, so they stay as their own
+     * rows exactly as before, interleaved chronologically with the
+     * document rows.
+     *
+     * The Action/Employees/date filters shift meaning to match: instead
+     * of matching one row's own action_type/user_id/timestamp, they now
+     * ask "does this document's history contain a matching entry
+     * anywhere" — filtering "rejected" surfaces every document that was
+     * rejected at some point, not a single rejected-labeled row.
      */
-    private const AUDIT_SESSION_ACTIONS = ['login', 'logout', 'api_login', 'api_logout'];
-
-    public function auditLogs(Request $request)
+    /**
+     * The document-row + system-row building/filtering logic shared by
+     * auditLogs() (full page) and auditLogsRefresh() (live-poll fragment)
+     * — kept in exactly one place so a live-swapped table can never drift
+     * from what a normal page load would have shown for the same filters.
+     */
+    private function buildAuditRows(Request $request): \Illuminate\Support\Collection
     {
-        $query = AuditLog::with(['user', 'document'])->orderByDesc('timestamp');
-
-        if ($request->filled('action_type')) {
-            $query->where('action_type', $request->string('action_type'));
-        }
+        $documentTerm = null;
+        $numericId = null;
         if ($request->filled('document')) {
             // Matches either a document title substring or, if the term
             // looks numeric (with or without a leading "#"), the exact
             // document_id — so "47" or "#47" both find it directly
             // without needing to know/guess the title.
-            $term = trim($request->string('document'));
-            $numericId = ltrim($term, '#');
-
-            $query->where(function ($q) use ($term, $numericId) {
-                $q->whereHas('document', fn ($q2) => $q2->where('title', 'like', "%{$term}%"));
-                if ($numericId !== '' && ctype_digit($numericId)) {
-                    $q->orWhere('document_id', (int) $numericId);
-                }
-            });
-        }
-        if ($request->filled('actor_id')) {
-            $query->where('user_id', $request->integer('actor_id'));
-        }
-        if ($request->filled('date_from')) {
-            $query->whereDate('timestamp', '>=', $request->date('date_from'));
-        }
-        if ($request->filled('date_to')) {
-            $query->whereDate('timestamp', '<=', $request->date('date_to'));
-        }
-        if (!$request->boolean('show_session')) {
-            $query->whereNotIn('action_type', self::AUDIT_SESSION_ACTIONS);
+            $documentTerm = trim($request->string('document'));
+            $numericId = ltrim($documentTerm, '#');
         }
 
-        $logs = $query->paginate(25)->withQueryString();
+        $documentRows = DocumentRepository::with('originator')
+            ->when($documentTerm !== null, function ($q) use ($documentTerm, $numericId) {
+                $q->where(function ($q2) use ($documentTerm, $numericId) {
+                    $q2->where('title', 'like', "%{$documentTerm}%");
+                    if ($numericId !== '' && ctype_digit($numericId)) {
+                        $q2->orWhere('document_id', (int) $numericId);
+                    }
+                });
+            })
+            ->when($request->filled('action_type'), fn ($q) => $q->whereHas(
+                'auditLogs', fn ($q2) => $q2->where('action_type', $request->string('action_type'))
+            ))
+            ->when($request->filled('actor_id'), function ($q) use ($request) {
+                $actorId = $request->integer('actor_id');
+                $q->where(function ($q2) use ($actorId) {
+                    $q2->where('originator_id', $actorId)
+                        ->orWhereHas('auditLogs', fn ($q3) => $q3->where('user_id', $actorId));
+                });
+            })
+            ->when($request->filled('date_from'), function ($q) use ($request) {
+                $from = $request->date('date_from');
+                $q->where(function ($q2) use ($from) {
+                    $q2->whereDate('upload_date', '>=', $from)
+                        ->orWhereHas('auditLogs', fn ($q3) => $q3->whereDate('timestamp', '>=', $from));
+                });
+            })
+            ->when($request->filled('date_to'), function ($q) use ($request) {
+                $to = $request->date('date_to');
+                $q->where(function ($q2) use ($to) {
+                    $q2->whereDate('upload_date', '<=', $to)
+                        ->orWhereHas('auditLogs', fn ($q3) => $q3->whereDate('timestamp', '<=', $to));
+                });
+            })
+            ->get()
+            ->map(fn (DocumentRepository $doc) => (object) [
+                'kind' => 'document',
+                'sort_at' => $doc->upload_date,
+                'document' => $doc,
+            ]);
+
+        // A document-name search has nothing meaningful to match against a
+        // system-level entry (no document at all) — skip fetching them
+        // entirely rather than returning a query that can never match.
+        $systemRows = $documentTerm !== null ? collect() : AuditLog::with('user')
+            ->whereNull('document_id')
+            ->when($request->filled('action_type'), fn ($q) => $q->where('action_type', $request->string('action_type')))
+            ->when($request->filled('actor_id'), fn ($q) => $q->where('user_id', $request->integer('actor_id')))
+            ->when($request->filled('date_from'), fn ($q) => $q->whereDate('timestamp', '>=', $request->date('date_from')))
+            ->when($request->filled('date_to'), fn ($q) => $q->whereDate('timestamp', '<=', $request->date('date_to')))
+            ->get()
+            ->map(fn (AuditLog $log) => (object) [
+                'kind' => 'system',
+                'sort_at' => $log->timestamp,
+                'log' => $log,
+            ]);
+
+        return $documentRows->concat($systemRows)->sortByDesc('sort_at')->values();
+    }
+
+    private function paginateAuditRows(Request $request): \Illuminate\Pagination\LengthAwarePaginator
+    {
+        $rows = $this->buildAuditRows($request);
+
+        $perPage = 13;
+        $page = (int) $request->input('page', 1);
+
+        return new \Illuminate\Pagination\LengthAwarePaginator(
+            $rows->forPage($page, $perPage)->values(),
+            $rows->count(),
+            $perPage,
+            $page,
+            // Real page route, not $request->url() — this is also built
+            // from within auditLogsRefresh() (the live-poll fragment
+            // route); see paginateContainers()'s docblock for the full
+            // reasoning.
+            ['path' => route('admin.audit.logs'), 'query' => $request->query()]
+        );
+    }
+
+    public function auditLogs(Request $request)
+    {
+        $logs = $this->paginateAuditRows($request);
 
         $actionTypes = AuditLog::select('action_type')->distinct()->orderBy('action_type')->pluck('action_type');
         $actors = User::orderBy('full_name')->get(['user_id', 'full_name']);
 
         return view('admin.audit_logs', compact('logs', 'actionTypes', 'actors'));
+    }
+
+    /**
+     * Renders just the results fragment (resources/views/admin/partials/
+     * audit-results.blade.php) for the live-poll JS to swap into place —
+     * see audit_logs.blade.php. Respects the same filters/page as a
+     * normal load (the JS forwards the current query string), so a live
+     * update never silently drops an active filter or jumps the admin
+     * back to page 1.
+     */
+    public function auditLogsRefresh(Request $request)
+    {
+        $logs = $this->paginateAuditRows($request);
+
+        return view('admin.partials.audit-results', compact('logs'));
+    }
+
+    /**
+     * Lightweight JSON endpoint the audit log page's JS polls as a
+     * fallback if the WebSocket connection is down — same "just the
+     * latest AuditLog id" signal already proven for the admin dashboard's
+     * own poll (see overviewPoll()), reused here rather than inventing a
+     * second cheap-signal shape.
+     */
+    public function auditLogsPoll()
+    {
+        return response()->json(['latest_log_id' => AuditLog::max('log_id')]);
+    }
+
+    // ---------------------------------------------------------------
+    // Document Tracking module
+    // ---------------------------------------------------------------
+
+    /**
+     * Every document ever submitted, in one place, permanently — unlike
+     * Archive (approved documents only) or the SLA queue (violated
+     * assignments only), nothing here is ever filtered out by outcome and
+     * nothing is ever removed once a document finishes. Each row links to
+     * the same tracking page (<x-workflow-stage-list> +
+     * <x-document-movement-timeline>) used elsewhere, so "every movement,
+     * who reviewed it, who approved/rejected it and why" is answerable
+     * for any document at any time.
+     */
+    private function buildDocumentTrackingQuery(Request $request)
+    {
+        return DocumentRepository::with(['originator', 'assignments.approver', 'assignments.stage'])
+            ->when($request->filled('document'), function ($q) use ($request) {
+                $term = trim($request->string('document'));
+                $numericId = ltrim($term, '#');
+                $q->where(function ($q2) use ($term, $numericId) {
+                    $q2->where('title', 'like', "%{$term}%");
+                    if ($numericId !== '' && ctype_digit($numericId)) {
+                        $q2->orWhere('document_id', (int) $numericId);
+                    }
+                });
+            })
+            ->when($request->filled('category'), fn ($q) => $q->where('ml_category', $request->string('category')))
+            ->when($request->filled('status'), fn ($q) => $q->where('global_status', $request->string('status')))
+            ->when($request->filled('originator_id'), fn ($q) => $q->where('originator_id', $request->integer('originator_id')))
+            ->orderByDesc('upload_date');
+    }
+
+    public function documents(Request $request)
+    {
+        $documents = $this->buildDocumentTrackingQuery($request)->paginate(5)->withQueryString()
+            // Real page route, not the implicit current-request path —
+            // this is also built from within documentsRefresh() (the
+            // live-poll fragment route); see paginateContainers()'s
+            // docblock for the full reasoning.
+            ->withPath(route('admin.documents.index'));
+
+        $categories = WorkflowStage::select('document_category')->distinct()->orderBy('document_category')->pluck('document_category');
+        $originators = User::where('role', 'originator')->orderBy('full_name')->get(['user_id', 'full_name']);
+
+        return view('admin.documents.index', compact('documents', 'categories', 'originators'));
+    }
+
+    /**
+     * Fragment for the live-poll JS to swap in place — see
+     * admin/documents/index.blade.php. Same reasoning as
+     * auditLogsRefresh(): respects the current filters/page so a live
+     * update never drops an active filter or resets pagination.
+     */
+    public function documentsRefresh(Request $request)
+    {
+        $documents = $this->buildDocumentTrackingQuery($request)->paginate(5)->withQueryString()
+            // Real page route, not the implicit current-request path —
+            // this is also built from within documentsRefresh() (the
+            // live-poll fragment route); see paginateContainers()'s
+            // docblock for the full reasoning.
+            ->withPath(route('admin.documents.index'));
+
+        return view('admin.partials.documents-results', compact('documents'));
+    }
+
+    /** Same cheap "latest AuditLog id" signal as auditLogsPoll() — a new upload, decision, or review event all write one. */
+    public function documentsPoll()
+    {
+        return response()->json(['latest_log_id' => AuditLog::max('log_id')]);
     }
 }

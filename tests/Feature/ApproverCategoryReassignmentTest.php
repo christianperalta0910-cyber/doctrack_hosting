@@ -80,6 +80,7 @@ it('still lets the approver decide on their pre-existing assignment after being 
     $approver->save();
     $approver->workflowStages()->sync([]);
 
+    seedReviewTime($approver, $assignment->document);
     $response = $this->actingAs($approver)->post(route('approver.assignments.decide', $assignment), [
         'decision' => 'approved',
     ]);

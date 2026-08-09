@@ -29,6 +29,13 @@ Broadcast::channel('admin-dashboard', function ($user) {
     return $user->isAdmin();
 });
 
+// Every approver, not one specific user — for broadcasts that affect the
+// whole role at once (e.g. SystemSettingsChanged), unlike approver.{userId}
+// above which targets one person's own queue.
+Broadcast::channel('approvers', function ($user) {
+    return $user->isApprover();
+});
+
 // Notification bell — every role has one, so this only checks identity,
 // not a specific role.
 Broadcast::channel('user.{userId}', function ($user, $userId) {

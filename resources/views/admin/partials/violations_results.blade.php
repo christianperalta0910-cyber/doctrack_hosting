@@ -4,9 +4,9 @@
     JS to swap in. Expects: $violations.
 --}}
 @php
-    // Nest by document — a document can rack up several breaches (one per
-    // stage, or repeat breaches over time), which previously showed as
-    // separate flat rows repeating the same title and made the report
+    // Nest by document — a document can rack up several violations (one
+    // per stage, or repeat violations over time), which previously showed
+    // as separate flat rows repeating the same title and made the report
     // noisy. Same pattern as the Admin dashboard's "SLA Override Alerts"
     // widget.
     $violationsByDocument = $violations->getCollection()->groupBy('document_id');
@@ -16,7 +16,6 @@
     @forelse($violationsByDocument as $docViolations)
         @php
             $doc = $docViolations->first()->document;
-            $latest = $docViolations->first(); // already ordered newest-first from the query
             $count = $docViolations->count();
         @endphp
         <details class="group">
@@ -40,25 +39,22 @@
                     </div>
                 </div>
                 <div class="flex items-center gap-3 shrink-0">
-                    <span class="hidden sm:inline text-xs text-surface-400">Latest
-                        <span data-live-time="{{ $latest->violation_timestamp->timestamp }}">{{ $latest->violation_timestamp->diffForHumans() }}</span>
-                    </span>
                     @if($doc)
-                        {{-- Status of the document RIGHT NOW, not at breach time — a
+                        {{-- Status of the document RIGHT NOW, not at violation time — a
                              violation here is a historical log entry, so the document
                              may well already be resolved since. This is the single most
                              useful signal for triage: still needs attention vs. handled. --}}
                         <x-status-badge :status="$doc->display_status" />
                     @endif
                     <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-rejected-50 text-rejected-700 ring-1 ring-inset ring-rejected-500/20">
-                        {{ $count }} breach{{ $count === 1 ? '' : 'es' }}
+                        {{ $count }} violation{{ $count === 1 ? '' : 's' }}
                     </span>
                 </div>
             </summary>
 
             <div class="px-6 pb-4">
                 <div class="hidden sm:grid grid-cols-[minmax(150px,170px)_1fr_1fr_minmax(150px,170px)] gap-4 px-3 py-1.5 text-surface-400 text-[11px] font-semibold uppercase tracking-wide">
-                    <span>Breached</span>
+                    <span>Violated</span>
                     <span>Stage</span>
                     <span>Approver</span>
                     <span>Resolved</span>
@@ -70,11 +66,11 @@
                             // precise than violation_timestamp, which only records when the
                             // periodic sweep happened to notice — fall back to it for
                             // violations logged before assignment_id was linked.
-                            $breachedAt = $v->assignment->sla_expires_at ?? $v->violation_timestamp;
+                            $violatedAt = $v->assignment->sla_expires_at ?? $v->violation_timestamp;
                             $resolvedStatus = $v->assignment->individual_status ?? null;
                         @endphp
                         <div class="grid grid-cols-2 sm:grid-cols-[minmax(150px,170px)_1fr_1fr_minmax(150px,170px)] gap-x-4 gap-y-0.5 text-xs py-2 px-3 rounded-lg odd:bg-surface-50/50">
-                            <span class="col-span-2 sm:col-span-1 text-surface-500 whitespace-nowrap">{{ $breachedAt->format('M j, Y g:i A') }}</span>
+                            <span class="col-span-2 sm:col-span-1 text-surface-500 whitespace-nowrap">{{ $violatedAt->format('M j, Y g:i A') }}</span>
                             <span class="text-surface-700 font-medium truncate">{{ $v->stage_name }}</span>
                             <span class="text-surface-600 truncate">{{ $v->approver->full_name ?? 'Unassigned' }}</span>
                             <span class="col-span-2 sm:col-span-1">
@@ -87,7 +83,7 @@
                                         $a = $v->assignment;
                                         // Once escalated, the original approver can no longer
                                         // act (see ApprovalController's 409 guard) — so a
-                                        // resolved breach was always either an Admin override
+                                        // resolved violation was always either an Admin override
                                         // or the system's own grace-window auto-approval.
                                         $resolvedBy = $a->auto_approved
                                             ? 'Auto-approved by system'

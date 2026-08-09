@@ -146,8 +146,8 @@ test('the approver roster includes approvers with zero breaches, ranked by breac
     expect($roster->pluck('full_name')->all())->toContain('Offender Approver', 'Clean Approver');
     $offenderRow = $roster->firstWhere('full_name', 'Offender Approver');
     $cleanRow = $roster->firstWhere('full_name', 'Clean Approver');
-    expect($offenderRow->breach_count)->toBe(1)
-        ->and($cleanRow->breach_count)->toBe(0)
+    expect($offenderRow->violation_count)->toBe(1)
+        ->and($cleanRow->violation_count)->toBe(0)
         ->and($roster->search(fn ($a) => $a->full_name === 'Offender Approver'))
         ->toBeLessThan($roster->search(fn ($a) => $a->full_name === 'Clean Approver'));
 });

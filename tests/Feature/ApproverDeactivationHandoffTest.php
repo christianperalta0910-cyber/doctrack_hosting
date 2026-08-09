@@ -93,7 +93,7 @@ test('an optional deactivation reason is stored on the reassigned assignment and
     expect($toggleLog->description)->toContain('Resigned from the company.');
 });
 
-test('when no eligible approver exists, the assignment escalates immediately without an SlaViolation', function () {
+test('when no eligible approver exists, the assignment is flagged needs_approver instead of escalated to SLA', function () {
     $admin = User::factory()->admin()->create();
     // The ONLY approver for this category — no one else eligible.
     $onlyApprover = User::factory()->approver('Service Report')->create();
@@ -102,12 +102,14 @@ test('when no eligible approver exists, the assignment escalates immediately wit
     $this->actingAs($admin)->post(route('admin.users.toggle', $onlyApprover))->assertRedirect();
 
     $fresh = $assignment->fresh();
-    expect($fresh->escalated_to_admin)->toBeTrue()
-        ->and($fresh->escalation_reason)->toBe('no_eligible_approver')
-        ->and($fresh->reassigned_from)->toBeNull() // never reassigned, escalated instead
-        ->and($fresh->user_id)->toBe($onlyApprover->user_id); // stays with them, just escalated
+    expect($fresh->needs_approver)->toBeTrue()
+        ->and($fresh->needs_approver_at)->not->toBeNull()
+        ->and($fresh->escalated_to_admin)->toBeFalse() // must never look like an SLA escalation
+        ->and($fresh->reassigned_from)->toBe($onlyApprover->user_id) // recorded for the "Admin note" display
+        ->and($fresh->user_id)->toBe($onlyApprover->user_id); // stays with them, just flagged
 
     expect(SlaViolation::where('assignment_id', $fresh->assignment_id)->exists())->toBeFalse();
+    expect(AuditLog::where('action_type', 'needs_approver')->exists())->toBeTrue();
     expect(NotificationRecord::where('recipient_id', $admin->user_id)->where('priority', 'high')->exists())->toBeTrue();
 });
 

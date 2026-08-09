@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Model;
  * SlaViolation
  * ------------
  * Section 4: SLA Violation & Accountability. Logged the moment an
- * assignment's SLA window is detected as breached (see
+ * assignment's SLA window is detected as violated (see
  * CheckParallelSlas). stage_name is a denormalized snapshot rather than a
  * stage_id FK so historical violations stay meaningful even after a stage
  * is later renamed/archived/deleted.

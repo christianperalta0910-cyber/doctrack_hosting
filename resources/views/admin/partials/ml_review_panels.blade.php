@@ -14,7 +14,7 @@
     <div class="lg:col-span-3">
         <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
             <div class="px-6 py-3 border-b border-surface-200">
-                <h2 class="text-sm font-semibold text-surface-900">Awaiting ML Review ({{ $reviewQueue->count() }})</h2>
+                <h2 class="text-sm font-semibold text-surface-900">Awaiting ML Review ({{ $reviewQueue->total() }})</h2>
                 <p class="text-xs text-surface-500 mt-0.5">
                     These documents classified below {{ config('ml.review_confidence_threshold', 70) }}% confidence and are being <strong>held —
                     not yet routed to any approver</strong>. <strong>Confirm</strong> routes it for approval using the category you pick and adds
@@ -129,6 +129,66 @@
                     </li>
                 @endforeach
             </ul>
+            @if($reviewQueue->hasPages())
+                <div class="px-6 py-4 border-t border-surface-200">{{ $reviewQueue->links() }}</div>
+            @endif
+        </div>
+    </div>
+@endif
+
+@if($readabilityQueue->isNotEmpty())
+    <div class="lg:col-span-3">
+        <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
+            <div class="px-6 py-3 border-b border-surface-200">
+                <h2 class="text-sm font-semibold text-surface-900">Content Readability Review ({{ $readabilityQueue->total() }})</h2>
+                <p class="text-xs text-surface-500 mt-0.5">
+                    These documents passed classification and every required section, but their content didn't clearly match known
+                    vocabulary for their category and are being <strong>held — not yet routed to any approver</strong>.
+                    <strong>Confirm</strong> stages this document into that category's training vocabulary (so future documents with the
+                    same wording score higher too) and routes it for approval. <strong>Reject</strong> if the content genuinely looks
+                    garbled or wrong — the originator will be asked to resubmit.
+                </p>
+            </div>
+            <ul class="divide-y divide-surface-100">
+                @foreach($readabilityQueue as $doc)
+                    <li class="px-6 py-4">
+                        <p class="text-sm font-medium text-surface-800 truncate">
+                            {{ $doc->title }}
+                        </p>
+                        <p class="text-xs text-surface-400 mt-0.5">
+                            Category: <span class="font-medium text-surface-600">{{ $doc->ml_category }}</span>
+                            &middot;
+                            <span class="font-medium text-processing-700">{{ $doc->readability_score }}% readability</span>
+                            (needs {{ config('ml.min_real_word_ratio', 0.7) * 100 }}%)
+                            &middot;
+                            <button type="button"
+                                onclick="openDocumentViewer('{{ route('documents.file', $doc) }}', '{{ $doc->mime_type }}', '{{ addslashes($doc->original_filename ?? $doc->title) }}')"
+                                class="font-medium text-primary-700 hover:underline">
+                                View File
+                            </button>
+                            &middot; uploaded by {{ $doc->originator->full_name ?? 'a former account' }}
+                            @if($doc->ml_review_status === 'pending')
+                                &middot; <span class="text-processing-700 font-medium">also awaiting classification review</span>
+                            @endif
+                        </p>
+
+                        <form method="POST" action="{{ route('admin.ml.review.readability', $doc) }}" class="mt-3 flex flex-wrap items-center gap-2">
+                            @csrf
+                            <button type="submit" name="action" value="confirm"
+                                class="text-xs font-medium bg-approved-600 hover:bg-approved-700 text-white px-3 py-1.5 rounded-lg transition-colors">
+                                Confirm
+                            </button>
+                            <button type="submit" name="action" value="reject"
+                                class="text-xs font-medium bg-rejected-600 hover:bg-rejected-700 text-white px-3 py-1.5 rounded-lg transition-colors">
+                                Reject
+                            </button>
+                        </form>
+                    </li>
+                @endforeach
+            </ul>
+            @if($readabilityQueue->hasPages())
+                <div class="px-6 py-4 border-t border-surface-200">{{ $readabilityQueue->links() }}</div>
+            @endif
         </div>
     </div>
 @endif

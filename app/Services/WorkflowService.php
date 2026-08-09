@@ -10,6 +10,7 @@ use App\Mail\DocumentDecisionMail;
 use App\Models\AuditLog;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentRepository;
+use App\Models\DocumentReviewSession;
 use App\Models\NotificationRecord;
 use App\Models\User;
 use App\Models\WorkflowStage;
@@ -28,43 +29,44 @@ use Illuminate\Support\Facades\Mail;
  *   processing -> classified_validated -> approved   (or auto_approved)
  *                                       -> rejected
  *
- * SINGLE-ASSIGNMENT, LOAD-BALANCED APPROVAL MODEL: every configured stage
+ * ALL-ELIGIBLE-APPROVERS, UNANIMOUS APPROVAL MODEL: every configured stage
  * for a document's category is routed the moment the document is uploaded
  * (see routeToWorkflow()) — not one at a time. Each stage is routed to
- * exactly ONE eligible approver: whichever eligible approver currently has
- * the fewest pending assignments (see selectApproverForStage()). This
- * guarantees a document is never visible in more than one approver's
- * queue for the same stage at the same time, so two approvers can never
- * act on — or race to approve — the same stage.
+ * EVERY eligible approver simultaneously (see assignStage()), one
+ * DocumentAssignment row each, all sharing the same stage_id. A stage only
+ * completes once every one of those rows is non-pending (see
+ * completeStage()); a single rejection from ANY of them immediately kills
+ * the whole document, same as before. There is no more load-balanced
+ * "pick one" step for normal routing — is_busy no longer gates assignment
+ * at all, since "assign everyone" and "skip whoever's busy" are
+ * contradictory goals. The old one-winner ranking (rankApprovers()) still
+ * exists and is still used, but only by findReplacementApprover() for the
+ * deactivation-handoff case, which is a genuinely different operation:
+ * replacing one lost seat, not routing a stage.
  *
  * Because every stage is assigned up front, a document can have more than
  * one stage pending at once (e.g. Stage 2 assigned to a specialist while
  * Stage 1 is still awaiting a different approver's decision). Stages
  * resolve independently of each other and of sequence order; the document
- * only finalizes once every stage's assignment has been resolved (see
+ * only finalizes once every stage's every seat has been resolved (see
  * completeStage()).
  *
  * ELIGIBILITY: an approver is eligible for a stage if (a) their
  * assigned_category matches the document, and (b) either they have no
  * specific stage restrictions at all (eligible for every stage in their
  * category by default) or this stage is explicitly among their assigned
- * stages (User::workflowStages()). Among eligible approvers, the one
- * currently carrying the least workload (fewest pending assignments) is
- * selected; ties are broken by fairness (whoever's last assignment was
- * longest ago), and approvers marked busy/away are skipped unless doing so
- * would leave nobody eligible at all.
- *
- * Example: if Approver A covers stages 1–3 and Approver B is dedicated to
- * stage 2 only, stage 2 goes to whichever of them has fewer pending
- * documents at that moment — including Approver B outright if Approver A
- * just picked up stage 1 for this same document a moment earlier, since
- * that pending assignment already counts against them.
+ * stages (User::workflowStages()). Every eligible approver gets a seat —
+ * there is no ranking/selection among them for normal routing.
  *
  * Each assignment's SLA window is 25% of the minutes remaining until the
  * document's own absolute due_date, computed at minute granularity so it
  * scales smoothly rather than in coarse hour jumps. Due dates at or under
  * 1 hour away skip the percentage and get a flat 15-minute window instead.
- * Either way, the window never extends past the due_date itself.
+ * Either way, the window never extends past the due_date itself. Every
+ * seat on a stage shares the identical window (computed once per stage,
+ * not once per approver), and each seat escalates/auto-approves
+ * completely independently of its siblings — an Admin override or
+ * auto-approval on one seat fills only that seat, not the whole stage.
  */
 class WorkflowService
 {
@@ -121,9 +123,11 @@ class WorkflowService
      * still in the pipeline and their still-pending, non-escalated
      * assignments; SLA windows are then re-synced against the (possibly
      * new) due dates via recalculatePendingSlaDeadlines(). Call after
-     * AdminController::storeHoliday()/updateSlaSettings() — never needed
-     * for destroyHoliday(), since removing a holiday only ever frees up
-     * days, it never invalidates an existing due date.
+     * AdminController::storeHoliday() — never needed for destroyHoliday(),
+     * since removing a holiday only ever frees up days, it never
+     * invalidates an existing due date. The working window itself
+     * (start/end time, working days) is a fixed config value now, not
+     * admin-editable, so nothing else can trigger this anymore.
      *
      * @return array{documents_shifted: int, assignments_recalculated: int}
      */
@@ -183,9 +187,9 @@ class WorkflowService
      *         unrelated submission — links the two into a version chain
      *         instead of leaving the rejection as a dead end.
      */
-    public function ingest(UploadedFile $file, User $originator, string $dueDate, ?int $batchId = null, ?DocumentRepository $revisionOf = null): DocumentRepository
+    public function ingest(UploadedFile $file, User $originator, string $dueDate, ?int $batchId = null, ?DocumentRepository $revisionOf = null, bool $requiresPrinting = false): DocumentRepository
     {
-        return DB::transaction(function () use ($file, $originator, $dueDate, $batchId, $revisionOf) {
+        return DB::transaction(function () use ($file, $originator, $dueDate, $batchId, $revisionOf, $requiresPrinting) {
             $storedPath = $file->store('documents', 'local');
 
             $document = DocumentRepository::create([
@@ -199,6 +203,9 @@ class WorkflowService
                 'global_status' => 'processing',
                 'previous_version_id' => $revisionOf?->document_id,
                 'version_number' => $revisionOf ? $revisionOf->version_number + 1 : 1,
+                // Purely the originator's own explicit checkbox at upload
+                // — see DocumentController::store().
+                'requires_printing' => $requiresPrinting,
             ]);
 
             AuditLog::record($originator->user_id, $document->document_id, 'upload', "Document '{$document->title}' submitted.");
@@ -267,14 +274,41 @@ class WorkflowService
             $validation = $this->validator->validate($result['category'], $extraction['text']);
             $document->is_validated = $validation['is_valid'];
             $document->validation_errors = $validation['errors'];
+            $document->readability_score = $validation['readability_score'];
 
-            $document->global_status = $validation['is_valid'] ? 'classified_validated' : 'processing';
+            // Readability failing ALONE (required sections present, word
+            // count met) is a judgment call, not a definite defect — held
+            // for admin review same as low classification confidence,
+            // rather than a flat block with no recourse. Any OTHER
+            // validation failure (missing section, too short) is objective
+            // and stays a hard block: there's nothing for a human to weigh
+            // in on until that's fixed, so no review is offered.
+            $needsReadabilityReview = $validation['readability_only_failure'];
+            if ($needsReadabilityReview) {
+                $document->readability_review_status = 'pending';
+            }
+
+            // Valid (or held only for readability, not an objective
+            // failure) determines whether this document has a shot at
+            // reaching the workflow at all; whether it does so NOW depends
+            // on whether either review gate is still pending.
+            $canRoute = $validation['is_valid'] || $needsReadabilityReview;
+            $readyToRoute = $canRoute && !$needsClassificationReview && !$needsReadabilityReview;
+
+            $document->global_status = $canRoute ? 'classified_validated' : 'processing';
             $document->save();
 
             AuditLog::record(null, $document->document_id, 'validate',
                 $validation['is_valid'] ? 'Validation passed.' : 'Validation failed: ' . implode('; ', $validation['errors']));
 
-            if ($validation['is_valid'] && $needsClassificationReview) {
+            if ($readyToRoute) {
+                $this->routeToWorkflow($document);
+            } elseif ($needsClassificationReview && $needsReadabilityReview) {
+                NotificationRecord::send($originator->user_id, $document->document_id,
+                    "Your document '{$document->title}' is awaiting admin review for both its classification confidence " .
+                    "({$result['confidence']}%) and its content readability ({$validation['readability_score']}%) before it's routed for approval.");
+                event(new DocumentStatusChanged($document));
+            } elseif ($needsClassificationReview) {
                 NotificationRecord::send($originator->user_id, $document->document_id,
                     "Your document '{$document->title}' passed validation, but its classification confidence was low " .
                     "({$result['confidence']}%). An admin will confirm its category before it's routed for approval.");
@@ -285,8 +319,12 @@ class WorkflowService
                 // Training page's review queue would only pick up a newly
                 // held document on the next manual reload.
                 event(new DocumentStatusChanged($document));
-            } elseif ($validation['is_valid']) {
-                $this->routeToWorkflow($document);
+            } elseif ($needsReadabilityReview) {
+                NotificationRecord::send($originator->user_id, $document->document_id,
+                    "Your document '{$document->title}' passed classification and its required sections, but its content " .
+                    "didn't clearly match known vocabulary for '{$result['category']}' (readability score " .
+                    "{$validation['readability_score']}%). An admin will review it before it's routed for approval.");
+                event(new DocumentStatusChanged($document));
             } else {
                 NotificationRecord::send($originator->user_id, $document->document_id,
                     "Your document '{$document->title}' failed validation: " . implode('; ', $validation['errors']));
@@ -355,8 +393,9 @@ class WorkflowService
      * Every eligible approver for a specific stage: matching category,
      * active account, and either unrestricted (no specific stage picks —
      * eligible for every stage in their category by default) or
-     * explicitly assigned to this stage. Does NOT pick a single winner —
-     * see selectApproverForStage() for the load-balanced pick from this pool.
+     * explicitly assigned to this stage. assignStage() gives every one of
+     * these a seat; only findReplacementApprover() further narrows this
+     * pool down to a single winner (via rankApprovers()).
      */
     private function eligibleApproversForStage(DocumentRepository $document, WorkflowStage $stage): Collection
     {
@@ -373,32 +412,26 @@ class WorkflowService
     }
 
     /**
-     * Selects exactly ONE approver for a stage (Feature: single-assignment
-     * load balancing): whichever eligible approver currently has the
-     * fewest pending assignments across all documents/stages. This is what
-     * guarantees a document is routed to exactly one approver's queue at a
-     * time instead of racing across multiple approvers, and lets an
-     * approver dedicated to a specific stage take it over a busier
-     * unrestricted peer even mid-pipeline.
+     * Workload-balanced ranking, used only by findReplacementApprover()
+     * (the deactivation-handoff case) — normal stage routing no longer
+     * picks a single winner at all (see assignStage()), so this only ever
+     * ranks a candidate pool that's already been filtered down to one lost
+     * seat's replacement options.
      *
      * Approvers marked busy/away are skipped in favor of an available
-     * peer, unless every eligible approver is busy — an approver who
-     * forgot to toggle back "available" should never permanently block a
-     * document.
-     *
-     * Ties in workload are broken by fairness, not by an arbitrary ID:
-     * whichever tied approver's most recent assignment (of any status)
-     * happened longest ago gets this one — "the approver who gets a
-     * document first" rather than whoever "gets a document recently".
-     * An approver who has never received an assignment is treated as
+     * peer, unless every candidate is busy. Ties in workload are broken by
+     * fairness, not by an arbitrary ID: whichever tied approver's most
+     * recent assignment (of any status) happened longest ago gets this
+     * one; an approver who has never received an assignment is treated as
      * having waited the longest and wins the tie outright.
+     *
+     * @param Collection<int, User> $candidates
+     * @return Collection<int, User> ranked best-first; empty if $candidates was empty
      */
-    private function selectApproverForStage(DocumentRepository $document, WorkflowStage $stage): ?User
+    private function rankApprovers(Collection $candidates): Collection
     {
-        $candidates = $this->eligibleApproversForStage($document, $stage);
-
         if ($candidates->isEmpty()) {
-            return null;
+            return collect();
         }
 
         $available = $candidates->reject(fn (User $approver) => $approver->is_busy)->values();
@@ -442,7 +475,7 @@ class WorkflowService
             return strcmp($lastA, $lastB);
         });
 
-        return $ranked[0] ?? null;
+        return collect($ranked);
     }
 
     /**
@@ -519,9 +552,9 @@ class WorkflowService
 
     /**
      * Re-syncs every still-pending, not-yet-escalated assignment's SLA
-     * deadline against the current calendar. Call after any SlaSetting/
-     * SlaHoliday change — see AdminController::storeHoliday()/
-     * destroyHoliday()/updateSlaSettings(). Escalated assignments are left
+     * deadline against the current calendar. Call after any SlaHoliday
+     * change — see AdminController::storeHoliday()/destroyHoliday().
+     * Escalated assignments are left
      * alone (they've already left the approver's queue for Admin
      * resolution — recalculating their deadline now would be meaningless).
      * If recalculation pushes a deadline into the past, it's simply
@@ -570,17 +603,20 @@ class WorkflowService
     }
 
     /**
-     * Creates exactly ONE DocumentAssignment for this stage — the eligible
-     * approver currently carrying the fewest pending assignments (Feature:
-     * single-assignment load balancing; see selectApproverForStage()). A
-     * document is therefore only ever visible in one approver's queue at a
-     * time for a given stage.
+     * Creates one DocumentAssignment PER eligible approver for this stage
+     * (Feature: unanimous approval — every eligible approver must sign off
+     * before the stage completes; see completeStage()). All seats share an
+     * identical sla_expires_at, computed once here rather than once per
+     * approver, so nobody's window is skewed by loop wall-clock time.
+     * is_busy is not consulted — every eligible approver gets a seat
+     * regardless of busy status, since "assign everyone" and "skip busy
+     * ones" can't both hold.
      */
     private function assignStage(DocumentRepository $document, WorkflowStage $stage): void
     {
-        $approver = $this->selectApproverForStage($document, $stage);
+        $approvers = $this->eligibleApproversForStage($document, $stage);
 
-        if (!$approver) {
+        if ($approvers->isEmpty()) {
             AuditLog::record(null, $document->document_id, 'route_no_approver',
                 "No active approver is eligible for stage '{$stage->stage_name}' (category '{$document->ml_category}'). " .
                 'An Admin must create/assign an approver for this category and stage.');
@@ -596,46 +632,203 @@ class WorkflowService
         $slaExpiresAt = $this->computeApproverSlaExpiry($document);
         $priorityRank = $this->computePriority($document->due_date);
 
-        $assignment = DocumentAssignment::create([
-            'document_id' => $document->document_id,
-            'user_id' => $approver->user_id,
-            'stage_id' => $stage->stage_id,
-            'due_date' => $document->due_date,
-            'priority_rank' => $priorityRank,
-            'individual_status' => 'pending',
-            'sla_expires_at' => $slaExpiresAt,
-        ]);
+        foreach ($approvers as $approver) {
+            $assignment = DocumentAssignment::create([
+                'document_id' => $document->document_id,
+                'user_id' => $approver->user_id,
+                'stage_id' => $stage->stage_id,
+                'due_date' => $document->due_date,
+                'priority_rank' => $priorityRank,
+                'individual_status' => 'pending',
+                'sla_expires_at' => $slaExpiresAt,
+            ]);
 
-        // True event-driven escalation (Section 4/5): fires at the exact
-        // deadline instant instead of waiting for the next periodic sweep —
-        // see EscalateAssignmentJob's docblock for the staleness guard that
-        // makes this safe across later recalculation.
-        EscalateAssignmentJob::dispatch($assignment->assignment_id, $slaExpiresAt)->delay($slaExpiresAt);
+            // True event-driven escalation (Section 4/5): fires at the exact
+            // deadline instant instead of waiting for the next periodic sweep —
+            // see EscalateAssignmentJob's docblock for the staleness guard that
+            // makes this safe across later recalculation. Each seat escalates
+            // completely independently of its siblings.
+            EscalateAssignmentJob::dispatch($assignment->assignment_id, $slaExpiresAt)->delay($slaExpiresAt);
 
-        NotificationRecord::send($approver->user_id, $document->document_id,
-            "New document assigned for '{$stage->stage_name}': {$document->title}.");
+            NotificationRecord::send($approver->user_id, $document->document_id,
+                "New document assigned for '{$stage->stage_name}': {$document->title}.");
 
-        if ($approver->email) {
-            Mail::to($approver->email)->queue(new DocumentAssignedMail($document, $stage, $approver));
+            if ($approver->email) {
+                Mail::to($approver->email)->queue(new DocumentAssignedMail($document, $stage, $approver));
+            }
         }
 
         AuditLog::record(null, $document->document_id, 'route',
-            "Stage '{$stage->stage_name}': assigned to {$approver->full_name} — least active workload among eligible approvers " .
-            "(category '{$document->ml_category}'). SLA window expires {$slaExpiresAt->toDayDateTimeString()}.");
+            "Stage '{$stage->stage_name}': assigned to all {$approvers->count()} eligible approver(s) " .
+            "(category '{$document->ml_category}') — {$approvers->pluck('full_name')->implode(', ')}. " .
+            "SLA window expires {$slaExpiresAt->toDayDateTimeString()} for each; the stage completes once every one has responded.");
     }
 
     /**
-     * Deactivation handoff (Feature) — same load-balanced selection normal
-     * routing uses (eligibleApproversForStage() + selectApproverForStage()),
-     * just pointed at an EXISTING assignment's document/stage instead of a
-     * brand-new one. Returns null if nobody is eligible (e.g. the
-     * deactivated approver was the only one for this stage) — the caller
-     * (AdminController::toggleUser()) falls back to
+     * Deactivation handoff (Feature) — the one place that still picks a
+     * SINGLE replacement (rankApprovers()), because this is
+     * replacing one lost seat, not routing a stage — normal routing now
+     * assigns every eligible approver at once (see assignStage()), so this
+     * candidate pool can legitimately include siblings who already hold
+     * their OWN independent seat on this exact (document, stage) — newly
+     * possible now that more than one approver can be assigned to a stage
+     * at all. Excluding them keeps one person from ending up holding two
+     * rows for the same stage. Returns null if nobody is eligible (e.g.
+     * the deactivated approver was the only one for this stage) — the
+     * caller (AdminController::toggleUser()) falls back to
      * SlaService::escalateForReassignmentFailure() in that case.
      */
     public function findReplacementApprover(DocumentAssignment $assignment): ?User
     {
-        return $this->selectApproverForStage($assignment->document, $assignment->stage);
+        $alreadyHoldingASeat = DocumentAssignment::where('document_id', $assignment->document_id)
+            ->where('stage_id', $assignment->stage_id)
+            ->where('assignment_id', '!=', $assignment->assignment_id)
+            ->pluck('user_id');
+
+        $candidates = $this->eligibleApproversForStage($assignment->document, $assignment->stage)
+            ->reject(fn (User $approver) => $alreadyHoldingASeat->contains($approver->user_id))
+            ->values();
+
+        return $this->rankApprovers($candidates)->first();
+    }
+
+    /**
+     * Whether $assignment has at least one sibling seat on the exact same
+     * (document, stage) that still represents a REAL approver — every
+     * OTHER eligible approver already got their own seat when the stage
+     * was first routed (see assignStage()), which is why
+     * findReplacementApprover() above almost never finds anyone: the only
+     * people who'd qualify as a genuine replacement are approvers who
+     * became eligible AFTER routing. AdminController::toggleUser() uses
+     * this to decide, once no replacement was found, whether the vacated
+     * seat can simply be withdrawn (a sibling already covers this stage —
+     * see withdrawAssignment()) or truly needs an Admin (no sibling at
+     * all — see SlaService::escalateForReassignmentFailure()).
+     *
+     * Excludes already-withdrawn siblings deliberately: if two approvers on
+     * the same stage are deactivated back to back, the first one's seat
+     * withdraws (covered by the second), but the second one's own
+     * deactivation must NOT also see that withdrawn row and withdraw
+     * itself too — that would leave the stage with zero real seats left,
+     * yet completeStage() would still treat it as fully resolved and
+     * silently finalize the document as "approved" with nobody having
+     * actually decided anything. Only a still-pending/already-decided
+     * sibling counts as real coverage; a withdrawn one does not.
+     */
+    public function hasSiblingSeat(DocumentAssignment $assignment): bool
+    {
+        return DocumentAssignment::where('document_id', $assignment->document_id)
+            ->where('stage_id', $assignment->stage_id)
+            ->where('assignment_id', '!=', $assignment->assignment_id)
+            ->where('individual_status', '!=', 'withdrawn')
+            ->exists();
+    }
+
+    /**
+     * Withdraws a pending seat that has nothing left to decide — its holder
+     * was deactivated, but at least one sibling approver already covers
+     * this exact stage independently (see hasSiblingSeat()), so unlike
+     * escalateForReassignmentFailure() this never involves Admin at all.
+     * Re-runs completeStage()'s own stage/document-completion gate
+     * immediately afterward ('approved', not auto — this is an
+     * administrative housekeeping action, not an SLA timeout), in case this
+     * withdrawal was the last pending seat blocking the stage or document.
+     */
+    public function withdrawAssignment(DocumentAssignment $assignment, User $oldApprover, ?string $reason = null): void
+    {
+        $assignment->individual_status = 'withdrawn';
+        $assignment->acted_at = now();
+        $assignment->reassigned_at = now();
+        $assignment->reassigned_from = $oldApprover->user_id;
+        $assignment->reassignment_reason = $reason;
+        $assignment->save();
+
+        AuditLog::record(null, $assignment->document_id, 'assignment_withdrawn',
+            "Seat on stage '{$assignment->stage->stage_name}' for '{$assignment->document->title}' withdrawn — " .
+            "{$oldApprover->full_name}'s account was deactivated and another approver already covers this stage." .
+            ($reason ? " Reason: \"{$reason}\"" : ''));
+
+        $this->completeStage($assignment, 'approved');
+    }
+
+    /**
+     * A pending seat with genuinely nobody eligible to take it over — no
+     * sibling seat exists on this stage (see hasSiblingSeat()) and
+     * findReplacementApprover() found nobody either, using the exact same
+     * category+stage eligibility rule normal routing uses (deliberately
+     * NOT broadened for this case). Unlike the old escalateForReassignment
+     * Failure() this replaces, this never touches escalated_to_admin or
+     * creates any SLA-flavored trail — the assignment's holder didn't fail
+     * an SLA deadline, they were deactivated with nothing else available,
+     * so folding it into the SLA Override Queue would misrepresent it and
+     * unfairly count against them once resolved. Instead it's flagged
+     * needs_approver and surfaced in the separate Unassigned Documents
+     * module (see AdminController::unassignedDocuments()), where an Admin
+     * decides it directly themselves — see adminDecideUnassigned() below.
+     * Deliberately no "assign anyone" bypass: eligibility stays strictly
+     * tied to each approver's assigned category/stages even here.
+     */
+    public function markNeedsApprover(DocumentAssignment $assignment, User $oldApprover, ?string $reason = null): void
+    {
+        $assignment->needs_approver = true;
+        $assignment->needs_approver_at = now();
+        $assignment->reassigned_from = $oldApprover->user_id;
+        $assignment->reassignment_reason = $reason;
+        $assignment->save();
+
+        AuditLog::record(null, $assignment->document_id, 'needs_approver',
+            "Stage '{$assignment->stage->stage_name}' on '{$assignment->document->title}' has no eligible approver — " .
+            "{$oldApprover->full_name}'s account was deactivated and nobody else qualifies for this category/stage." .
+            ($reason ? " Reason: \"{$reason}\"" : '') . ' Moved to the Unassigned Documents queue.');
+
+        foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
+            NotificationRecord::send($admin->user_id, $assignment->document_id,
+                "'{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') needs an approver — " .
+                'nobody is currently eligible after an account deactivation. See Unassigned Documents.', 'high');
+        }
+
+        event(new DocumentStatusChanged($assignment->document));
+    }
+
+    /**
+     * Admin decides a needs_approver seat directly rather than assigning it
+     * to anyone — same mechanics as SlaService::adminOverride() (reuses the
+     * same admin_override_at/by fields — an Admin deciding on someone
+     * else's behalf, regardless of which queue brought them there) but
+     * deliberately kept in WorkflowService rather than SlaService: this
+     * isn't an SLA concern, and running it through SlaService would invite
+     * exactly the SLA-violation conflation this whole feature exists to
+     * avoid.
+     */
+    public function adminDecideUnassigned(DocumentAssignment $assignment, User $admin, string $decision, ?string $comments = null): void
+    {
+        DB::transaction(function () use ($assignment, $admin, $decision, $comments) {
+            $assignment->admin_override_at = now();
+            $assignment->admin_override_by = $admin->user_id;
+            $assignment->individual_status = $decision;
+            $assignment->comments = $comments;
+            $assignment->acted_at = now();
+            $assignment->needs_approver = false;
+            $assignment->save();
+
+            $document = $assignment->document;
+            DocumentReviewSession::closeFor($document, $admin);
+            AuditLog::record($admin->user_id, $document->document_id, 'admin_override',
+                "Admin {$admin->full_name} decided stage '{$assignment->stage->stage_name}' directly (no approver " .
+                "was eligible) -> {$decision}." . ($comments ? " Notes: {$comments}" : ''));
+
+            $this->completeStage($assignment, $decision);
+
+            NotificationRecord::send($document->originator_id, $document->document_id,
+                "An Admin decision was applied to your document '{$document->title}' ({$decision})." .
+                ($comments ? " Notes: \"{$comments}\"" : ''));
+
+            if ($document->originator->email) {
+                Mail::to($document->originator->email)->queue(
+                    new DocumentDecisionMail($document, $decision, $comments, $assignment->stage->stage_name)
+                );
+            }
+        });
     }
 
     /**
@@ -698,12 +891,28 @@ class WorkflowService
             AuditLog::record($approver->user_id, $document->document_id, $decision,
                 "Stage '{$stage->stage_name}' {$decision} by {$approver->full_name}." . ($comments ? " Comments: {$comments}" : ''));
 
+            // "N of M approvers have responded" — only meaningful on an
+            // approval (a rejection gets its own unambiguous whole-document
+            // message from completeStage() instead) once a stage has more
+            // than one seat (see assignStage()); omitted for
+            // single-approver stages to avoid noise on the common case.
+            $progressNote = '';
+            if ($decision === 'approved') {
+                $stageSeats = DocumentAssignment::where('document_id', $document->document_id)
+                    ->where('stage_id', $stage->stage_id)
+                    ->get();
+                if ($stageSeats->count() > 1) {
+                    $approvedCount = $stageSeats->whereIn('individual_status', ['approved', 'auto_approved'])->count();
+                    $progressNote = " ({$approvedCount} of {$stageSeats->count()} approvers have responded for this stage.)";
+                }
+            }
+
             // Section 3: Decision Alerts — per-stage notice to the
             // originator including the approver's comments, distinct from
             // completeStage()'s whole-document-outcome message below.
             NotificationRecord::send($document->originator_id, $document->document_id,
                 "Stage '{$stage->stage_name}' of '{$document->title}' was {$decision} by {$approver->full_name}." .
-                ($comments ? " Comments: \"{$comments}\"" : ''));
+                ($comments ? " Comments: \"{$comments}\"" : '') . $progressNote);
 
             if ($document->originator->email) {
                 Mail::to($document->originator->email)->queue(
@@ -716,9 +925,12 @@ class WorkflowService
     }
 
     /**
-     * Resolves a stage once its single assignment has been decided (by an
+     * Resolves a stage once one of its seats has been decided (by an
      * approver in decide(), by an Admin in SlaService::adminOverride(), or
-     * automatically by SlaService::autoApproveUnresolved()).
+     * automatically by SlaService::autoApproveOne()). Since a stage can now
+     * have more than one seat (see assignStage()), a single decided seat
+     * doesn't necessarily mean the STAGE is done — see the stage-scoped
+     * gate below.
      *
      * @param  bool  $auto  true when this resolution came from the SLA
      *                      auto-approval safety net rather than a human
@@ -732,16 +944,38 @@ class WorkflowService
 
         if ($decision === 'rejected') {
             // Rejection terminates the WHOLE document — close every other
-            // pending assignment across ALL stages, since every stage is
-            // routed up front and more than one can be pending at once.
+            // pending assignment across ALL stages (including any other
+            // still-pending seat on THIS SAME stage — this query has no
+            // stage_id filter, so it already correctly cascades to
+            // same-stage siblings, not just other stages), since every
+            // stage is routed up front and more than one can be pending at
+            // once. Any single rejection, from any seat on any stage,
+            // kills the whole document — unchanged behavior.
             DocumentAssignment::where('document_id', $document->document_id)
                 ->where('individual_status', 'pending')
                 ->where('assignment_id', '!=', $assignment->assignment_id)
                 ->get()
-                ->each(function (DocumentAssignment $other) {
+                ->each(function (DocumentAssignment $other) use ($assignment) {
                     $other->individual_status = 'rejected';
-                    $other->comments = 'Auto-closed — document rejected at another stage.';
+                    // The ACTUAL rejection reason, not a generic system
+                    // message — $assignment already has one (rejecting
+                    // requires a comment, see the mandatory-comment rule
+                    // in decide()/decideBatch()), so every reader of
+                    // $other's comment (Decision History, workflow-stage-
+                    // list, etc.) sees why it was really rejected instead
+                    // of a placeholder that told them nothing. Whether
+                    // this was a direct decision or a cascade-close is now
+                    // recorded distinctly via cascade_closed_by below, not
+                    // by sniffing the comment text.
+                    $other->comments = $assignment->comments;
                     $other->acted_at = now();
+                    // Records who ACTUALLY rejected it, not $other's own
+                    // holder — $other never made this decision themselves,
+                    // it was cascade-closed by $assignment's reject. Lets
+                    // Decision History correctly attribute it to the real
+                    // decider instead of implying $other's own approver
+                    // personally rejected something they never reviewed.
+                    $other->cascade_closed_by = $assignment->user_id;
                     $other->save();
                 });
 
@@ -751,6 +985,27 @@ class WorkflowService
                 "Your document '{$document->title}' was rejected at stage '{$stage->stage_name}'.");
             return;
         }
+
+        // NEW gate: this STAGE isn't done until every seat on it (every
+        // approver assigned to this exact document+stage) is non-pending —
+        // not just this one. Until then, nothing else below has anything
+        // to do yet, since neither stage-advancement nor document
+        // finalization can be correct while a sibling seat on this same
+        // stage might still reject.
+        $stageStillPending = DocumentAssignment::where('document_id', $document->document_id)
+            ->where('stage_id', $stage->stage_id)
+            ->where('individual_status', 'pending')
+            ->exists();
+
+        if ($stageStillPending) {
+            return;
+        }
+
+        // Everything below only runs once every seat on this stage is
+        // resolved — i.e. this now means "the STAGE completed", not just
+        // "one assignment completed".
+        AuditLog::record(null, $document->document_id, 'stage_complete',
+            "Stage '{$stage->stage_name}' is fully resolved — every assigned approver has responded.");
 
         // Safety net only: every stage is normally already assigned at
         // upload time (see routeToWorkflow()). This only fires if a stage

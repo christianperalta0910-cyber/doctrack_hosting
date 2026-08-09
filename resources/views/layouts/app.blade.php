@@ -5,6 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>@yield('title', 'Document Classification & Tracking System')</title>
     <meta name="csrf-token" content="{{ csrf_token() }}">
+    {{--
+        Business-hours config for the client-side real-remaining ticker
+        (see the script block below) — cheap (one small holiday query),
+        exposed on every page rather than gated to specific ones so it's
+        available wherever a [data-real-remaining] element might render.
+        startMinutes/endMinutes let the ticker check "is it business hours
+        right now" without re-parsing a time string every second.
+    --}}
+    @php
+        $__workStart = \Carbon\Carbon::parse(config('sla.default_work_start'));
+        $__workEnd = \Carbon\Carbon::parse(config('sla.default_work_end'));
+    @endphp
+    <meta name="business-hours" content="{{ json_encode([
+        'startMinutes' => $__workStart->hour * 60 + $__workStart->minute,
+        'endMinutes' => $__workEnd->hour * 60 + $__workEnd->minute,
+        'workingDays' => config('sla.default_working_days'),
+        'holidays' => \App\Models\SlaHoliday::pluck('holiday_date')->map(fn ($d) => \Carbon\Carbon::parse($d)->toDateString())->values(),
+    ]) }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
@@ -184,6 +202,63 @@
 
     document.addEventListener('DOMContentLoaded', __docTrackUpdateLiveTimes);
     setInterval(__docTrackUpdateLiveTimes, 1000);
+
+    // Real (business-hours-aware) countdown ticker — a sibling to the
+    // generic wall-clock ticker above, not a replacement for it (that one
+    // is used elsewhere for plain elapsed/remaining time and shouldn't
+    // gain business-hours awareness it was never meant to have). Ticks any
+    // [data-real-remaining="<seconds>"] element down by 1 every second
+    // ONLY while currently inside a working window, freezing it
+    // otherwise — matching the "⏸ Paused" note shown next to it. Starting
+    // value comes from the server (DocumentAssignment::realSecondsRemaining());
+    // this only ever counts down from there, self-correcting on the next
+    // page refresh/live swap rather than trying to replicate the server's
+    // full walk-forward business-time algorithm in JS.
+    const __businessHoursConfig = JSON.parse(document.querySelector('meta[name="business-hours"]')?.content || 'null');
+
+    // Manila is a fixed UTC+8 with no DST (see BusinessHoursService's
+    // class docblock) — reconstructing wall-clock time from a fixed
+    // offset means this stays correct regardless of the visitor's own
+    // browser/OS timezone, instead of trusting `new Date()`'s local time.
+    const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+    function __isWithinBusinessHoursNow() {
+        if (!__businessHoursConfig) return true; // fail open — never wrongly freeze if config didn't load
+
+        const manila = new Date(Date.now() + MANILA_OFFSET_MS);
+        if (!__businessHoursConfig.workingDays.includes(manila.getUTCDay())) return false;
+
+        const dateStr = manila.toISOString().slice(0, 10);
+        if (__businessHoursConfig.holidays.includes(dateStr)) return false;
+
+        const nowMinutes = manila.getUTCHours() * 60 + manila.getUTCMinutes();
+        return nowMinutes >= __businessHoursConfig.startMinutes && nowMinutes < __businessHoursConfig.endMinutes;
+    }
+
+    function __docTrackUpdateRealRemaining() {
+        const withinHours = __isWithinBusinessHoursNow();
+
+        document.querySelectorAll('[data-real-remaining]').forEach((el) => {
+            let remaining = parseInt(el.dataset.realRemaining, 10);
+            if (isNaN(remaining)) return;
+
+            if (remaining > 0 && withinHours) {
+                remaining -= 1;
+                el.dataset.realRemaining = remaining;
+            }
+
+            el.textContent = remaining > 0 ? `(${__docTrackFormatDuration(remaining)} remaining)` : '(expired)';
+
+            const urgentUnder = el.getAttribute('data-live-urgent-under');
+            if (urgentUnder !== null) {
+                el.classList.toggle('text-rejected-700', remaining < parseInt(urgentUnder, 10));
+                el.classList.toggle('text-surface-600', remaining >= parseInt(urgentUnder, 10));
+            }
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', __docTrackUpdateRealRemaining);
+    setInterval(__docTrackUpdateRealRemaining, 1000);
 </script>
 @stack('scripts')
 </body>

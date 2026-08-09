@@ -1,7 +1,10 @@
 {{--
     Embedded original-file viewer (Feature: view the exact uploaded file
     in-system rather than downloading it). One shared modal, invoked from
-    anywhere via JS: openDocumentViewer(url, mimeType, filename).
+    anywhere via JS: openDocumentViewer(url, mimeType, filename, documentId).
+    documentId is optional — omitted at call sites that aren't really
+    "reviewing" a document (e.g. the ML training panels), which simply
+    means no presence icon fetch happens there.
 
     Rendering strategy per mime type:
       - application/pdf                                            -> <iframe> (native browser PDF viewer)
@@ -9,13 +12,47 @@
       - text/plain                                                 -> fetched & shown as preformatted text
       - .docx (wordprocessingml.document)                          -> fetched & converted to HTML client-side via mammoth.js
       - anything else (legacy .doc, etc.)                          -> graceful fallback with an "open in new tab" link
+
+    Presence icon: while open, polls documents.presence every ~8s (see
+    __pollPresence below) for who else is currently reviewing this exact
+    document — approvers only, per DocumentReviewSession. Each poll also
+    heartbeats the current viewer's own session server-side. Closing the
+    modal (or unloading the page) also fires an explicit presence-leave
+    beacon (__sendPresenceLeave), which closes the session for real
+    server-side (see DocumentController::presenceLeave()) — the icon
+    disappears for other viewers instantly rather than waiting out the
+    heartbeat decay, and the time spent on this review pass is correctly
+    recorded instead of lost.
 --}}
-<div id="doc-viewer-overlay" class="hidden fixed inset-0 z-50 bg-surface-900/60 backdrop-blur-sm flex items-center justify-center p-4" onclick="if(event.target === this) closeDocumentViewer()">
+<div id="doc-viewer-overlay" class="hidden fixed inset-0 z-50 bg-surface-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+     data-presence-url-template="{{ route('documents.presence', ['document' => '__ID__']) }}"
+     data-presence-leave-url-template="{{ route('documents.presence.leave', ['document' => '__ID__']) }}"
+     onclick="if(event.target === this) closeDocumentViewer()">
     <div class="bg-white rounded-xl shadow-2xl w-full max-w-4xl h-[85vh] flex flex-col overflow-hidden" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between px-5 py-3 border-b border-surface-200 flex-shrink-0">
-            <h3 id="doc-viewer-title" class="text-sm font-semibold text-surface-900 truncate pr-4">Document Preview</h3>
+            <div class="flex items-center gap-2 min-w-0">
+                <h3 id="doc-viewer-title" class="text-sm font-semibold text-surface-900 truncate pr-2">Document Preview</h3>
+                <details id="doc-viewer-presence" class="relative hidden flex-shrink-0">
+                    <summary class="list-none cursor-pointer flex items-center -space-x-1.5">
+                        <span id="doc-viewer-presence-avatars" class="flex items-center -space-x-1.5"></span>
+                        <span class="ml-2 text-[11px] text-approved-700 font-medium flex items-center gap-1">
+                            <span class="relative flex w-1.5 h-1.5">
+                                <span class="absolute inline-flex h-full w-full rounded-full bg-approved-400 opacity-75 animate-ping"></span>
+                                <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-approved-500"></span>
+                            </span>
+                            <span id="doc-viewer-presence-count"></span> reviewing now
+                        </span>
+                    </summary>
+                    <div id="doc-viewer-presence-names" class="absolute z-10 mt-1 left-0 bg-white rounded-lg shadow-lg border border-surface-200 py-1.5 min-w-[200px]"></div>
+                </details>
+            </div>
             <div class="flex items-center gap-4 flex-shrink-0">
                 <a id="doc-viewer-newtab" href="#" target="_blank" rel="noopener" class="text-xs text-primary-700 hover:underline font-medium">Open in new tab</a>
+                <button type="button" onclick="window.print()" class="text-surface-400 hover:text-surface-700" aria-label="Print document" title="Print">
+                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6.72 13.829c-.24.03-.48.062-.72.096m.72-.096a42.415 42.415 0 0110.56 0m-10.56 0L6.34 18m10.94-4.171c.24.03.48.062.72.096m-.72-.096L17.66 18m0 0l.318 2.647a.75.75 0 01-.74.853H6.762a.75.75 0 01-.74-.853L6.34 18m11.32 0H6.34m10.94-9.75V4.243a.75.75 0 00-.75-.75H7.47a.75.75 0 00-.75.75V8.25m10.94 0H6.72"/>
+                    </svg>
+                </button>
                 <button type="button" onclick="closeDocumentViewer()" class="text-surface-400 hover:text-surface-700" aria-label="Close preview">
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                         <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
@@ -27,8 +64,96 @@
     </div>
 </div>
 
+{{-- Scopes window.print() to just the previewed document — hides
+     everything else on the page rather than printing the whole app shell
+     underneath the modal. --}}
+<style>
+    @media print {
+        body * { visibility: hidden; }
+        #doc-viewer-body, #doc-viewer-body * { visibility: visible; }
+        #doc-viewer-body { position: absolute; top: 0; left: 0; width: 100%; }
+    }
+</style>
+
 <script>
     let __mammothLoadPromise = null;
+    let __presencePollTimer = null;
+    let __presenceDocumentId = null;
+
+    function __escapeHtmlAttr(str) {
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function __sendPresenceLeave() {
+        if (!__presenceDocumentId) return;
+        const overlay = document.getElementById('doc-viewer-overlay');
+        const url = overlay.dataset.presenceLeaveUrlTemplate.replace('__ID__', __presenceDocumentId);
+        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+        fetch(url, {
+            method: 'POST',
+            keepalive: true,
+            headers: { 'X-CSRF-TOKEN': csrfToken, Accept: 'application/json' },
+        }).catch(() => {});
+        __presenceDocumentId = null;
+    }
+
+    function __stopPresencePoll() {
+        if (__presencePollTimer) {
+            clearInterval(__presencePollTimer);
+            __presencePollTimer = null;
+        }
+        __sendPresenceLeave();
+        const el = document.getElementById('doc-viewer-presence');
+        el.classList.add('hidden');
+        el.removeAttribute('open');
+    }
+
+    // Covers closing the browser tab/navigating away without ever
+    // clicking the X — closeDocumentViewer() alone can't catch that.
+    window.addEventListener('pagehide', __sendPresenceLeave);
+
+    function __renderPresence(viewers) {
+        const el = document.getElementById('doc-viewer-presence');
+        if (!viewers || viewers.length === 0) {
+            el.classList.add('hidden');
+            el.removeAttribute('open');
+            return;
+        }
+        el.classList.remove('hidden');
+
+        document.getElementById('doc-viewer-presence-count').textContent = viewers.length;
+
+        const avatars = viewers.slice(0, 4).map((v) => {
+            const initial = (v.name || '?').charAt(0).toUpperCase();
+            return `<span class="w-5 h-5 rounded-full bg-approved-500 text-white text-[9px] font-bold flex items-center justify-center ring-2 ring-white shadow-sm" title="${__escapeHtmlAttr(v.name)} is currently reviewing">${__escapeHtmlAttr(initial)}</span>`;
+        }).join('');
+        document.getElementById('doc-viewer-presence-avatars').innerHTML = avatars;
+
+        const names = viewers.map((v) => `<div class="px-3 py-1.5 text-xs">
+            <p class="font-medium text-surface-800">${__escapeHtmlAttr(v.name)}</p>
+            <p class="text-[10px] text-surface-400">${__escapeHtmlAttr(v.role)}${v.category ? ' &middot; ' + __escapeHtmlAttr(v.category) : ''}</p>
+        </div>`).join('');
+        document.getElementById('doc-viewer-presence-names').innerHTML = names;
+    }
+
+    function __pollPresence(url) {
+        fetch(url, { headers: { Accept: 'application/json' } })
+            .then((res) => (res.ok ? res.json() : Promise.reject(res)))
+            .then((data) => __renderPresence(data.viewers))
+            .catch(() => {});
+    }
+
+    function __startPresencePoll(documentId) {
+        __stopPresencePoll();
+        if (!documentId) return;
+        __presenceDocumentId = documentId;
+
+        const overlay = document.getElementById('doc-viewer-overlay');
+        const url = overlay.dataset.presenceUrlTemplate.replace('__ID__', documentId);
+
+        __pollPresence(url);
+        __presencePollTimer = setInterval(() => __pollPresence(url), 8000);
+    }
 
     function __loadMammoth() {
         if (window.mammoth) return Promise.resolve();
@@ -59,45 +184,78 @@
     function closeDocumentViewer() {
         document.getElementById('doc-viewer-overlay').classList.add('hidden');
         document.getElementById('doc-viewer-body').innerHTML = '';
+        __stopPresencePoll();
     }
 
-    async function openDocumentViewer(url, mimeType, filename) {
+    async function openDocumentViewer(url, mimeType, filename, documentId, autoPrint = false) {
         const overlay = document.getElementById('doc-viewer-overlay');
         const title = document.getElementById('doc-viewer-title');
         const newTabLink = document.getElementById('doc-viewer-newtab');
         const body = document.getElementById('doc-viewer-body');
 
+        // Cache-bust every open — some browsers keep an in-memory decoded
+        // image cache for <img> (and similarly for iframe/fetch) that's
+        // separate from the HTTP cache and can reuse the exact same URL
+        // within one page session WITHOUT ever hitting the network, even
+        // with Cache-Control: no-store set server-side. That silently
+        // skipped this whole viewer's server round-trip on a second open
+        // of the same document — no request meant no new review session,
+        // no realtime push, and no time recorded for that visit. A
+        // genuinely different URL each time can't be served from any
+        // cache, HTTP or in-memory, since it's a different resource as
+        // far as the browser is concerned.
+        const freshUrl = url + (url.includes('?') ? '&' : '?') + '_=' + Date.now();
+
         title.textContent = filename || 'Document Preview';
-        newTabLink.href = url;
+        newTabLink.href = freshUrl;
         overlay.classList.remove('hidden');
         body.innerHTML = '<div class="absolute inset-0 flex items-center justify-center text-sm text-surface-400">Loading preview…</div>';
+        __startPresencePoll(documentId);
+
+        // Lets any page (e.g. the Approver Queue's minimum-review-time
+        // countdown) react to "this document's viewer just opened" without
+        // this component needing to know anything about who's listening.
+        if (documentId) {
+            window.dispatchEvent(new CustomEvent('documentviewer:opened', { detail: { documentId } }));
+        }
 
         mimeType = mimeType || '';
 
         try {
             if (mimeType === 'application/pdf') {
-                body.innerHTML = `<iframe src="${url}" class="w-full h-full border-0" title="${filename || 'Document preview'}"></iframe>`;
+                body.innerHTML = `<iframe id="doc-viewer-iframe" src="${freshUrl}" class="w-full h-full border-0" title="${filename || 'Document preview'}"></iframe>`;
+                // Printing before the iframe's own content has actually
+                // loaded would just print a blank page — wait for its
+                // load event rather than assuming synchronous readiness.
+                if (autoPrint) {
+                    document.getElementById('doc-viewer-iframe').addEventListener('load', () => window.print(), { once: true });
+                }
             } else if (mimeType.startsWith('image/')) {
                 body.innerHTML = `<div class="w-full h-full flex items-center justify-center p-4">
-                    <img src="${url}" alt="${filename || 'Document preview'}" class="max-w-full max-h-full object-contain rounded-lg shadow-card">
+                    <img id="doc-viewer-img" src="${freshUrl}" alt="${filename || 'Document preview'}" class="max-w-full max-h-full object-contain rounded-lg shadow-card">
                 </div>`;
+                if (autoPrint) {
+                    document.getElementById('doc-viewer-img').addEventListener('load', () => window.print(), { once: true });
+                }
             } else if (mimeType === 'text/plain') {
-                const res = await fetch(url);
+                const res = await fetch(freshUrl);
                 if (!res.ok) throw new Error('Fetch failed');
                 const text = await res.text();
                 body.innerHTML = `<pre class="p-6 text-xs text-surface-700 whitespace-pre-wrap font-mono">${__escapeHtml(text)}</pre>`;
+                if (autoPrint) window.print(); // content above is already synchronously in the DOM
             } else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
                 await __loadMammoth();
-                const res = await fetch(url);
+                const res = await fetch(freshUrl);
                 if (!res.ok) throw new Error('Fetch failed');
                 const arrayBuffer = await res.arrayBuffer();
                 const result = await window.mammoth.convertToHtml({ arrayBuffer });
                 body.innerHTML = `<div class="prose prose-sm max-w-none bg-white mx-auto my-4 p-8 rounded-lg shadow-card" style="max-width: 800px;">${result.value}</div>`;
+                if (autoPrint) window.print();
             } else {
-                __showFallback(body, url, "Preview isn't available for this file type in-browser.");
+                __showFallback(body, freshUrl, "Preview isn't available for this file type in-browser.");
             }
         } catch (e) {
-            __showFallback(body, url, "Couldn't load the preview.");
+            __showFallback(body, freshUrl, "Couldn't load the preview.");
         }
     }
 

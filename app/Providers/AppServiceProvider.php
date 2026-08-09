@@ -2,6 +2,7 @@
 
 namespace App\Providers;
 
+use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\ServiceProvider;
@@ -35,6 +36,12 @@ class AppServiceProvider extends ServiceProvider
         // generated URL consistent regardless of which host a given
         // request happened to arrive on.
         URL::forceRootUrl(config('app.url'));
+
+        // App-wide pagination styling — see the view's own docblock for
+        // why the framework's built-in Tailwind view (living in vendor/,
+        // outside Tailwind's content-scan glob) rendered completely
+        // unstyled everywhere it was used.
+        Paginator::defaultView('vendor.pagination.custom');
 
         // Custom mailer — Laravel has no built-in Brevo driver. Brevo's
         // *SMTP* transport times out from Railway (outbound SMTP appears

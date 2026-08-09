@@ -19,7 +19,7 @@ class SlaEscalationMail extends Mailable implements ShouldQueue
 
     public function build(): self
     {
-        return $this->subject("SLA breach: '{$this->assignment->document->title}'")
+        return $this->subject("SLA violation: '{$this->assignment->document->title}'")
             ->markdown('emails.sla-escalation');
     }
 }

@@ -49,7 +49,7 @@ class ArchiveController extends Controller
         if ($user->isApprover() && !$user->assigned_category) {
             return view('archive.index', [
                 'showFolders' => false,
-                'documents' => DocumentRepository::whereRaw('1 = 0')->paginate(12),
+                'documents' => DocumentRepository::whereRaw('1 = 0')->paginate(10),
                 'categories' => [],
                 'restrictedCategory' => null,
                 'noCategoryAssigned' => true,
@@ -115,7 +115,7 @@ class ArchiveController extends Controller
     {
         $query = DocumentRepository::query()
             ->whereIn('global_status', ['approved', 'auto_approved'])
-            ->with('originator');
+            ->with('originator', 'assignments');
 
         $isOwnSubmissionsView = false;
 
@@ -159,7 +159,29 @@ class ArchiveController extends Controller
             default => $query->latest('upload_date'),
         };
 
-        return [$query->paginate(12)->withQueryString(), $isOwnSubmissionsView];
+        // Admin browses the whole repository across every category/
+        // originator, so a denser page is the right default; Approver
+        // and Originator are each already scoped down to a much smaller
+        // slice (one category, or just their own submissions), where 10
+        // still reads comfortably.
+        $perPage = $user->isAdmin() ? 5 : 10;
+
+        // Real page route (role-specific — admin/approver/originator each
+        // have their own 'archive' route name under the same URL shape),
+        // not the implicit current-request path. This is also built from
+        // within refresh() (the single shared archive.refresh route every
+        // role's live-poll JS hits) — a path derived from THAT request
+        // would bake the bare-fragment URL into Next/Previous whenever a
+        // live swap happens to be what rendered this page. See
+        // AdminController::paginateContainers()'s docblock for the same
+        // reasoning applied everywhere else.
+        $realRoute = match (true) {
+            $user->isAdmin() => route('admin.archive'),
+            $user->isApprover() => route('approver.archive'),
+            default => route('originator.archive'),
+        };
+
+        return [$query->paginate($perPage)->withQueryString()->withPath($realRoute), $isOwnSubmissionsView];
     }
 
     /**

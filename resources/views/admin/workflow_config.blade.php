@@ -31,125 +31,53 @@
                 <button class="w-full bg-primary-700 hover:bg-primary-800 text-white text-sm font-medium py-2.5 rounded-lg">Add Stage</button>
             </form>
         </div>
+
+        <div class="bg-white rounded-xl shadow-card border border-surface-200 p-6 mt-6">
+            <h2 class="text-sm font-semibold text-surface-900 mb-1">Approver Decision Restriction</h2>
+            <p class="text-xs text-surface-500 mb-4">
+                When on, an approver can only Approve/Reject during business hours (9 AM–5 PM, Mon–Sat) — this stops a document from being decided after-hours to dodge acting on it during paid working time. Off by default.
+            </p>
+            <form method="POST" action="{{ route('admin.systemSettings.businessHoursToggle') }}">
+                @csrf
+                <label class="flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" name="enforce_business_hours_decisions" value="1"
+                        {{ $businessHoursEnforced ? 'checked' : '' }}
+                        onchange="this.form.submit()"
+                        class="sr-only peer">
+                    <span class="relative w-10 h-6 bg-surface-200 peer-checked:bg-primary-700 rounded-full transition-colors">
+                        <span class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform peer-checked:translate-x-4"></span>
+                    </span>
+                    <span class="text-xs font-medium text-surface-700">
+                        Restrict approver decisions to business hours — currently <strong class="{{ $businessHoursEnforced ? 'text-primary-700' : 'text-surface-500' }}">{{ $businessHoursEnforced ? 'ON' : 'OFF' }}</strong>
+                    </span>
+                </label>
+            </form>
+        </div>
     </div>
 
-    <div class="lg:col-span-2 space-y-6">
-        @foreach($stages as $category => $categoryStages)
-            <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
-                <div class="px-6 py-3 border-b border-surface-200 bg-surface-50">
-                    <h3 class="text-sm font-semibold text-surface-900">{{ $category }}</h3>
-                </div>
-                <ul class="divide-y divide-surface-100 text-sm">
-                    @foreach($categoryStages as $s)
-                        @php
-                            $pendingCount = $activeCounts[$s->stage_id] ?? 0;
-                            $historyCount = $historyCounts[$s->stage_id] ?? 0;
-                        @endphp
-                        <li class="px-6 py-4 {{ $s->is_archived ? 'opacity-60' : '' }}">
-                            <div class="flex justify-between items-start gap-3">
-                                <div class="min-w-0">
-                                    <span class="font-medium text-surface-800">{{ $s->sequence_order }}. {{ $s->stage_name }}</span>
-                                    @if($s->is_archived)
-                                        <span class="ml-2 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-surface-200 text-surface-600 uppercase tracking-wide">Archived</span>
-                                    @endif
-                                    <p class="text-xs text-surface-400">{{ $s->description }}</p>
-                                    @if($pendingCount > 0)
-                                        <p class="text-xs text-rejected-700 mt-1">{{ $pendingCount }} active assignment(s) pending on this stage.</p>
-                                    @endif
-                                </div>
-
-                                @unless($s->is_archived)
-                                <div class="flex items-center gap-1 shrink-0">
-                                    <form method="POST" action="{{ route('admin.workflow.stages.moveUp', $s) }}">
-                                        @csrf
-                                        <button class="w-7 h-7 rounded-lg border border-surface-200 hover:bg-surface-50 text-surface-500" title="Move up">&uarr;</button>
-                                    </form>
-                                    <form method="POST" action="{{ route('admin.workflow.stages.moveDown', $s) }}">
-                                        @csrf
-                                        <button class="w-7 h-7 rounded-lg border border-surface-200 hover:bg-surface-50 text-surface-500" title="Move down">&darr;</button>
-                                    </form>
-                                </div>
-                                @endunless
-                            </div>
-
-                            @unless($s->is_archived)
-                            <div class="mt-3 flex flex-wrap items-center gap-2">
-                                <details class="text-xs">
-                                    <summary class="cursor-pointer text-primary-700 hover:underline font-medium">Edit</summary>
-                                    <form method="POST" action="{{ route('admin.workflow.stages.update', $s) }}" class="mt-2 space-y-2 max-w-sm">
-                                        @csrf
-                                        @method('PUT')
-                                        <input name="stage_name" value="{{ $s->stage_name }}" required class="w-full rounded-lg border-surface-300 text-xs px-3 py-2">
-                                        <textarea name="description" rows="2" class="w-full rounded-lg border-surface-300 text-xs px-3 py-2">{{ $s->description }}</textarea>
-                                        <button class="text-xs font-medium bg-primary-700 hover:bg-primary-800 text-white px-3 py-1.5 rounded-lg">Save</button>
-                                    </form>
-                                </details>
-
-                                @if($pendingCount > 0)
-                                    <details class="text-xs w-full">
-                                        <summary class="cursor-pointer text-processing-700 hover:underline font-medium">Review &amp; decide pending ({{ $pendingCount }})</summary>
-                                        <p class="mt-2 text-[11px] text-surface-400">
-                                            Resolve these directly — same admin-override used in the SLA queue — so the stage can be archived once nothing's left pending. The document's own approver stays credited for the eligibility check; this is you standing in for them, not reassigning their work.
-                                        </p>
-                                        <form method="POST" action="{{ route('admin.workflow.stages.notifyPending', $s) }}" class="mt-2">
-                                            @csrf
-                                            <button class="w-full text-xs font-medium bg-white border border-processing-300 text-processing-700 hover:bg-processing-50 px-3 py-1.5 rounded-lg">
-                                                Notify approver(s) to review now — before you edit or archive
-                                            </button>
-                                        </form>
-                                        <ul class="mt-2 divide-y divide-surface-100 border border-surface-200 rounded-lg overflow-hidden">
-                                            @foreach($pendingByStage[$s->stage_id] ?? [] as $assignment)
-                                                @php $pDoc = $assignment->document; @endphp
-                                                <li class="px-3 py-2 flex flex-wrap items-center justify-between gap-2 bg-white">
-                                                    <div class="min-w-0">
-                                                        <span class="text-surface-700 font-medium truncate block">{{ $pDoc->title ?? 'Deleted document' }}</span>
-                                                        @if($pDoc)
-                                                            <button type="button"
-                                                                onclick="openDocumentViewer('{{ route('documents.file', $pDoc) }}', '{{ $pDoc->mime_type }}', '{{ addslashes($pDoc->original_filename ?? $pDoc->title) }}')"
-                                                                class="text-[11px] text-primary-700 hover:underline font-medium">
-                                                                View original file
-                                                            </button>
-                                                        @endif
-                                                    </div>
-                                                    <form method="POST" action="{{ route('admin.sla.override', $assignment) }}" class="flex items-center gap-1.5 shrink-0">
-                                                        @csrf
-                                                        <button type="submit" name="decision" value="approved"
-                                                            class="text-xs font-medium bg-approved-500 hover:bg-approved-700 text-white px-2.5 py-1 rounded-lg">Approve</button>
-                                                        <button type="submit" name="decision" value="rejected"
-                                                            class="text-xs font-medium bg-rejected-500 hover:bg-rejected-700 text-white px-2.5 py-1 rounded-lg">Reject</button>
-                                                    </form>
-                                                </li>
-                                            @endforeach
-                                        </ul>
-                                    </details>
-                                @else
-                                    <form method="POST" action="{{ route('admin.workflow.stages.archive', $s) }}">
-                                        @csrf
-                                        <button class="text-xs font-medium text-surface-500 hover:underline">Archive</button>
-                                    </form>
-
-                                    @if($historyCount === 0)
-                                        <form method="POST" action="{{ route('admin.workflow.stages.destroy', $s) }}" onsubmit="return confirm('Permanently delete this never-used stage?');">
-                                            @csrf
-                                            @method('DELETE')
-                                            <button class="text-xs font-medium text-rejected-700 hover:underline">Delete</button>
-                                        </form>
-                                    @else
-                                        <span class="text-xs text-surface-300" title="Has assignment history — archive instead of deleting.">Delete unavailable (has history)</span>
-                                    @endif
-                                @endif
-                            </div>
-                            @else
-                                <form method="POST" action="{{ route('admin.workflow.stages.unarchive', $s) }}" class="mt-2">
-                                    @csrf
-                                    <button class="text-xs font-medium text-primary-700 hover:underline">Unarchive</button>
-                                </form>
-                            @endunless
-                        </li>
-                    @endforeach
-                </ul>
-            </div>
-        @endforeach
+    <div class="lg:col-span-2 space-y-6" id="workflow-config-results"
+        data-poll-url="{{ route('admin.workflow.config.poll') }}" data-refresh-url="{{ route('admin.workflow.config.refresh') }}">
+        @include('admin.partials.workflow-config-results')
     </div>
 </div>
+
+<script>
+    // Same live-poll pattern as every other admin module — see
+    // dashboard.blade.php's comment for the full reasoning. A stage
+    // added/archived or an assignment decided elsewhere (e.g. from the SLA
+    // queue) needs to show up here without a manual reload, since the
+    // pending counts and "review & decide" panel above act on live data.
+    document.addEventListener('DOMContentLoaded', function () {
+        const resultsEl = document.getElementById('workflow-config-results');
+        if (!resultsEl) return;
+
+        const opts = {
+            refreshUrl: resultsEl.dataset.refreshUrl,
+            target: resultsEl,
+        };
+
+        startLiveChannel('admin-dashboard', '.admin.activity-logged', opts);
+        startLivePoll({ ...opts, pollUrl: resultsEl.dataset.pollUrl });
+    });
+</script>
 @endsection

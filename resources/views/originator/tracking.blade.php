@@ -3,7 +3,7 @@
 @section('page-title', 'Document Tracking')
 
 @section('content')
-<div class="max-w-4xl mx-auto space-y-6" id="tracking-content"
+<div id="tracking-content"
     data-document-id="{{ $document->document_id }}"
     data-user-id="{{ auth()->id() }}"
     data-poll-url="{{ route('originator.documents.trackingPoll', $document) }}"

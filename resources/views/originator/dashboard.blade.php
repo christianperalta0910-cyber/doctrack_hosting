@@ -33,6 +33,11 @@
                         class="w-full rounded-lg border-surface-300 focus:border-primary-500 focus:ring-primary-500 text-sm px-3 py-2">
                 </div>
 
+                <label class="mt-3 flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" name="requires_printing" value="1" class="rounded border-surface-300 text-primary-600 focus:ring-primary-500">
+                    <span class="text-xs text-surface-600">Requires a printed copy</span>
+                </label>
+
                 <button type="submit"
                     class="mt-4 w-full bg-gradient-to-b from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 text-white text-sm font-medium py-2.5 rounded-lg shadow-sm transition-all">
                     Submit Document(s)

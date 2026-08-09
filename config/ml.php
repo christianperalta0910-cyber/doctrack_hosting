@@ -30,4 +30,29 @@ return [
     'review_confidence_threshold' => 70,
     'review_priority_threshold' => 30,
 
+    /*
+    |--------------------------------------------------------------------------
+    | Content readability heuristic
+    |--------------------------------------------------------------------------
+    |
+    | The minimum fraction of a document's word tokens that must appear in
+    | that category's own ML training vocabulary (built live from
+    | MlStagingSample::extracted_text — see
+    | ValidationService::categoryVocabulary()) before ValidationService
+    | flags it as unreadable — see checkContentQuality(). This is a
+    | real-word-ratio heuristic, NOT semantic understanding: it catches
+    | garbled OCR output, keyboard-mashing, and non-English submissions,
+    | but says nothing about whether the content is actually correct or
+    | professional. A document that fails ONLY this check is held for
+    | admin review rather than flatly blocked — see WorkflowService::
+    | ingest() and AdminController::confirmReadabilityReview() — since
+    | confirming one grows the vocabulary for next time. Matched to
+    | review_confidence_threshold above so both ML gates on a document
+    | (classification confidence, content readability) hold it to the
+    | same bar.
+    |
+    */
+
+    'min_real_word_ratio' => 0.7,
+
 ];

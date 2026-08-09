@@ -11,12 +11,12 @@ use Illuminate\Support\Facades\Event;
 /**
  * Regression coverage: when one approver rejects their stage,
  * WorkflowService::completeStage() auto-closes every OTHER pending
- * assignment on that document (see its "Auto-closed — document rejected
- * at another stage" comment). Those other approvers never touched
- * anything themselves, so without an explicit broadcast targeting THEIR
- * queue specifically, their dashboard has no way to find out — the
- * document would keep appearing in their queue as if still awaiting
- * their decision, forever (or until their next slow fallback poll).
+ * assignment on that document (see completeStage()'s cascade_closed_by
+ * comment). Those other approvers never touched anything themselves, so
+ * without an explicit broadcast targeting THEIR queue specifically, their
+ * dashboard has no way to find out — the document would keep appearing
+ * in their queue as if still awaiting their decision, forever (or until
+ * their next slow fallback poll).
  */
 beforeEach(function () {
     WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Technical Review', 'sequence_order' => 1]);
@@ -59,7 +59,8 @@ it('notifies a sibling approver\'s own channel when their assignment is auto-clo
     Event::assertDispatched(AssignmentRouted::class, fn ($e) => $e->assignment->assignment_id === $assignmentTwo->assignment_id);
 
     expect($assignmentTwo->fresh()->individual_status)->toBe('rejected');
-    expect($assignmentTwo->fresh()->comments)->toContain('Auto-closed');
+    expect($assignmentTwo->fresh()->comments)->toBe('not acceptable'); // the REAL rejection reason, copied from approverOne's decision
+    expect($assignmentTwo->fresh()->cascade_closed_by)->toBe($approverOne->user_id);
 });
 
 it('notifies a sibling approver holding a DIFFERENT, unaffected stage when this stage is decided', function () {

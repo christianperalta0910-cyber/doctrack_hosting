@@ -3,15 +3,42 @@
 namespace App\Http\Controllers;
 
 use App\Models\DocumentAssignment;
+use App\Models\DocumentReviewSession;
+use App\Models\SystemSetting;
+use App\Services\BusinessHoursService;
 use App\Services\SlaService;
 use App\Services\WorkflowService;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Validation\Rule;
 
 class ApprovalController extends Controller
 {
-    public function __construct(private WorkflowService $workflow, private SlaService $sla)
+    public function __construct(
+        private WorkflowService $workflow,
+        private SlaService $sla,
+        private BusinessHoursService $businessHours,
+    ) {
+    }
+
+    /**
+     * Feature: an approver can be blocked from deciding outside business
+     * hours (SystemSetting::enforce_business_hours_decisions, Admin
+     * toggle on Workflow Config — off by default so existing installs and
+     * the test suite aren't suddenly gated). The point isn't the SLA
+     * clock — that's already business-hours-aware and unaffected either
+     * way — it's accountability: without this, an approver could let an
+     * assignment sit untouched through the entire paid workday and then
+     * decide it that same evening, off the clock, always safely before
+     * the deadline (which itself always lands inside a future business
+     * window), leaving zero record of ever acting during business hours.
+     */
+    private function requireBusinessHoursIfEnforced(): void
     {
+        if (SystemSetting::current()->enforce_business_hours_decisions
+            && !$this->businessHours->isWithinWorkingWindow(now())) {
+            abort(403, 'Decisions can only be made during business hours (9 AM–5 PM, Mon–Sat).');
+        }
     }
 
     /**
@@ -44,13 +71,43 @@ class ApprovalController extends Controller
      */
     private function containerPriorityLabels($container): \Illuminate\Support\Collection
     {
-        $priorityMap = [1 => 'Urgent', 2 => 'Normal', 3 => 'Low'];
+        return $container->documents->map(function ($stageAssignments) {
+            // Only a still-pending seat gets a label — a document that's
+            // only here because it's waiting on OTHER approvers (see
+            // buildQueue()) has nothing left for THIS approver to act on,
+            // so it shouldn't match any specific urgency filter anymore.
+            $active = $stageAssignments->where('individual_status', 'pending')
+                ->sortBy(fn (DocumentAssignment $a) => $a->stage->sequence_order)->first();
 
-        return $container->documents->map(function ($stageAssignments) use ($priorityMap) {
-            $active = $stageAssignments->sortBy(fn (DocumentAssignment $a) => $a->stage->sequence_order)->first();
-            $isExpired = $active->seconds_remaining !== null && $active->seconds_remaining <= 0;
-            return $isExpired ? 'Expired' : ($priorityMap[$active->priority_rank] ?? $priorityMap[2]);
-        })->unique()->values();
+            return $active?->urgencyLabel();
+        })->filter()->unique()->values();
+    }
+
+    /**
+     * Queue ordering key (Feature: Urgent-first sorting) — the most urgent
+     * rank (DocumentAssignment::urgencyRank(), based on real remaining
+     * business time before each seat's own SLA deadline — see that
+     * method's docblock) among this container's still-actionable
+     * documents, so the list position always agrees with the priority
+     * badge shown per row instead of only being sorted by due_date. Lower
+     * sorts first: Urgent=1, Normal=2, Low=3, Expired=4 — Expired sits
+     * last among "real" priorities since those seats are already
+     * escalated/read-only here, nothing left to act on. A container where
+     * every document is already decided by this approver (just waiting on
+     * co-approvers — see resolvedButInFlightQueryFor()) has no active seat
+     * at all and sorts last of all (5), since there's nothing actionable
+     * in it either.
+     */
+    private function containerPriorityRank($container): int
+    {
+        $ranks = $container->documents->map(function ($stageAssignments) {
+            $active = $stageAssignments->where('individual_status', 'pending')
+                ->sortBy(fn (DocumentAssignment $a) => $a->stage->sequence_order)->first();
+
+            return $active?->urgencyRank();
+        })->filter(fn ($r) => $r !== null);
+
+        return $ranks->isEmpty() ? 5 : $ranks->min();
     }
 
     /**
@@ -69,16 +126,16 @@ class ApprovalController extends Controller
      *     pending at once, and those still nest under that one document
      *     card rather than duplicating it.
      */
-    /** Section 4: a breached assignment stays visible (disabled) in the approver's own queue for this long, so they see their own SLA misses instead of it silently vanishing. */
-    private const BREACH_VISIBILITY_HOURS = 24;
+    /** Section 4: a violated assignment stays visible (disabled) in the approver's own queue for this long, so they see their own SLA misses instead of it silently vanishing. */
+    private const VIOLATION_VISIBILITY_HOURS = 24;
 
     /**
-     * Genuinely actionable (still within SLA) OR recently breached — the
+     * Genuinely actionable (still within SLA) OR recently violated — the
      * latter stays visible read-only so the approver sees their own
      * misses instead of the item just disappearing the instant it
-     * escalates. It drops off after BREACH_VISIBILITY_HOURS even if still
-     * unresolved by Admin, so this queue never accumulates old breaches
-     * forever; once Admin actually resolves it, individual_status stops
+     * escalates. It drops off after VIOLATION_VISIBILITY_HOURS even if
+     * still unresolved by Admin, so this queue never accumulates old
+     * violations forever; once Admin actually resolves it, individual_status stops
      * being 'pending' and it falls out of this query immediately
      * regardless of the time window. Shared by dashboard() (full data)
      * and poll() (just a count) so both always agree on what "pending"
@@ -93,7 +150,7 @@ class ApprovalController extends Controller
                     ->orWhere(function ($q2) {
                         $q2->where('escalated_to_admin', true)
                             ->whereNull('admin_override_at')
-                            ->where('sla_expires_at', '>=', now()->subHours(self::BREACH_VISIBILITY_HOURS));
+                            ->where('sla_expires_at', '>=', now()->subHours(self::VIOLATION_VISIBILITY_HOURS));
                     });
             });
     }
@@ -104,6 +161,24 @@ class ApprovalController extends Controller
      * — kept in exactly one place so a live-swapped queue can never drift
      * from what a normal page load would have shown for the same filters.
      */
+    /**
+     * A document stays visible in this approver's queue even after they've
+     * decided every seat they hold on it, as long as the document itself
+     * isn't finalized yet — e.g. a co-approver on the same stage, or a
+     * later stage, still hasn't decided. It disappears only once the whole
+     * document reaches a terminal global_status (approved/auto_approved/
+     * rejected), not the moment this approver's own part is done. Excludes
+     * any document already covered by $pending (still has an actionable
+     * seat) to avoid a duplicate container for the same document.
+     */
+    private function resolvedButInFlightQueryFor(int $userId, \Illuminate\Support\Collection $pendingDocumentIds)
+    {
+        return DocumentAssignment::where('user_id', $userId)
+            ->whereIn('individual_status', ['approved', 'rejected', 'auto_approved'])
+            ->whereNotIn('document_id', $pendingDocumentIds)
+            ->whereHas('document', fn ($q) => $q->whereNotIn('global_status', ['approved', 'auto_approved', 'rejected']));
+    }
+
     private function buildQueue(Request $request, int $userId): array
     {
         $pending = $this->pendingQueryFor($userId)
@@ -115,9 +190,18 @@ class ApprovalController extends Controller
         // Raw assignment count (same unit poll() returns), not the number
         // of grouped containers below — passed to the view as the polling
         // JS's starting baseline so "N new" comparisons are apples-to-apples.
+        // Deliberately excludes the resolved-but-in-flight rows merged in
+        // below — this counts only what still needs THIS approver's own
+        // action, not everything visible in the queue.
         $initialPendingCount = $pending->count();
 
-        $containers = $pending
+        $resolvedInFlight = $this->resolvedButInFlightQueryFor($userId, $pending->pluck('document_id')->unique())
+            ->with(['document.batch', 'document.originator', 'document.assignments.approver', 'stage'])
+            ->get();
+
+        $relevant = $pending->concat($resolvedInFlight);
+
+        $containers = $relevant
             ->groupBy(fn (DocumentAssignment $a) => $a->document->batch_id ? 'batch-' . $a->document->batch_id : 'doc-' . $a->document_id)
             ->map(function ($groupAssignments) {
                 $first = $groupAssignments->first();
@@ -131,7 +215,14 @@ class ApprovalController extends Controller
                     'documents' => $groupAssignments->groupBy('document_id'),
                 ];
             })
+            // Sorted least-significant-key-first: due_date breaks ties
+            // within the same priority rank, then the priority-rank sort
+            // (stable, per PHP 8+) preserves that due_date ordering within
+            // each rank bucket — Urgent containers all listed first (soonest
+            // due first among them), then Normal, then Low, then Expired,
+            // then anything with nothing left to act on.
             ->sortBy(fn ($c) => $c->due_date)
+            ->sortBy(fn ($c) => $this->containerPriorityRank($c))
             ->values();
 
         if ($request->filled('priority')) {
@@ -159,10 +250,30 @@ class ApprovalController extends Controller
             $containers->count(),
             $perPage,
             $page,
-            ['path' => $request->url(), 'query' => $request->query()]
+            // Real page route, not $request->url() — this is also built
+            // from within refresh() (the live-poll fragment route); a
+            // path derived from that request would bake the bare-fragment
+            // URL into Next/Previous whenever a live swap happens to be
+            // what rendered this page.
+            ['path' => route('approver.dashboard'), 'query' => $request->query()]
         );
 
         return [$containers, $initialPendingCount];
+    }
+
+    /**
+     * Business-hours-gate state for the queue view (Feature: Approve/Reject
+     * disabled outside business hours when an Admin has opted into the
+     * toggle) — shared by dashboard() and refresh() so a live-swapped
+     * fragment can never disagree with a full page load about whether the
+     * gate is currently active.
+     */
+    private function businessHoursGateData(): array
+    {
+        return [
+            'businessHoursEnforced' => SystemSetting::current()->enforce_business_hours_decisions,
+            'isWithinBusinessHours' => $this->businessHours->isWithinWorkingWindow(now()),
+        ];
     }
 
     public function dashboard(Request $request)
@@ -171,7 +282,10 @@ class ApprovalController extends Controller
 
         [$containers, $initialPendingCount] = $this->buildQueue($request, $request->user()->user_id);
 
-        return view('approver.dashboard', compact('containers', 'initialPendingCount'));
+        return view('approver.dashboard', [
+            ...compact('containers', 'initialPendingCount'),
+            ...$this->businessHoursGateData(),
+        ]);
     }
 
     /**
@@ -188,7 +302,10 @@ class ApprovalController extends Controller
 
         [$containers, $initialPendingCount] = $this->buildQueue($request, $request->user()->user_id);
 
-        return view('approver.partials.queue', compact('containers', 'initialPendingCount'));
+        return view('approver.partials.queue', [
+            ...compact('containers', 'initialPendingCount'),
+            ...$this->businessHoursGateData(),
+        ]);
     }
 
     /**
@@ -213,7 +330,10 @@ class ApprovalController extends Controller
 
         $validated = $request->validate([
             'decision' => ['required', 'in:approved,rejected'],
-            'comments' => ['nullable', 'string', 'max:1000'],
+            // Required on rejection specifically — a reject with no
+            // explanation gives the originator nothing to act on when
+            // they resubmit. Approving needs no justification.
+            'comments' => [Rule::requiredIf(fn () => $request->input('decision') === 'rejected'), 'nullable', 'string', 'max:1000'],
         ]);
 
         abort_if($assignment->individual_status !== 'pending', 409, 'This assignment has already been actioned.');
@@ -227,9 +347,31 @@ class ApprovalController extends Controller
         }
         abort_if($assignment->escalated_to_admin, 409, 'This assignment\'s SLA deadline has passed — it was just escalated to Admin and can no longer be decided here.');
 
+        $this->requireBusinessHoursIfEnforced();
+
+        // Checked BEFORE closeFor() — closing the session would make "time
+        // elapsed on the still-open session" impossible to recover, and
+        // that time is exactly what this is judging.
+        $secondsReviewed = DocumentReviewSession::secondsSpentSoFar($assignment->document_id, $request->user()->user_id);
+        $minSeconds = config('review.min_review_seconds', 10);
+        abort_if($secondsReviewed < $minSeconds, 422,
+            "You need to view the document for at least {$minSeconds} seconds before deciding — {$secondsReviewed}s recorded so far.");
+
+        DocumentReviewSession::closeFor($assignment->document, $request->user());
         $this->workflow->decide($assignment, $request->user(), $validated['decision'], $validated['comments'] ?? null);
 
-        return redirect()->route('approver.dashboard')->with('status', 'Decision recorded: ' . ucfirst($validated['decision']) . '.');
+        $status = 'Decision recorded: ' . ucfirst($validated['decision']) . '.';
+
+        // AJAX path (Feature: no full-page redirect on Approve/Reject) —
+        // the queue JS swaps the fragment itself via applyLiveRefresh()
+        // instead of relying on a redirect + session-flashed banner, which
+        // is what was resetting scroll position to the top of the page on
+        // every decision. Non-JS/no-JS clients still get the old redirect.
+        if ($request->wantsJson()) {
+            return response()->json(['status' => $status]);
+        }
+
+        return redirect()->route('approver.dashboard')->with('status', $status);
     }
 
     /**
@@ -251,7 +393,7 @@ class ApprovalController extends Controller
             'assignment_ids' => ['required', 'array', 'min:1'],
             'assignment_ids.*' => ['integer', 'exists:document_assignments,assignment_id'],
             'decision' => ['required', 'in:approved,rejected'],
-            'comments' => ['nullable', 'string', 'max:1000'],
+            'comments' => [Rule::requiredIf(fn () => $request->input('decision') === 'rejected'), 'nullable', 'string', 'max:1000'],
         ]);
 
         $assignments = DocumentAssignment::whereIn('assignment_id', $validated['assignment_ids'])
@@ -262,7 +404,13 @@ class ApprovalController extends Controller
 
         abort_if($assignments->isEmpty(), 409, 'These assignments have already been actioned.');
 
+        // Once for the whole batch, not per assignment — it's the same
+        // "is it currently business hours" answer for every row.
+        $this->requireBusinessHoursIfEnforced();
+
+        $minSeconds = config('review.min_review_seconds', 10);
         $skippedExpired = 0;
+        $skippedUnreviewed = 0;
 
         foreach ($assignments as $assignment) {
             $assignment->refresh();
@@ -280,12 +428,29 @@ class ApprovalController extends Controller
                 continue;
             }
 
+            // Checked per assignment (not once for the whole batch) since
+            // nothing here actually guarantees every id in the request
+            // belongs to the same document — see decide()'s matching
+            // comment for why this runs before closeFor().
+            if (DocumentReviewSession::secondsSpentSoFar($assignment->document_id, $request->user()->user_id) < $minSeconds) {
+                $skippedUnreviewed++;
+                continue;
+            }
+
+            DocumentReviewSession::closeFor($assignment->document, $request->user());
             $this->workflow->decide($assignment, $request->user(), $validated['decision'], $validated['comments'] ?? null);
         }
 
         $status = 'Decision recorded: ' . ucfirst($validated['decision']) . '.';
         if ($skippedExpired > 0) {
-            $status .= " {$skippedExpired} assignment(s) had already breached their SLA and were escalated to Admin instead.";
+            $status .= " {$skippedExpired} assignment(s) had already violated their SLA and were escalated to Admin instead.";
+        }
+        if ($skippedUnreviewed > 0) {
+            $status .= " {$skippedUnreviewed} assignment(s) were skipped — you need to view the document for at least {$minSeconds} seconds before deciding.";
+        }
+
+        if ($request->wantsJson()) {
+            return response()->json(['status' => $status]);
         }
 
         return redirect()->route('approver.dashboard')->with('status', $status);
@@ -306,5 +471,122 @@ class ApprovalController extends Controller
         return back()->with('status', $user->is_busy
             ? "You're now marked as busy/away — new documents will route to an available peer where possible."
             : "You're now marked as available.");
+    }
+
+    // ---------------------------------------------------------------
+    // Decision History — every decision THIS approver has personally
+    // made (approved, rejected, or auto-approved on their behalf),
+    // across every category they've ever been eligible for. Deliberately
+    // assignment-scoped rather than document-scoped like the Archive:
+    // Archive only ever shows approved/auto_approved DOCUMENTS, which
+    // structurally can never include a rejection — an approver's own
+    // rejections would be invisible there. This scopes to THEIR seat's
+    // own individual_status instead, so a reject they issued shows up
+    // even if a co-approver's later reject killed the document via a
+    // completely different stage (that cascade-closed sibling seat still
+    // shows up here too, but clearly attributed to whoever actually
+    // rejected it — see cascade_closed_by and the view).
+    //
+    // Grouped by document, one row per document (not one row per
+    // decision) — same "collapse to one row, expand for the rest"
+    // pattern the Audit Logs/SLA Queue/Unassigned Documents pages already
+    // use, since one approver can hold more than one stage on the same
+    // document and a flat per-decision list repeated the title for each.
+    // ---------------------------------------------------------------
+
+    /** Shared by history() and historyRefresh() — one place, can't drift. */
+    private function historyResults(Request $request, int $approverId): LengthAwarePaginator
+    {
+        $query = DocumentAssignment::where('user_id', $approverId)
+            ->whereIn('individual_status', ['approved', 'rejected', 'auto_approved'])
+            // document.assignments.approver (every seat on the document,
+            // not just this approver's own, plus who holds each one) is
+            // what the view uses to name every co-approver on a
+            // multi-seat stage for attribution purposes — see
+            // history-results.blade.php's $attributionFor.
+            ->with(['document.originator', 'document.assignments.approver', 'stage', 'cascadeClosedBy', 'adminOverrideBy']);
+
+        if ($request->filled('keyword')) {
+            $keyword = $request->string('keyword');
+            $query->whereHas('document', fn ($q) => $q->where('title', 'like', "%{$keyword}%"));
+        }
+
+        if ($request->filled('category')) {
+            $category = $request->string('category');
+            $query->whereHas('document', fn ($q) => $q->where('ml_category', $category));
+        }
+
+        // 'admin_override' isn't a real individual_status value — an admin
+        // deciding on this approver's behalf (SLA Queue / Unassigned
+        // Documents) still writes 'approved'/'rejected' to individual_
+        // status, just with admin_override_by also set. Filtering on that
+        // column instead is what actually answers "show me the ones an
+        // admin decided for me," which individual_status alone can't.
+        if ($request->string('decision')->toString() === 'admin_override') {
+            $query->whereNotNull('admin_override_by');
+        } elseif ($request->filled('decision')) {
+            $query->where('individual_status', $request->string('decision'));
+        }
+
+        if ($request->filled('date_from')) {
+            $query->whereDate('acted_at', '>=', $request->date('date_from'));
+        }
+        if ($request->filled('date_to')) {
+            $query->whereDate('acted_at', '<=', $request->date('date_to'));
+        }
+
+        $decisions = $query->get();
+
+        $containers = $decisions
+            ->groupBy('document_id')
+            ->map(fn ($group) => (object) [
+                'document' => $group->first()->document,
+                'decisions' => $group->sortByDesc('acted_at')->values(),
+                'latest_acted_at' => $group->max('acted_at'),
+            ])
+            ->values();
+
+        $containers = $request->string('sort')->toString() === 'oldest'
+            ? $containers->sortBy('latest_acted_at')->values()
+            : $containers->sortByDesc('latest_acted_at')->values();
+
+        $perPage = 10;
+        $page = (int) $request->input('page', 1);
+
+        return new LengthAwarePaginator(
+            $containers->forPage($page, $perPage)->values(),
+            $containers->count(),
+            $perPage,
+            $page,
+            // Real page route, not $request->url() — also built from
+            // within historyRefresh() (the live-poll fragment route); see
+            // buildQueue()'s matching comment above for the full reasoning.
+            ['path' => route('approver.history'), 'query' => $request->query()]
+        );
+    }
+
+    public function history(Request $request)
+    {
+        $decisions = $this->historyResults($request, $request->user()->user_id);
+        $categories = \App\Services\ValidationService::knownCategories();
+
+        return view('approver.history', compact('decisions', 'categories'));
+    }
+
+    /** Live search (Feature: instant results as you type) — same query as history(), just the results fragment. */
+    public function historyRefresh(Request $request)
+    {
+        $decisions = $this->historyResults($request, $request->user()->user_id);
+
+        return view('approver.partials.history-results', compact('decisions'));
+    }
+
+    /** Cheap change-signal for the live-poll fallback — same pattern as ApprovalController::poll(). */
+    public function historyPoll(Request $request)
+    {
+        return response()->json([
+            'count' => DocumentAssignment::where('user_id', $request->user()->user_id)
+                ->whereIn('individual_status', ['approved', 'rejected', 'auto_approved'])->count(),
+        ]);
     }
 }

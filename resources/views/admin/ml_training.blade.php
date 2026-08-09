@@ -171,10 +171,21 @@
         const opts = {
             refreshUrl: panelsEl.dataset.refreshUrl,
             target: panelsEl,
+            // Was missing before — a poll/channel swap was silently
+            // resetting whichever page of ML Review / Readability Review
+            // you had open back to page 1, since it fetched refreshUrl
+            // with no query string at all.
+            preserveQueryString: true,
         };
 
         startLiveChannel('admin-dashboard', '.document.status-changed', opts);
         startLivePoll({ ...opts, pollUrl: panelsEl.dataset.pollUrl });
+
+        // Both Awaiting ML Review and Content Readability Review
+        // pagination live inside this one container — see
+        // enableAjaxPagination()'s docblock in app.js for why one shared
+        // fragment fetch correctly handles both.
+        enableAjaxPagination(panelsEl, opts);
     });
 </script>
 @endsection

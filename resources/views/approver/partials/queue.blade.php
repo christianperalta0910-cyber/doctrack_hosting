@@ -46,14 +46,18 @@
                         <h3 class="text-sm font-semibold text-surface-900">{{ $doc->title }}</h3>
                         <span class="text-xs text-surface-400">· {{ $doc->ml_category }}</span>
                     </div>
-                    <p class="text-xs text-surface-500 mb-3">
+                    <p class="text-xs text-surface-500 mb-2">
                         Submitted by {{ $doc->originator->full_name }} ·
                         <button type="button"
-                           onclick="openDocumentViewer('{{ route('documents.file', $doc) }}', '{{ $doc->mime_type }}', '{{ addslashes($doc->original_filename ?? $doc->title) }}')"
+                           onclick="openDocumentViewer('{{ route('documents.file', $doc) }}', '{{ $doc->mime_type }}', '{{ addslashes($doc->original_filename ?? $doc->title) }}', {{ $doc->document_id }})"
                            class="text-primary-700 hover:underline font-medium">
                             View original file
                         </button>
                     </p>
+
+                    <div class="mb-3">
+                        <x-document-presence :document="$doc" :show-reviewers="false" />
+                    </div>
 
                     {{-- Full stage pipeline for this document's category, so approvers can
                          see what already happened and what's still to come — not just
@@ -68,20 +72,78 @@
                          visible up there as "Up next" and becomes actionable here once this
                          one is resolved. --}}
                     @php
-                        $activeAssignment = $stageAssignments->sortBy(fn ($a) => $a->stage->sequence_order)->first();
-                        $priorityMap = [1 => ['Urgent', 'bg-rejected-50 text-rejected-700 ring-rejected-500/20'],
-                                         2 => ['Normal', 'bg-processing-50 text-processing-700 ring-processing-500/20'],
-                                         3 => ['Low', 'bg-surface-100 text-surface-600 ring-surface-300']];
-                        // priority_rank reflects the document's overall due-date urgency, not
-                        // this specific stage's own SLA countdown — once that's already past
-                        // (should be rare: ApprovalController escalates expired assignments
-                        // out of this queue on load/decide), "Urgent" would be misleading, so
-                        // "Expired" takes precedence as a defensive override.
-                        $isExpired = $activeAssignment->seconds_remaining !== null && $activeAssignment->seconds_remaining <= 0;
-                        [$pLabel, $pClass] = $isExpired
-                            ? ['Expired', 'bg-rejected-100 text-rejected-800 ring-rejected-500/40']
-                            : ($priorityMap[$activeAssignment->priority_rank] ?? $priorityMap[2]);
+                        // Only a still-pending seat is actionable here — a
+                        // document can also show up in this queue purely
+                        // because it's waiting on OTHER approvers after
+                        // this one already decided every seat they hold
+                        // (see ApprovalController::resolvedButInFlightQueryFor()),
+                        // in which case there's nothing left for THIS
+                        // approver to act on below.
+                        $activeAssignment = $stageAssignments->where('individual_status', 'pending')
+                            ->sortBy(fn ($a) => $a->stage->sequence_order)->first();
+
+                        // Urgent/Normal/Low/Expired — driven by real remaining
+                        // BUSINESS time before this seat's own SLA deadline
+                        // (DocumentAssignment::urgencyRank()), not the
+                        // document's overall due date, so the badge always
+                        // agrees with the countdown shown right below it.
+                        $urgencyStyles = [
+                            1 => ['Urgent', 'bg-rejected-50 text-rejected-700 ring-rejected-500/20'],
+                            2 => ['Normal', 'bg-processing-50 text-processing-700 ring-processing-500/20'],
+                            3 => ['Low', 'bg-surface-100 text-surface-600 ring-surface-300'],
+                            4 => ['Expired', 'bg-rejected-100 text-rejected-800 ring-rejected-500/40'],
+                        ];
+                        [$pLabel, $pClass] = $activeAssignment ? $urgencyStyles[$activeAssignment->urgencyRank()] : [null, null];
+
+                        // Real (business-hours-aware) countdown, not a raw
+                        // wall-clock diff — see realSecondsRemaining()'s
+                        // docblock for why: a diff that crosses an evening/
+                        // weekend can look many times longer than the actual
+                        // review time left, which is exactly what made the
+                        // badge and the countdown look like they disagreed.
+                        $realSecondsRemaining = $activeAssignment?->realSecondsRemaining();
+                        $realRemainingLabel = null;
+                        if ($realSecondsRemaining !== null) {
+                            if ($realSecondsRemaining <= 0) {
+                                $realRemainingLabel = 'expired';
+                            } else {
+                                $rh = intdiv($realSecondsRemaining, 3600);
+                                $rm = intdiv($realSecondsRemaining % 3600, 60);
+                                $realRemainingLabel = $rh > 0 ? "{$rh}h {$rm}m remaining" : "{$rm}m remaining";
+                            }
+                        }
+
+                        // Minimum-review-time gate (config('review.min_review_seconds'))
+                        // — computed here purely for the client-side countdown/
+                        // disabled-button UX; ApprovalController::decide() is the
+                        // real, authoritative enforcement regardless of what this
+                        // shows. Already-reviewed-enough (e.g. returning after a
+                        // past session) renders with 0 remaining, buttons enabled
+                        // from the start — no need to reopen the viewer.
+                        $reviewSecondsRemaining = $activeAssignment
+                            ? max(0, config('review.min_review_seconds', 10) - \App\Models\DocumentReviewSession::secondsSpentSoFar($doc->document_id, auth()->id()))
+                            : 0;
+
+                        // Business-hours restriction (Admin toggle, off by
+                        // default — see SystemSetting/ApprovalController::
+                        // requireBusinessHoursIfEnforced()). $businessHoursEnforced/
+                        // $isWithinBusinessHours are supplied by both
+                        // ApprovalController::dashboard() and refresh(), so a
+                        // live-swapped fragment can never disagree with a full
+                        // page load about whether this is currently blocking.
+                        $outsideBusinessHoursBlocked = ($businessHoursEnforced ?? false) && !($isWithinBusinessHours ?? true);
                     @endphp
+                    @if(!$activeAssignment)
+                        <div class="flex items-center gap-3 rounded-xl border border-approved-200 bg-approved-50/40 p-4">
+                            <span class="w-7 h-7 rounded-full bg-approved-100 text-approved-700 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg>
+                            </span>
+                            <p class="text-xs text-surface-600">
+                                <span class="font-medium text-approved-700">Your decision is recorded.</span>
+                                Still waiting on other approvers before this document is finalized — see the stage list above for who's left.
+                            </p>
+                        </div>
+                    @else
                     <div class="flex flex-col sm:flex-row sm:items-center gap-4 rounded-xl border {{ $activeAssignment->escalated_to_admin ? 'border-rejected-200 bg-rejected-50/40' : 'border-primary-200 bg-primary-50/40' }} p-4 shadow-sm">
                         <div class="flex-1 min-w-0">
                             <div class="flex items-center gap-2 mb-1">
@@ -90,20 +152,30 @@
                             </div>
                             <p class="text-xs text-surface-400">
                                 SLA expires
-                                <span class="font-semibold {{ $activeAssignment->seconds_remaining !== null && $activeAssignment->seconds_remaining < 3600 ? 'text-rejected-700' : 'text-surface-600' }}"
-                                      data-live-time="{{ optional($activeAssignment->sla_expires_at)->timestamp }}"
-                                      data-live-urgent-under="3600">
-                                    {{ $activeAssignment->sla_expires_at?->diffForHumans() ?? '—' }}
-                                </span>
+                                <span class="font-semibold text-surface-600">{{ $activeAssignment->sla_expires_at?->format('M j, Y, g:i A') ?? '—' }}</span>
+                                @if($realSecondsRemaining !== null)
+                                    {{-- Ticks live via __docTrackUpdateRealRemaining() in layouts/app.blade.php
+                                         — server-rendered text below is the starting value, immediately
+                                         taken over by JS on load, same pattern the data-live-time elements
+                                         elsewhere already use. --}}
+                                    <span class="font-semibold {{ $realSecondsRemaining < 3600 ? 'text-rejected-700' : 'text-surface-600' }}"
+                                          data-real-remaining="{{ max(0, $realSecondsRemaining) }}"
+                                          data-live-urgent-under="3600">
+                                        ({{ $realRemainingLabel }})
+                                    </span>
+                                @endif
+                                @if(!$activeAssignment->escalated_to_admin && !($isWithinBusinessHours ?? true))
+                                    <span class="text-[11px] text-surface-400">⏸ Paused (outside business hours)</span>
+                                @endif
                             </p>
                             @if($activeAssignment->escalated_to_admin)
                                 <p class="text-xs text-rejected-700 font-medium mt-1">
                                     You missed this SLA — it's been escalated to Admin and can no longer be approved or rejected here.
                                     This will drop off your queue {{ $activeAssignment->sla_expires_at->copy()->addHours(24)->diffForHumans() }}.
                                 </p>
-                            @elseif(!app(App\Services\BusinessHoursService::class)->isWithinWorkingWindow(now()))
-                                <p class="text-[11px] text-surface-400 mt-0.5">
-                                    SLA clock is paused outside business hours right now — it only counts down during working hours, so this may look longer than the actual review window.
+                            @elseif($outsideBusinessHoursBlocked)
+                                <p class="text-xs text-processing-700 font-medium mt-1">
+                                    Decisions are currently restricted to business hours (9 AM–5 PM, Mon–Sat) — Approve/Reject will unlock when the next working window opens.
                                 </p>
                             @endif
                         </div>
@@ -124,23 +196,43 @@
                                 </div>
                             </div>
                         @else
-                            <form method="POST" action="{{ route('approver.assignments.decide', $activeAssignment) }}" class="flex flex-col sm:w-64 gap-2">
+                            <form method="POST" action="{{ route('approver.assignments.decide', $activeAssignment) }}"
+                                class="review-decide-form flex flex-col sm:w-64 gap-2"
+                                data-document-id="{{ $doc->document_id }}"
+                                data-review-remaining="{{ $reviewSecondsRemaining }}"
+                                data-business-hours-blocked="{{ $outsideBusinessHoursBlocked ? '1' : '0' }}">
                                 @csrf
-                                <textarea name="comments" rows="1" placeholder="Optional comments…"
+                                {{-- One shared textarea serves both Approve and Reject — comments stay
+                                     optional for Approve, but rejecting with no explanation leaves the
+                                     originator nothing to act on when they resubmit (see
+                                     ApprovalController::decide()'s matching server-side rule), so each
+                                     button toggles .required on click rather than the field being
+                                     unconditionally required or optional. --}}
+                                <textarea name="comments" rows="1" placeholder="Comments (required if rejecting)…"
                                     class="w-full rounded-lg border-surface-300 text-xs focus:border-primary-500 focus:ring-primary-500 px-3 py-2"></textarea>
+                                @if($reviewSecondsRemaining > 0)
+                                    <p class="review-countdown-label text-[11px] text-processing-700 font-medium">
+                                        Open "View original file" above to begin your review — {{ $reviewSecondsRemaining }}s needed before you can decide.
+                                    </p>
+                                @endif
                                 <div class="flex gap-2">
                                     <button type="submit" name="decision" value="approved"
-                                        class="flex-1 bg-gradient-to-b from-approved-500 to-approved-600 hover:from-approved-600 hover:to-approved-700 text-white text-xs font-semibold py-2 rounded-lg shadow-sm transition-all">
+                                        {{ ($reviewSecondsRemaining > 0 || $outsideBusinessHoursBlocked) ? 'disabled' : '' }}
+                                        onclick="this.form.querySelector('textarea[name=comments]').required = false"
+                                        class="review-decide-btn flex-1 bg-gradient-to-b from-approved-500 to-approved-600 hover:from-approved-600 hover:to-approved-700 text-white text-xs font-semibold py-2 rounded-lg shadow-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:from-approved-500 disabled:hover:to-approved-600">
                                         Approve
                                     </button>
                                     <button type="submit" name="decision" value="rejected"
-                                        class="flex-1 bg-gradient-to-b from-rejected-500 to-rejected-600 hover:from-rejected-600 hover:to-rejected-700 text-white text-xs font-semibold py-2 rounded-lg shadow-sm transition-all">
+                                        {{ ($reviewSecondsRemaining > 0 || $outsideBusinessHoursBlocked) ? 'disabled' : '' }}
+                                        onclick="this.form.querySelector('textarea[name=comments]').required = true"
+                                        class="review-decide-btn flex-1 bg-gradient-to-b from-rejected-500 to-rejected-600 hover:from-rejected-600 hover:to-rejected-700 text-white text-xs font-semibold py-2 rounded-lg shadow-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:from-rejected-500 disabled:hover:to-rejected-600">
                                         Reject
                                     </button>
                                 </div>
                             </form>
                         @endif
                     </div>
+                    @endif
                 </div>
             @endforeach
         </div>

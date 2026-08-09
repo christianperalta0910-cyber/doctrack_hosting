@@ -44,7 +44,22 @@ expect()->extend('toBeOne', function () {
 |
 */
 
-function something()
+/**
+ * Backdates a closed DocumentReviewSession so a test can decide/confirm/
+ * reject a document without tripping the minimum-review-time gate (see
+ * config('review.min_review_seconds') and DocumentReviewSession::
+ * secondsSpentSoFar()) — every decision endpoint checks this now, so any
+ * test exercising one needs a real review session behind it, the same way
+ * a real user would have opened the document viewer first.
+ */
+function seedReviewTime(\App\Models\User $user, \App\Models\DocumentRepository $document, int $seconds = 15): void
 {
-    // ..
+    \App\Models\DocumentReviewSession::create([
+        'document_id' => $document->document_id,
+        'user_id' => $user->user_id,
+        'opened_at' => now()->subSeconds($seconds),
+        'closed_at' => now(),
+        'duration_seconds' => $seconds,
+        'session_type' => 'initial',
+    ]);
 }

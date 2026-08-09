@@ -41,7 +41,7 @@
                 </td>
                 <td class="px-6 py-4 text-surface-600">{{ $doc->ml_category ?? '—' }}</td>
                 <td class="px-6 py-4"><x-status-badge :status="$doc->display_status" /></td>
-                <td class="px-6 py-4 text-surface-500">{{ $doc->upload_date->diffForHumans() }}</td>
+                <td class="px-6 py-4 text-surface-500 whitespace-nowrap">{{ $doc->upload_date->format('M j, Y, g:i A') }}</td>
                 <td class="px-6 py-4 text-right">
                     <a href="{{ route('originator.documents.show', $doc) }}" class="text-primary-700 hover:text-primary-900 font-medium text-xs">Track &rarr;</a>
                 </td>

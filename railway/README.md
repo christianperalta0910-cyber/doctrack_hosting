@@ -75,13 +75,34 @@ BREVO_API_KEY=your-brevo-api-key        # starts with xkeysib-, from the API Key
 MAIL_FROM_ADDRESS="noreply@yourdomain.com"
 MAIL_FROM_NAME="${APP_NAME}"
 
+# --- File storage (Cloudflare R2) ---
+# Local disk (the default, FILESYSTEM_DISK=local) does NOT survive a
+# redeploy on Railway — every service's filesystem is ephemeral, so
+# uploaded documents and trained ML model files would silently disappear
+# on the next push. R2 is S3-API-compatible (league/flysystem-aws-s3-v3 is
+# already in composer.json), so switching is just these env vars — no code
+# changes anywhere, since the app only ever reads/writes via
+# Storage::disk(...), never a raw file path.
+#
+# Get these from the Cloudflare dashboard: R2 → create a bucket → Manage
+# API Tokens → Create API Token (Object Read & Write, scoped to that
+# bucket) for the key/secret; the bucket's own page shows its S3 endpoint.
+FILESYSTEM_DISK=s3
+AWS_ACCESS_KEY_ID=your-r2-access-key-id
+AWS_SECRET_ACCESS_KEY=your-r2-secret-access-key
+AWS_DEFAULT_REGION=auto
+AWS_BUCKET=doctrack-documents
+AWS_ENDPOINT=https://<your-cloudflare-account-id>.r2.cloudflarestorage.com
+AWS_USE_PATH_STYLE_ENDPOINT=true
+
 BACKUP_KEEP=14
 ```
 
-**Two things that trip people up here:**
+**Three things that trip people up here:**
 
 1. **`REVERB_HOST` must be the Reverb service's own public domain, not the web service's.** Give the `reverb` service a public domain first (Railway → that service → Settings → Networking → Generate Domain), copy it, *then* set `REVERB_HOST` to it everywhere.
 2. **The `VITE_REVERB_*` variables get baked into the JS bundle at build time**, not read at runtime — this app already avoids the worst version of this problem (`resources/js/echo.js` uses `window.location.hostname` for the WebSocket host dynamically instead of trusting the build-time value), but `VITE_REVERB_APP_KEY`/`PORT`/`SCHEME` still need to be correct *before* the web service's build runs. If you set or change any `REVERB_*` variable, trigger a fresh deploy of the **web** service afterward — a variable change alone doesn't rebuild already-compiled assets.
+3. **`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are secrets — never commit them.** They only ever go into Railway's environment variables (ideally the shared variable group, same as everything else here), never into `.env.example` or any file in the repo. If you ever paste a real key into a file by mistake, treat it as compromised and regenerate it from the Cloudflare dashboard rather than just deleting the line.
 
 ## Generating `APP_KEY`
 

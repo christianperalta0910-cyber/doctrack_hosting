@@ -3,16 +3,16 @@
 namespace App\Services;
 
 use App\Models\SlaHoliday;
-use App\Models\SlaSetting;
 use Carbon\Carbon;
 
 /**
  * BusinessHoursService
  * ---------------------
  * Section 1: Operational Window Controls & Holiday Management. Computes
- * business-hours-aware timestamps against the admin-configured daily
- * working window (SlaSetting) and non-working dates (SlaHoliday), which
- * are treated identically to a non-working weekday.
+ * business-hours-aware timestamps against the fixed daily working window
+ * (config('sla.php') — 9-5, Mon-Sat by default, no longer admin-editable)
+ * and non-working dates (SlaHoliday), which are treated identically to a
+ * non-working weekday.
  *
  * Settings are lazy-loaded on first actual use, not in the constructor —
  * this service is resolved fresh per request via normal DI, so there's no
@@ -52,17 +52,16 @@ class BusinessHoursService
     /** ['Y-m-d' => true, ...] for O(1) lookup. */
     private ?array $holidayDates = null;
 
-    /** Loads settings/holidays from the database on first actual use — see class docblock for why this can't happen in the constructor. */
+    /** Loads holidays from the database on first actual use — see class docblock for why this can't happen in the constructor. The working window itself is a fixed config value now, not admin-editable, so no query is needed for that part. */
     private function ensureLoaded(): void
     {
         if ($this->workingDays !== null) {
             return;
         }
 
-        $settings = SlaSetting::current();
-        $this->workingDays = $settings->working_days ?: config('sla.default_working_days');
-        $this->workStartTime = $settings->work_start_time;
-        $this->workEndTime = $settings->work_end_time;
+        $this->workingDays = config('sla.default_working_days');
+        $this->workStartTime = config('sla.default_work_start');
+        $this->workEndTime = config('sla.default_work_end');
 
         $this->holidayDates = SlaHoliday::pluck('holiday_date')
             ->map(fn ($date) => Carbon::parse($date)->toDateString())
@@ -152,6 +151,45 @@ class BusinessHoursService
             'BusinessHoursService: could not resolve a deadline within ' . self::MAX_ITERATIONS .
             ' working-day iterations — check sla_settings.working_days / sla_holidays for misconfiguration.'
         );
+    }
+
+    /**
+     * The mirror image of addBusinessMinutes() above: instead of "given a
+     * budget, find the deadline," this is "given a deadline, find the
+     * real remaining budget from $from" — sums only the seconds between
+     * $from and $until that fall inside actual working windows, skipping
+     * evenings, non-working weekdays, and holiday dates, instead of a raw
+     * wall-clock diff (which can look wildly inflated whenever the gap
+     * crosses a non-working stretch). Returns 0 once $until has already
+     * passed.
+     */
+    public function businessSecondsRemaining(Carbon $from, Carbon $until): int
+    {
+        if ($until->lessThanOrEqualTo($from)) {
+            return 0;
+        }
+
+        $cursor = $this->nextWorkingMoment($from->copy());
+        $totalSeconds = 0;
+
+        for ($i = 0; $i <= self::MAX_ITERATIONS; $i++) {
+            if ($cursor->greaterThanOrEqualTo($until)) {
+                break;
+            }
+
+            $endOfToday = $this->endOfWindow($cursor);
+            $segmentEnd = $until->lessThan($endOfToday) ? $until : $endOfToday;
+
+            $totalSeconds += $cursor->diffInSeconds($segmentEnd);
+
+            if ($until->lessThanOrEqualTo($endOfToday)) {
+                break;
+            }
+
+            $cursor = $this->nextWorkingMoment($this->startOfWindow($cursor->copy()->addDay()));
+        }
+
+        return $totalSeconds;
     }
 
     /**

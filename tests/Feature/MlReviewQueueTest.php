@@ -96,7 +96,9 @@ it('lets an admin confirm a near-duplicate (not identical) document independentl
     $primary = flaggedDocument(confidence: 20.0, category: 'Job Order', text: NEAR_DUP_BASE);
     $similar = flaggedDocument(confidence: 22.0, category: 'Job Order', text: NEAR_DUP_VARIANT);
 
-    $this->actingAs(mlReviewAdmin())
+    $admin = mlReviewAdmin();
+    seedReviewTime($admin, $similar);
+    $this->actingAs($admin)
         ->post(route('admin.ml.review', $similar), ['action' => 'confirm', 'category' => 'Job Order'])
         ->assertSessionHas('status');
 
@@ -113,7 +115,9 @@ it('confirming a document also confirms and routes a genuinely-identical (exact-
     $primary = flaggedDocument(confidence: 20.0, category: 'Job Order', text: NEAR_DUP_BASE);
     $exact = flaggedDocument(confidence: 22.0, category: 'Job Order', text: NEAR_DUP_BASE); // identical text -> similarity 1.0
 
-    $this->actingAs(mlReviewAdmin())
+    $admin = mlReviewAdmin();
+    seedReviewTime($admin, $primary);
+    $this->actingAs($admin)
         ->post(route('admin.ml.review', $primary), ['action' => 'confirm', 'category' => 'Job Order'])
         ->assertSessionHas('status');
 
@@ -130,7 +134,9 @@ it('rejecting a document also rejects a genuinely-identical (exact-duplicate) si
     $primary = flaggedDocument(confidence: 20.0, category: 'Job Order', text: NEAR_DUP_BASE);
     $exact = flaggedDocument(confidence: 22.0, category: 'Job Order', text: NEAR_DUP_BASE);
 
-    $this->actingAs(mlReviewAdmin())
+    $admin = mlReviewAdmin();
+    seedReviewTime($admin, $primary);
+    $this->actingAs($admin)
         ->post(route('admin.ml.review', $primary), ['action' => 'reject'])
         ->assertSessionHas('status');
 
@@ -159,7 +165,9 @@ it('confirming a category routes the held document to an eligible approver and a
 
     $document = flaggedDocument(confidence: 30.0, category: 'Job Order', text: 'a job order sample');
 
-    $this->actingAs(mlReviewAdmin())
+    $admin = mlReviewAdmin();
+    seedReviewTime($admin, $document);
+    $this->actingAs($admin)
         ->post(route('admin.ml.review', $document), [
             'action' => 'confirm',
             'category' => 'Purchase Requisition',
@@ -177,7 +185,9 @@ it('confirming a category routes the held document to an eligible approver and a
 it('rejecting a held document marks it rejected, notifies the originator, and does not route or stage it', function () {
     $document = flaggedDocument();
 
-    $this->actingAs(mlReviewAdmin())
+    $admin = mlReviewAdmin();
+    seedReviewTime($admin, $document);
+    $this->actingAs($admin)
         ->post(route('admin.ml.review', $document), ['action' => 'reject'])
         ->assertSessionHas('status');
 
@@ -387,7 +397,7 @@ it('broadcasts DocumentStatusChanged when WorkflowService::ingest() holds a newl
         $mock->shouldReceive('classify')->andReturn(['category' => 'Purchase Requisition', 'confidence' => 30.0, 'model_id' => null]);
     });
     $this->mock(App\Services\ValidationService::class, function ($mock) {
-        $mock->shouldReceive('validate')->andReturn(['is_valid' => true, 'errors' => []]);
+        $mock->shouldReceive('validate')->andReturn(['is_valid' => true, 'errors' => [], 'readability_score' => null, 'readability_only_failure' => false]);
     });
 
     $originator = User::factory()->originator()->create();
@@ -405,10 +415,12 @@ it('broadcasts DocumentStatusChanged when a document is confirmed out of the rev
     WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
 
     $document = flaggedDocument(confidence: 30.0, category: 'Job Order');
+    $admin = mlReviewAdmin();
+    seedReviewTime($admin, $document);
 
     Event::fake([DocumentStatusChanged::class]);
 
-    $this->actingAs(mlReviewAdmin())
+    $this->actingAs($admin)
         ->post(route('admin.ml.review', $document), ['action' => 'confirm', 'category' => 'Job Order']);
 
     Event::assertDispatched(DocumentStatusChanged::class, fn ($e) => $e->document->document_id === $document->document_id);

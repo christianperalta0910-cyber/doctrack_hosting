@@ -1,18 +1,11 @@
 <?php
 
 use App\Models\DocumentAssignment;
-use App\Models\SlaSetting;
 use App\Services\WorkflowService;
 use Carbon\Carbon;
 
-// Mon–Sat 9:00–17:00 — matches this app's default configuration.
-beforeEach(function () {
-    SlaSetting::current()->update([
-        'work_start_time' => '09:00:00',
-        'work_end_time' => '17:00:00',
-        'working_days' => [1, 2, 3, 4, 5, 6],
-    ]);
-});
+// Mon–Sat 9:00–17:00 — the fixed config('sla.php') default (no longer
+// admin-editable), so no setup is needed beyond that.
 
 /**
  * Builds a transient (unsaved) assignment with only the two fields the

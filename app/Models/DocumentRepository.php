@@ -38,7 +38,8 @@ class DocumentRepository extends Model
         'is_validated', 'validation_errors', 'due_date', 'global_status',
         'previous_version_id', 'version_number', 'is_legacy_import', 'disputed_at',
         'ml_review_status', 'ml_recheck_category', 'ml_recheck_confidence', 'ml_rechecked_at',
-        'ml_recheck_dismissed_at', 'confirmed_at_model_id',
+        'ml_recheck_dismissed_at', 'confirmed_at_model_id', 'requires_printing',
+        'readability_score', 'readability_review_status',
     ];
 
     protected $casts = [
@@ -52,6 +53,7 @@ class DocumentRepository extends Model
         'ml_recheck_confidence' => 'float',
         'ml_rechecked_at' => 'datetime',
         'ml_recheck_dismissed_at' => 'datetime',
+        'requires_printing' => 'boolean',
     ];
 
     // Every state a document can be in — mirrors Section 5 state machine.
@@ -71,6 +73,9 @@ class DocumentRepository extends Model
             return 'disputed';
         }
         if ($this->ml_review_status === 'pending' && $this->global_status === 'classified_validated') {
+            return 'pending_review';
+        }
+        if ($this->readability_review_status === 'pending') {
             return 'pending_review';
         }
         return $this->global_status;
@@ -116,7 +121,16 @@ class DocumentRepository extends Model
 
     public function auditLogs()
     {
-        return $this->hasMany(AuditLog::class, 'document_id', 'document_id')->orderByDesc('timestamp');
+        // Secondary tiebreak on log_id (auto-increment, so it reflects true
+        // insertion order) matters a lot here: `timestamp` is a
+        // second-precision column, and a single WorkflowService::ingest()
+        // call fires several AuditLog rows (upload, validate, classify,
+        // route per stage) synchronously within the same wall-clock
+        // second — without this, MySQL has no defined order for those
+        // ties and the movement timeline renders them scrambled.
+        return $this->hasMany(AuditLog::class, 'document_id', 'document_id')
+            ->orderByDesc('timestamp')
+            ->orderByDesc('log_id');
     }
 
     /** The document this one was resubmitted to revise, if any. */
