@@ -1,0 +1,57 @@
+name: Tests
+
+# Runs on every push (any branch — not just main, so this catches problems
+# while still on a feature branch) and on pull requests targeting main.
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Extensions match composer.json's hard requirements (ext-fileinfo,
+      # ext-pcntl, ext-zip — see composer.json's _comment_extensions) plus
+      # pdo_sqlite, which phpunit.xml needs since the test suite always
+      # runs against an in-memory SQLite database (DB_CONNECTION=sqlite,
+      # DB_DATABASE=:memory:), regardless of the real app's MySQL config —
+      # no database service container needed here at all.
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: fileinfo, pcntl, zip, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Copy .env
+        run: cp .env.example .env
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Generate app key
+        run: php artisan key:generate
+
+      # public/build (the compiled Vite manifest + assets) is gitignored,
+      # so a fresh checkout has none — without this, any test that renders
+      # a full page (most Feature tests, via layouts.app's @vite(...))
+      # fails with "Unable to locate file in the Vite manifest", not a
+      # real app bug.
+      - name: Install NPM dependencies
+        run: npm ci
+
+      - name: Build frontend assets
+        run: npm run build
+
+      - name: Run test suite
+        run: php artisan test

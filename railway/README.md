@@ -96,13 +96,24 @@ AWS_ENDPOINT=https://<your-cloudflare-account-id>.r2.cloudflarestorage.com
 AWS_USE_PATH_STYLE_ENDPOINT=true
 
 BACKUP_KEEP=14
+
+# --- Error monitoring (Sentry) ---
+# Without this, the only trace of a production error is storage/logs/
+# laravel.log on whichever ephemeral Railway container happens to still be
+# running when you go looking — easy to lose entirely on the next redeploy.
+# Get a DSN from sentry.io (free tier is enough at this scale) → create a
+# Laravel project → Settings → Client Keys (DSN). Set on the web service at
+# minimum; the other three (queue-worker/reverb/scheduler) benefit from it
+# too if you want errors from those surfaced as well.
+SENTRY_LARAVEL_DSN=https://your-key@your-org.ingest.sentry.io/your-project-id
 ```
 
-**Three things that trip people up here:**
+**Four things that trip people up here:**
 
 1. **`REVERB_HOST` must be the Reverb service's own public domain, not the web service's.** Give the `reverb` service a public domain first (Railway → that service → Settings → Networking → Generate Domain), copy it, *then* set `REVERB_HOST` to it everywhere.
 2. **The `VITE_REVERB_*` variables get baked into the JS bundle at build time**, not read at runtime — this app already avoids the worst version of this problem (`resources/js/echo.js` uses `window.location.hostname` for the WebSocket host dynamically instead of trusting the build-time value), but `VITE_REVERB_APP_KEY`/`PORT`/`SCHEME` still need to be correct *before* the web service's build runs. If you set or change any `REVERB_*` variable, trigger a fresh deploy of the **web** service afterward — a variable change alone doesn't rebuild already-compiled assets.
 3. **`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are secrets — never commit them.** They only ever go into Railway's environment variables (ideally the shared variable group, same as everything else here), never into `.env.example` or any file in the repo. If you ever paste a real key into a file by mistake, treat it as compromised and regenerate it from the Cloudflare dashboard rather than just deleting the line.
+4. **`SENTRY_LARAVEL_DSN` is safe to leave blank** if you're not ready to set up Sentry yet — the SDK silently no-ops with no DSN configured (see `config/sentry.php`), it won't error or block anything. Same "never commit a real secret" caution as the AWS keys above still applies once you do set it, even though a DSN is less sensitive than an access key (it can only submit events, not read your account).
 
 ## Generating `APP_KEY`
 

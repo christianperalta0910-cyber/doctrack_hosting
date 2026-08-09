@@ -5,6 +5,7 @@ use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Console\Scheduling\Schedule;
+use Sentry\Laravel\Integration;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -76,5 +77,11 @@ return Application::configure(basePath: dirname(__DIR__))
         $schedule->command('backup:run')->dailyAt('02:00')->withoutOverlapping();
     })
     ->withExceptions(function (Exceptions $exceptions) {
-        //
+        // Sends every unhandled exception to Sentry (config/sentry.php,
+        // SENTRY_LARAVEL_DSN env var) — a no-op with no DSN set (e.g.
+        // local dev), so this is safe to leave wired in unconditionally.
+        // Without this, the only trace of a production error is
+        // storage/logs/laravel.log on whichever ephemeral Railway
+        // container happens to still be running.
+        Integration::handles($exceptions);
     })->create();
