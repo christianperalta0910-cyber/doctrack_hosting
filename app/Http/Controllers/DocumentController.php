@@ -311,28 +311,27 @@ class DocumentController extends Controller
             DocumentReviewSession::openFor($document, $user);
         }
 
-        abort_unless(Storage::disk('local')->exists($document->file_path), 404, 'File not found.');
+        // Default disk (config('filesystems.default')), not hardcoded
+        // 'local' — respects FILESYSTEM_DISK. Storage::response() (unlike
+        // response()->file(), which needs an actual local filesystem path
+        // and therefore ONLY ever worked against local disk) streams
+        // correctly from any configured disk driver, including an
+        // S3-compatible one like Cloudflare R2.
+        abort_unless(Storage::exists($document->file_path), 404, 'File not found.');
 
-        $path = Storage::disk('local')->path($document->file_path);
         $mime = $document->mime_type ?: 'application/octet-stream';
 
-        $response = response()->file($path, [
+        $response = Storage::response($document->file_path, $document->original_filename ?? $document->title, [
             'Content-Type' => $mime,
-            'Content-Disposition' => 'inline; filename="' . addslashes($document->original_filename ?? $document->title) . '"',
         ]);
 
-        // no-store, not response()->file()'s hardcoded "public" default: a
-        // browser silently serving a second open from cache skips this
+        // no-store, not whatever the disk driver's response() defaults to:
+        // a browser silently serving a second open from cache skips this
         // whole method entirely, which means openFor() never runs — no
         // review session gets created for that visit, so it never shows up
         // as "reviewing", never gets a realtime push, and its time never
         // gets counted. Every open of this popup needs to genuinely hit the
-        // server, not just the first one. Passing 'Cache-Control' in the
-        // headers array above isn't enough on its own — BinaryFileResponse's
-        // constructor unconditionally calls setPublic() afterwards, which
-        // ADDS a "public" directive alongside whatever was already set
-        // rather than replacing it, so it has to be removed explicitly
-        // here instead.
+        // server, not just the first one.
         $response->headers->addCacheControlDirective('no-store');
         $response->headers->addCacheControlDirective('must-revalidate');
         $response->headers->removeCacheControlDirective('public');

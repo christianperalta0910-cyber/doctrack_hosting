@@ -190,7 +190,14 @@ class WorkflowService
     public function ingest(UploadedFile $file, User $originator, string $dueDate, ?int $batchId = null, ?DocumentRepository $revisionOf = null, bool $requiresPrinting = false): DocumentRepository
     {
         return DB::transaction(function () use ($file, $originator, $dueDate, $batchId, $revisionOf, $requiresPrinting) {
-            $storedPath = $file->store('documents', 'local');
+            // Default disk (config('filesystems.default')), not hardcoded
+            // 'local' — respects FILESYSTEM_DISK, so uploads actually land
+            // wherever that's configured (S3-compatible object storage in
+            // production, e.g. Cloudflare R2, since local disk doesn't
+            // survive a Railway redeploy). Hardcoding 'local' here silently
+            // defeated switching FILESYSTEM_DISK entirely — every upload
+            // kept landing on local disk regardless of that setting.
+            $storedPath = $file->store('documents');
 
             $document = DocumentRepository::create([
                 'originator_id' => $originator->user_id,

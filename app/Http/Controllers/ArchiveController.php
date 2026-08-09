@@ -235,12 +235,16 @@ class ArchiveController extends Controller
             );
         }
 
-        abort_unless(Storage::disk('local')->exists($document->file_path), 404, 'File no longer available on disk.');
+        // Default disk (config('filesystems.default')), not hardcoded
+        // 'local' — respects FILESYSTEM_DISK, so this still works when
+        // that's S3-compatible object storage (e.g. Cloudflare R2) rather
+        // than the local disk, which doesn't survive a Railway redeploy.
+        abort_unless(Storage::exists($document->file_path), 404, 'File no longer available on disk.');
 
         AuditLog::record($user->user_id, $document->document_id, 'archive_download',
             "{$user->full_name} downloaded '{$document->title}' from the archive.");
 
-        return Storage::disk('local')->download($document->file_path, $document->original_filename ?? $document->title);
+        return Storage::download($document->file_path, $document->original_filename ?? $document->title);
     }
 
     /**
@@ -263,7 +267,8 @@ class ArchiveController extends Controller
         ]);
 
         $file = $validated['file'];
-        $storedPath = $file->store('documents', 'local');
+        // Default disk, not hardcoded 'local' — see WorkflowService::ingest()'s matching comment.
+        $storedPath = $file->store('documents');
         $extraction = $this->extractor->extract($file); // populates ocr_text so it stays searchable
 
         $document = DocumentRepository::create([
