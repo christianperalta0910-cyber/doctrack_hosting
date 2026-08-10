@@ -78,6 +78,7 @@ Route::middleware('auth')->group(function () {
     // so these live outside any single role's route group.
     Route::get('/notifications/poll', [NotificationController::class, 'poll'])->middleware('throttle:30,1')->name('notifications.poll');
     Route::get('/notifications/refresh', [NotificationController::class, 'refresh'])->middleware('throttle:30,1')->name('notifications.refresh');
+    Route::get('/notifications/list-refresh', [NotificationController::class, 'listRefresh'])->middleware('throttle:30,1')->name('notifications.listRefresh');
     Route::post('/notifications/{notification}/read', [NotificationController::class, 'markRead'])->name('notifications.read');
     Route::post('/notifications/read-all', [NotificationController::class, 'markAllRead'])->name('notifications.readAll');
 
@@ -136,6 +137,7 @@ Route::middleware('auth')->group(function () {
         Route::get('/dashboard/poll', [AdminController::class, 'overviewPoll'])->middleware('throttle:30,1')->name('dashboard.poll');
         Route::get('/dashboard/refresh', [AdminController::class, 'overviewRefresh'])->middleware('throttle:30,1')->name('dashboard.refresh');
         Route::get('/dashboard/drilldown/{type}', [AdminController::class, 'dashboardDrilldown'])->middleware('throttle:30,1')->name('dashboard.drilldown');
+        Route::get('/dashboard/analytics-panel', [AdminController::class, 'analyticsPanelRefresh'])->middleware('throttle:30,1')->name('dashboard.analyticsPanel');
 
         Route::get('/users', [AdminController::class, 'users'])->name('users');
         Route::get('/users/refresh', [AdminController::class, 'usersRefresh'])->name('users.refresh');

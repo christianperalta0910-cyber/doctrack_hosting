@@ -40,3 +40,23 @@ it('does not include the outer <details> tag in the refresh fragment, preserving
     $response->assertOk();
     expect($response->getContent())->not->toContain('<details');
 });
+
+it('serves the full notifications list fragment for the live-refresh JS on the Notifications page', function () {
+    $user = User::factory()->originator()->create();
+    NotificationRecord::create(['recipient_id' => $user->user_id, 'message_body' => 'A full-list-page notification', 'priority' => 'normal', 'is_read' => false, 'created_at' => now()]);
+
+    $response = $this->actingAs($user)->get(route('notifications.listRefresh'));
+
+    $response->assertOk()->assertSee('A full-list-page notification');
+});
+
+it('does not leak another user\'s notifications into the list-refresh fragment', function () {
+    $user = User::factory()->originator()->create();
+    $other = User::factory()->originator()->create();
+    NotificationRecord::create(['recipient_id' => $other->user_id, 'message_body' => 'Someone else\'s notification', 'priority' => 'normal', 'is_read' => false, 'created_at' => now()]);
+
+    $response = $this->actingAs($user)->get(route('notifications.listRefresh'));
+
+    $response->assertOk();
+    expect($response->getContent())->not->toContain("Someone else's notification");
+});

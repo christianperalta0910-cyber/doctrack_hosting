@@ -21,6 +21,21 @@ function trackedDocument(User $originator): DocumentRepository
     ]);
 }
 
+it('broadcasts DocumentStatusChanged to the owning originator, every admin, AND every approver', function () {
+    // The 'approvers' channel is what lets the Archive page (any approver
+    // can browse it) live-refresh when a document newly arrives there —
+    // regression coverage for that broadcast reaching the right audience.
+    $originator = User::factory()->originator()->create();
+    $document = trackedDocument($originator);
+
+    $channels = (new DocumentStatusChanged($document))->broadcastOn();
+    $channelNames = array_map(fn ($c) => $c->name, $channels);
+
+    expect($channelNames)->toContain('private-originator.' . $originator->user_id)
+        ->toContain('private-admin-dashboard')
+        ->toContain('private-approvers');
+});
+
 it('broadcasts DocumentStatusChanged when a single assignment is decided, even if global_status has not finalized yet', function () {
     Event::fake([DocumentStatusChanged::class]);
 

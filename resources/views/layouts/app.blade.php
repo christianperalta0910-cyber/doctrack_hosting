@@ -259,6 +259,71 @@
 
     document.addEventListener('DOMContentLoaded', __docTrackUpdateRealRemaining);
     setInterval(__docTrackUpdateRealRemaining, 1000);
+
+    // Analytics "Now" line ticker — walks the vertical marker on the
+    // Admin Dashboard's Day-tab chart (admin/partials/analytics-panel.blade.php)
+    // forward in real time, live-clock label included. Lives here (not in
+    // that panel's own script) for the same reason __docTrackUpdateRealRemaining
+    // does: one global, DOM-driven ticker that's a harmless no-op wherever
+    // its target element doesn't currently exist, rather than something
+    // that needs re-wiring every time the panel gets AJAX-swapped in.
+    // Reuses MANILA_OFFSET_MS above for the same "correct regardless of
+    // the visitor's own browser timezone" reason.
+    //
+    // Snapped to the nearest 15-minute mark (:00/:15/:30/:45), not the
+    // exact minute — the chart maps a full 24-hour day across roughly 950
+    // SVG units, so minute-by-minute movement was only a fraction of a
+    // pixel per update and read as barely moving at all. Stepping in
+    // 15-minute jumps makes each move ~4x bigger and genuinely visible
+    // (11:15 -> 11:30 -> 11:45 -> 12:00), holding still between marks
+    // instead of creeping continuously.
+    //
+    // Ticks every 1s (matching __docTrackUpdateRealRemaining above), not
+    // on some longer delay — the function itself is cheap, and the point
+    // of checking often is to catch the moment a 15-minute mark actually
+    // passes as close to real time as possible, rather than the step
+    // lagging behind by however long the tick interval is.
+    //
+    // data-step-x is the EXACT spacing analytics-panel.blade.php uses
+    // between its 24 hour-points (x = AXIS_W + index * stepX). Position is
+    // computed as a fractional INDEX (hour + minutes/60) times that same
+    // stepX — not an independent minutes-into-day/1440 fraction of the
+    // total width. Those two scales don't match (24 points is 23 gaps,
+    // not 24), which used to drift the line away from where the hour
+    // points actually sit. Reusing the identical stepX value guarantees
+    // this can only ever land on/between the real points, never off from
+    // them.
+    function __docTrackUpdateAnalyticsNowLine() {
+        const marker = document.querySelector('.analytics-now-marker');
+        if (!marker) return;
+
+        const plotStart = parseFloat(marker.dataset.plotStart);
+        const stepX = parseFloat(marker.dataset.stepX);
+        if (isNaN(plotStart) || isNaN(stepX)) return;
+
+        const manila = new Date(Date.now() + MANILA_OFFSET_MS);
+        const snappedMinutes = Math.floor(manila.getUTCMinutes() / 15) * 15;
+        const fractionalIndex = manila.getUTCHours() + (snappedMinutes / 60);
+        const x = plotStart + fractionalIndex * stepX;
+
+        const line = marker.querySelector('.analytics-now-line');
+        if (line) {
+            line.setAttribute('x1', x);
+            line.setAttribute('x2', x);
+        }
+
+        const label = marker.querySelector('.analytics-now-label');
+        if (label) {
+            label.setAttribute('x', x);
+            const hours12 = manila.getUTCHours() % 12 || 12;
+            const ampm = manila.getUTCHours() < 12 ? 'AM' : 'PM';
+            const minutes = String(snappedMinutes).padStart(2, '0');
+            label.textContent = `${hours12}:${minutes} ${ampm}`;
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', __docTrackUpdateAnalyticsNowLine);
+    setInterval(__docTrackUpdateAnalyticsNowLine, 1000);
 </script>
 @stack('scripts')
 </body>

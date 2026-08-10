@@ -29,56 +29,51 @@
 </div>
 
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mt-4">
-    {{-- SLA override alerts --}}
+    {{--
+        Analytics — constrained to 2/3 width here (not its own full-width
+        row) specifically so it doesn't visually dominate the dashboard
+        next to everything else, which is why it sits in this grid rather
+        than below it. ONE reusable panel (see
+        AdminController::analyticsPanelData()) whose content is fetched via
+        AJAX whenever the Day/Week/Month/Year tab or the date filter
+        changes — never four pre-rendered panels toggled by CSS. The
+        wrapper below carries the persistent id + refresh URL and survives
+        every swap; only what's inside it is replaced (see
+        dashboard.blade.php's script). $panel is only passed in on the
+        initial dashboard() load — overviewRefresh()'s periodic live-swap
+        deliberately omits it (see dashboardExtras()'s docblock), so the
+        script re-fetches the currently-selected state right after any
+        such swap.
+    --}}
     <div class="lg:col-span-2 bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
-        <div class="px-5 py-3 border-b border-surface-200 flex items-center justify-between">
-            <h2 class="text-sm font-semibold text-surface-900 tracking-tight flex items-center gap-2">
-                <span class="relative flex w-2 h-2">
-                    <span class="absolute inline-flex h-full w-full rounded-full bg-rejected-400 opacity-75 animate-ping"></span>
-                    <span class="relative inline-flex rounded-full h-2 w-2 bg-rejected-500"></span>
-                </span>
-                SLA Override Alerts
-            </h2>
-            <div class="flex items-center gap-3">
-                @if($reviewCount > 0)
-                    <a href="{{ route('admin.sla.queue') }}" class="text-xs bg-processing-50 text-processing-700 px-2 py-1 rounded-full font-medium ring-1 ring-inset ring-processing-500/20">{{ $reviewCount }} auto-approved awaiting review</a>
-                @endif
-                <a href="{{ route('admin.sla.queue') }}" class="text-xs text-primary-700 hover:underline font-medium">View all &rarr;</a>
+        <div class="px-5 py-3 border-b border-surface-200 flex items-center justify-between flex-wrap gap-3">
+            <h2 class="text-sm font-semibold text-surface-900 tracking-tight">Analytics</h2>
+            <div class="flex items-center gap-2 flex-wrap">
+                <input type="date" id="analytics-date-filter" value="{{ $panel['as_of'] ?? now()->toDateString() }}"
+                    max="{{ now()->toDateString() }}"
+                    class="text-xs rounded-lg border border-surface-200 px-2 py-1.5 text-surface-600 focus:outline-none focus:ring-1 focus:ring-primary-500" />
+                <div class="inline-flex rounded-lg border border-surface-200 overflow-hidden text-xs font-medium">
+                    @foreach(['day' => 'Day', 'week' => 'Week', 'month' => 'Month', 'year' => 'Year'] as $key => $label)
+                        <button type="button" data-analytics-tab="{{ $key }}"
+                            class="analytics-tab-btn px-3 py-1.5 transition-colors {{ ($panel['granularity'] ?? 'day') === $key ? 'bg-primary-700 text-white' : 'text-surface-600 hover:bg-surface-50' }}">
+                            {{ $label }}
+                        </button>
+                    @endforeach
+                </div>
             </div>
         </div>
-        @php
-            // Nest by document — a single document can have more than one
-            // violated stage (e.g. Budget Check and Final Approval both
-            // pending on the same doc), which previously showed as
-            // separate flat rows repeating the same title.
-            $alertsByDocument = $slaAlerts->groupBy('document_id')->take(5);
-        @endphp
-        <ul class="divide-y divide-surface-100">
-            @forelse($alertsByDocument as $violations)
-                @php $doc = $violations->first()->document; @endphp
-                <li class="px-5 py-2.5 hover:bg-surface-50/60 transition-colors">
-                    <div class="flex items-center justify-between gap-3">
-                        <p class="font-medium text-surface-800 truncate">{{ $doc->title }}</p>
-                        <a href="{{ route('admin.sla.queue') }}" class="shrink-0 text-xs bg-primary-700 text-white px-3 py-1.5 rounded-lg font-medium hover:bg-primary-800 shadow-sm transition-colors">Override</a>
-                    </div>
-                    <ul class="mt-1 space-y-0.5">
-                        @foreach($violations as $a)
-                            <li class="text-xs text-rejected-700 flex items-center gap-1.5">
-                                <span class="w-1 h-1 rounded-full bg-rejected-500 shrink-0"></span>
-                                <span>
-                                    Stage "{{ $a->stage->stage_name }}" — expired <span data-live-time="{{ $a->sla_expires_at->timestamp }}">{{ $a->sla_expires_at->diffForHumans() }}</span>
-                                    @if($a->adminGraceExpiresAt())
-                                        &middot; <span data-live-time="{{ $a->adminGraceExpiresAt()->timestamp }}" data-live-urgent-under="7200">{{ $a->adminGraceExpiresAt()->diffForHumans() }}</span> until auto-approval
-                                    @endif
-                                </span>
-                            </li>
-                        @endforeach
-                    </ul>
-                </li>
-            @empty
-                <li class="px-5 py-6 text-center text-sm text-surface-400">No SLA violations — everything is on schedule.</li>
-            @endforelse
-        </ul>
+
+        <div class="px-5 py-2 border-b border-surface-100 flex flex-wrap gap-x-6 gap-y-1 text-xs text-surface-500">
+            <span>Peak upload day: <span class="font-semibold text-surface-700">{{ $analytics['peak_day'] ?? '—' }}</span></span>
+            <span>Peak upload hour: <span class="font-semibold text-surface-700">{{ $analytics['peak_hour'] ?? '—' }}</span></span>
+            <span>Currently in progress: <span class="font-semibold text-surface-700">{{ $analytics['backlog_count'] }}</span> document{{ $analytics['backlog_count'] === 1 ? '' : 's' }}</span>
+        </div>
+
+        <div id="analytics-panel" data-refresh-url="{{ route('admin.dashboard.analyticsPanel') }}">
+            @isset($panel)
+                @include('admin.partials.analytics-panel', ['panel' => $panel])
+            @endisset
+        </div>
     </div>
 
     {{-- Active ML model --}}
@@ -86,11 +81,35 @@
         <h2 class="text-sm font-semibold text-surface-900 tracking-tight mb-3">Active ML Model</h2>
         @if($activeModel)
             <dl class="space-y-2 text-sm">
+                <div><dt class="text-surface-500">Algorithm</dt><dd class="font-medium text-surface-800">{{ $activeModel->model_name }}</dd></div>
                 <div class="flex justify-between"><dt class="text-surface-500">Version</dt><dd class="font-medium tabular-nums">{{ $activeModel->version }}</dd></div>
                 <div class="flex justify-between"><dt class="text-surface-500">Training samples</dt><dd class="font-medium tabular-nums">{{ $activeModel->training_sample_count }}</dd></div>
                 <div class="flex justify-between"><dt class="text-surface-500">Est. accuracy</dt><dd class="font-medium text-approved-700 tabular-nums">{{ $activeModel->accuracy_score }}%</dd></div>
                 <div class="flex justify-between"><dt class="text-surface-500">Last trained</dt><dd class="font-medium">{{ $activeModel->last_trained->diffForHumans() }}</dd></div>
             </dl>
+
+            {{-- Only shown once there's an actual history beyond the single
+                 active model — a "history" list of one entry would just
+                 repeat everything above. Reuses AdminController::
+                 modelHistory(), the same query shape the ML Training page
+                 already runs. --}}
+            @if(isset($modelHistory) && $modelHistory->count() > 1)
+                <div class="mt-4 pt-4 border-t border-surface-100">
+                    <h3 class="text-xs font-semibold text-surface-500 uppercase tracking-wide mb-2">Version History</h3>
+                    <ul class="space-y-2">
+                        @foreach($modelHistory as $m)
+                            <li class="flex items-center justify-between text-xs gap-2">
+                                <span class="flex items-center gap-1.5 text-surface-600 truncate">
+                                    <span class="w-1.5 h-1.5 rounded-full shrink-0 {{ $m->is_active ? 'bg-approved-500' : 'bg-surface-300' }}" title="{{ $m->is_active ? 'Active' : 'Retired' }}"></span>
+                                    <span class="font-medium tabular-nums">{{ $m->version }}</span>
+                                    <span class="text-surface-400 shrink-0">&middot; {{ $m->last_trained?->format('M j, Y') ?? '—' }}</span>
+                                </span>
+                                <span class="font-medium tabular-nums shrink-0 {{ $m->is_active ? 'text-approved-700' : 'text-surface-500' }}">{{ $m->accuracy_score }}%</span>
+                            </li>
+                        @endforeach
+                    </ul>
+                </div>
+            @endif
         @else
             <p class="text-sm text-surface-400">No model trained yet.</p>
         @endif
@@ -98,117 +117,90 @@
     </div>
 </div>
 
+{{-- SLA override alerts — moved to its own full-width row (was previously
+     squeezed to 2/3 width beside the ML model panel); it's a list of
+     rows, not a wide chart, so full width doesn't hurt it the way it hurt
+     Analytics. --}}
+<div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden mt-4">
+    <div class="px-5 py-3 border-b border-surface-200 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-surface-900 tracking-tight flex items-center gap-2">
+            <span class="relative flex w-2 h-2">
+                <span class="absolute inline-flex h-full w-full rounded-full bg-rejected-400 opacity-75 animate-ping"></span>
+                <span class="relative inline-flex rounded-full h-2 w-2 bg-rejected-500"></span>
+            </span>
+            SLA Override Alerts
+        </h2>
+        <div class="flex items-center gap-3">
+            @if($reviewCount > 0)
+                <a href="{{ route('admin.sla.queue') }}" class="text-xs bg-processing-50 text-processing-700 px-2 py-1 rounded-full font-medium ring-1 ring-inset ring-processing-500/20">{{ $reviewCount }} auto-approved awaiting review</a>
+            @endif
+            <a href="{{ route('admin.sla.queue') }}" class="text-xs text-primary-700 hover:underline font-medium">View all &rarr;</a>
+        </div>
+    </div>
+    @php
+        // Nest by document — a single document can have more than one
+        // violated stage (e.g. Budget Check and Final Approval both
+        // pending on the same doc), which previously showed as
+        // separate flat rows repeating the same title.
+        $alertsByDocument = $slaAlerts->groupBy('document_id')->take(5);
+    @endphp
+    <ul class="divide-y divide-surface-100">
+        @forelse($alertsByDocument as $violations)
+            @php $doc = $violations->first()->document; @endphp
+            <li class="px-5 py-2.5 hover:bg-surface-50/60 transition-colors">
+                <div class="flex items-center justify-between gap-3">
+                    <p class="font-medium text-surface-800 truncate">{{ $doc->title }}</p>
+                    <a href="{{ route('admin.sla.queue') }}" class="shrink-0 text-xs bg-primary-700 text-white px-3 py-1.5 rounded-lg font-medium hover:bg-primary-800 shadow-sm transition-colors">Override</a>
+                </div>
+                <ul class="mt-1 space-y-0.5">
+                    @foreach($violations as $a)
+                        <li class="text-xs text-rejected-700 flex items-center gap-1.5">
+                            <span class="w-1 h-1 rounded-full bg-rejected-500 shrink-0"></span>
+                            <span>
+                                Stage "{{ $a->stage->stage_name }}" — expired <span data-live-time="{{ $a->sla_expires_at->timestamp }}">{{ $a->sla_expires_at->diffForHumans() }}</span>
+                                @if($a->adminGraceExpiresAt())
+                                    &middot; <span data-live-time="{{ $a->adminGraceExpiresAt()->timestamp }}" data-live-urgent-under="7200">{{ $a->adminGraceExpiresAt()->diffForHumans() }}</span> until auto-approval
+                                @endif
+                            </span>
+                        </li>
+                    @endforeach
+                </ul>
+            </li>
+        @empty
+            <li class="px-5 py-6 text-center text-sm text-surface-400">No SLA violations — everything is on schedule.</li>
+        @endforelse
+    </ul>
+</div>
+
 {{--
-    System-wide module overview (Feature: dashboard as an actual control
-    center) — analytics and recent activity, none of which had any
-    presence on this page before. Analytics first (Feature: leads with the
-    trend/chart view before the raw activity feed).
+    Category volume — all-time (not tab-scoped, see AdminController::
+    analyticsData()'s matching comment), a separate card since it answers a
+    different question ("what kind of documents are busiest overall") than
+    the time-series panel above ("how is the pipeline trending"). A plain
+    ranked bar list, not a pie/donut — reading exact proportions off a pie
+    chart is genuinely harder than reading bar lengths, and a simple list
+    doesn't need its own categorical color palette when the labels already
+    identify each row.
 --}}
 <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden mt-4">
-    <div class="px-5 py-3 border-b border-surface-200 flex items-center justify-between flex-wrap gap-3">
-        <h2 class="text-sm font-semibold text-surface-900 tracking-tight">Analytics</h2>
-        <div class="inline-flex rounded-lg border border-surface-200 overflow-hidden text-xs font-medium">
-            @foreach(['day' => 'Day', 'week' => 'Week', 'month' => 'Month', 'year' => 'Year'] as $key => $label)
-                <button type="button" data-analytics-tab="{{ $key }}"
-                    class="analytics-tab-btn px-3 py-1.5 transition-colors {{ $key === 'day' ? 'bg-primary-700 text-white' : 'text-surface-600 hover:bg-surface-50' }}">
-                    {{ $label }}
-                </button>
-            @endforeach
-        </div>
+    <div class="px-5 py-3 border-b border-surface-200">
+        <h2 class="text-sm font-semibold text-surface-900 tracking-tight">Category Volume</h2>
+        <p class="text-xs text-surface-400 mt-0.5">All-time document volume per category.</p>
     </div>
-
-    <div class="px-5 py-2 border-b border-surface-100 flex flex-wrap gap-x-6 gap-y-1 text-xs text-surface-500">
-        <span>Peak upload day: <span class="font-semibold text-surface-700">{{ $analytics['peak_day'] ?? '—' }}</span></span>
-        <span>Peak upload hour: <span class="font-semibold text-surface-700">{{ $analytics['peak_hour'] ?? '—' }}</span></span>
+    <div class="p-5 space-y-3">
+        @php $maxCategoryCount = $analytics['category_volume']->max() ?: 1; @endphp
+        @forelse($analytics['category_volume'] as $category => $count)
+            <div class="flex items-center gap-3 text-sm">
+                <span class="w-40 shrink-0 text-surface-700 font-medium truncate" title="{{ $category }}">{{ $category }}</span>
+                <div class="flex-1 h-2 bg-surface-100 rounded-full overflow-hidden">
+                    <div class="h-full bg-primary-500 rounded-full" style="width: {{ ($count / $maxCategoryCount) * 100 }}%"></div>
+                </div>
+                <span class="w-10 text-right tabular-nums text-surface-500">{{ $count }}</span>
+            </div>
+        @empty
+            <p class="text-xs text-surface-400 text-center py-4">No classified documents yet.</p>
+        @endforelse
     </div>
-
-    @foreach(['day' => 'Day', 'week' => 'Week', 'month' => 'Month', 'year' => 'Year'] as $key => $label)
-        @php
-            // Chart reads chronologically (oldest -> newest, left to right);
-            // the table below it stays newest-first, matching every other
-            // list on this dashboard — same data, ordered for what each
-            // presentation is for.
-            $chartRows = $analytics['series'][$key];
-            $chartMax = collect($chartRows)->flatMap(fn ($r) => [$r->uploaded, $r->approved, $r->rejected])->max() ?: 1;
-            $barW = 9; $barGap = 2; $groupW = ($barW * 3) + ($barGap * 2);
-            $colW = max($groupW + 12, 40);
-            $chartH = 90; $chartW = max(count($chartRows) * $colW, $colW);
-
-            $rows = array_reverse($chartRows);
-            $maxUploaded = collect($rows)->max('uploaded') ?: 1;
-        @endphp
-        <div class="analytics-tab-panel {{ $key === 'day' ? '' : 'hidden' }}" data-analytics-panel="{{ $key }}">
-            {{-- Grouped bar chart: uploaded / approved / rejected per bucket --}}
-            <div class="px-5 pt-3 overflow-x-auto">
-                @if(count($chartRows) > 0)
-                    <svg width="{{ $chartW }}" height="{{ $chartH + 26 }}" viewBox="0 0 {{ $chartW }} {{ $chartH + 26 }}" class="block overflow-visible">
-                        @for ($g = 0; $g <= 3; $g++)
-                            <line x1="0" y1="{{ $chartH - ($g * $chartH / 3) }}" x2="{{ $chartW }}" y2="{{ $chartH - ($g * $chartH / 3) }}" class="stroke-surface-100" stroke-width="1" />
-                        @endfor
-                        @foreach($chartRows as $i => $row)
-                            @php
-                                $colX = $i * $colW + ($colW - $groupW) / 2;
-                                $uH = ($row->uploaded / $chartMax) * $chartH;
-                                $aH = ($row->approved / $chartMax) * $chartH;
-                                $rH = ($row->rejected / $chartMax) * $chartH;
-                            @endphp
-                            <rect x="{{ $colX }}" y="{{ $chartH - $uH }}" width="{{ $barW }}" height="{{ $uH }}" rx="1.5" class="fill-primary-400"><title>{{ $row->bucket }} — Uploaded: {{ $row->uploaded }}</title></rect>
-                            <rect x="{{ $colX + $barW + $barGap }}" y="{{ $chartH - $aH }}" width="{{ $barW }}" height="{{ $aH }}" rx="1.5" class="fill-approved-500"><title>{{ $row->bucket }} — Approved: {{ $row->approved }}</title></rect>
-                            <rect x="{{ $colX + ($barW + $barGap) * 2 }}" y="{{ $chartH - $rH }}" width="{{ $barW }}" height="{{ $rH }}" rx="1.5" class="fill-rejected-500"><title>{{ $row->bucket }} — Rejected: {{ $row->rejected }}</title></rect>
-                            <text x="{{ $i * $colW + $colW / 2 }}" y="{{ $chartH + 15 }}" text-anchor="middle" class="fill-surface-400" style="font-size: 9px;">{{ \Illuminate\Support\Str::limit($row->bucket, 7, '') }}</text>
-                        @endforeach
-                    </svg>
-                @else
-                    <p class="text-xs text-surface-400 py-6 text-center">No data yet for this range.</p>
-                @endif
-            </div>
-            <div class="px-5 pb-2 flex items-center gap-4 text-xs text-surface-500">
-                <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-primary-400 inline-block"></span>Uploaded</span>
-                <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-approved-500 inline-block"></span>Approved</span>
-                <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm bg-rejected-500 inline-block"></span>Rejected</span>
-            </div>
-
-            <div class="overflow-x-auto overflow-y-auto max-h-44 border-t border-surface-100">
-                <table class="w-full text-xs">
-                    <thead class="bg-surface-50 text-surface-500 uppercase tracking-wide sticky top-0">
-                        <tr>
-                            <th class="text-left px-6 py-2 font-medium">{{ $label }}</th>
-                            <th class="text-left px-4 py-2 font-medium">Uploaded</th>
-                            <th class="text-left px-4 py-2 font-medium">Approved</th>
-                            <th class="text-left px-4 py-2 font-medium">Rejected</th>
-                            <th class="text-left px-4 py-2 font-medium">Auto vs Human</th>
-                            <th class="text-left px-4 py-2 font-medium">Avg. Time to Decide</th>
-                            <th class="text-left px-4 py-2 font-medium">SLA Violations</th>
-                        </tr>
-                    </thead>
-                    <tbody class="divide-y divide-surface-100">
-                        @forelse($rows as $row)
-                            @php
-                                $decidedTotal = $row->approved + $row->rejected;
-                                $autoPct = $decidedTotal > 0 ? round($row->auto_approved / $decidedTotal * 100) : null;
-                            @endphp
-                            <tr>
-                                <td class="px-6 py-2 font-medium text-surface-700 whitespace-nowrap">{{ $row->bucket }}</td>
-                                <td class="px-4 py-2">
-                                    <div class="flex items-center gap-2">
-                                        <div class="w-16 h-1.5 bg-surface-100 rounded-full overflow-hidden shrink-0"><div class="h-full bg-primary-500" style="width: {{ ($row->uploaded / $maxUploaded) * 100 }}%"></div></div>
-                                        <span class="tabular-nums">{{ $row->uploaded }}</span>
-                                    </div>
-                                </td>
-                                <td class="px-4 py-2 text-approved-700 font-medium tabular-nums">{{ $row->approved }}</td>
-                                <td class="px-4 py-2 text-rejected-700 font-medium tabular-nums">{{ $row->rejected }}</td>
-                                <td class="px-4 py-2 text-surface-500">{{ $autoPct !== null ? "{$autoPct}% auto" : '—' }}</td>
-                                <td class="px-4 py-2 text-surface-500">{{ $row->avg_minutes !== null ? \Carbon\CarbonInterval::minutes($row->avg_minutes)->cascade()->forHumans(['short' => true]) : '—' }}</td>
-                                <td class="px-4 py-2 {{ $row->violations > 0 ? 'text-rejected-700 font-medium' : 'text-surface-400' }}">{{ $row->violations }}</td>
-                            </tr>
-                        @empty
-                            <tr><td colspan="7" class="px-6 py-6 text-center text-surface-400">No data yet for this range.</td></tr>
-                        @endforelse
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    @endforeach
 </div>
 
 <div class="grid grid-cols-1 gap-4 mt-4">

@@ -72,17 +72,26 @@ class AdminController extends Controller
     }
 
     /**
-     * Heavier "module overview" data — analytics and a recent-activity
-     * feed — split out from overviewData() so overviewPoll() (fired every
-     * ~45-75s purely to detect change) stays cheap; only the full-page
-     * dashboard() and its live-swap counterpart overviewRefresh() need
-     * this.
+     * Heavier "module overview" data — analytics summary and a
+     * recent-activity feed — split out from overviewData() so
+     * overviewPoll() (fired every ~45-75s purely to detect change) stays
+     * cheap; only the full-page dashboard() and its live-swap counterpart
+     * overviewRefresh() need this.
+     *
+     * Deliberately does NOT include the analytics chart/KPI/table data —
+     * that's a separately interactive sub-widget (one reusable panel, its
+     * content swapped via analyticsPanelRefresh() when the admin changes
+     * the Day/Week/Month/Year tab or the date filter — see
+     * admin/partials/analytics-panel.blade.php). Bundling it in here would
+     * mean this page's periodic live-refresh silently resets whatever
+     * granularity/date the admin currently has selected back to the
+     * default every ~45-75s.
      */
     private function dashboardExtras(): array
     {
         $recentActivity = $this->recentActivityRows();
 
-        $analytics = $this->analyticsData();
+        $analytics = $this->analyticsSummary();
 
         return [$recentActivity, $analytics];
     }
@@ -125,69 +134,268 @@ class AdminController extends Controller
     }
 
     /**
-     * Uploaded/approved/rejected/auto-approved counts, average
-     * time-to-decision, and SLA violation counts, bucketed by day/month/
-     * year — replaces the old Approver Workload panel (Section 10:
-     * "analytics reports of the documents being upload, approve, rejected
-     * per day, per month, per year"). Approval/rejection/auto-approval
-     * are bucketed by DocumentRepository.updated_at as a stand-in for
-     * "when it was decided" — there's no dedicated finalized_at column,
-     * and global_status changing is normally the last thing that happens
-     * to a document, so this is a reasonable heuristic rather than an
-     * exact record (same "statistical estimate, not a perfect ledger"
-     * spirit as the rest of this app's analytics-flavored features).
+     * The parts of the Analytics card that are NOT the interactive
+     * chart panel: peak upload day/hour, category volume, and the current
+     * backlog — all all-time/live snapshots, deliberately not scoped to
+     * whatever Day/Week/Month/Year tab or date filter the admin currently
+     * has the chart panel set to (see analyticsPanelData() below), since
+     * "which categories are busiest overall" and "how much is in flight
+     * right now" are more useful as a constant reference point than
+     * something that resets depending on the chart's current filter.
      */
-    private function analyticsData(): array
+    private function analyticsSummary(): array
     {
-        // Bucketing is done in PHP via Carbon's own format(), not
-        // DB-specific SQL (no DATE_FORMAT()/DAYNAME()/HOUR()) — this app's
-        // test suite runs against SQLite while dev/prod runs MySQL, and
-        // those functions aren't portable between the two. At this
-        // project's scale, pulling the raw rows and grouping them in PHP
-        // is simple and avoids maintaining two SQL dialects for one page.
-        $granularities = [
-            'day' => ['format' => 'Y-m-d', 'since' => now()->subDays(13)->startOfDay()],
-            'week' => ['format' => 'o-\WW', 'since' => now()->subWeeks(11)->startOfWeek()],
-            'month' => ['format' => 'Y-m', 'since' => now()->subMonths(11)->startOfMonth()],
-            'year' => ['format' => 'Y', 'since' => now()->subYears(4)->startOfYear()],
-        ];
-
-        $series = [];
-        foreach ($granularities as $key => $cfg) {
-            $series[$key] = $this->analyticsBuckets($cfg['format'], $cfg['since']);
-        }
-
         $uploadDates = DocumentRepository::pluck('upload_date');
         $peakDay = $uploadDates->countBy(fn ($d) => $d->format('l'))->sortDesc()->keys()->first();
         $peakHour = $uploadDates->countBy(fn ($d) => (int) $d->format('G'))->sortDesc()->keys()->first();
 
+        $categoryVolume = DocumentRepository::whereNotNull('ml_category')
+            ->selectRaw('ml_category, count(*) as cnt')
+            ->groupBy('ml_category')
+            ->orderByDesc('cnt')
+            ->pluck('cnt', 'ml_category');
+
+        $backlogCount = DocumentRepository::whereIn('global_status', ['processing', 'classified_validated'])->count();
+
         return [
-            'series' => $series,
             'peak_day' => $peakDay,
             'peak_hour' => $peakHour !== null ? sprintf('%02d:00–%02d:00', $peakHour, ($peakHour + 1) % 24) : null,
+            'category_volume' => $categoryVolume,
+            'backlog_count' => $backlogCount,
         ];
     }
 
-    /** One row per period bucket: uploaded/approved/rejected/auto-approved counts, avg minutes to decide, and SLA violations. */
-    private function analyticsBuckets(string $carbonFormat, \Carbon\Carbon $since): array
+    /**
+     * Config per granularity: the Carbon unit to step by, the bucket-key
+     * format, how many periods the rolling window covers, the label used
+     * for the detail table's period column, and the label used for the
+     * KPI tiles' "vs previous ___" trend tooltip.
+     *
+     * 'day' steps by HOUR across a single calendar day (00:00-23:59 of
+     * whichever date is selected), not a multi-day rolling window like
+     * the other three — a 14-day window meant most of the chart sat empty
+     * with all the real activity crammed against the right edge (today).
+     * A single day's hourly timeline doesn't have that skew: whatever
+     * hours had activity are spread across the full width on their own
+     * terms. label is "Hour" (each row IS an hour) but trend_label stays
+     * "day" (see analyticsPanelData() — the KPI tiles trend today's
+     * totals against yesterday's, not one hour against the last).
+     */
+    private const ANALYTICS_GRANULARITIES = [
+        'day' => ['unit' => 'hour', 'format' => 'H:00', 'count' => 24, 'label' => 'Hour', 'trend_label' => 'day'],
+        'week' => ['unit' => 'week', 'format' => 'o-\WW', 'count' => 12, 'label' => 'Week', 'trend_label' => 'week'],
+        'month' => ['unit' => 'month', 'format' => 'Y-m', 'count' => 12, 'label' => 'Month', 'trend_label' => 'month'],
+        'year' => ['unit' => 'year', 'format' => 'Y', 'count' => 5, 'label' => 'Year', 'trend_label' => 'year'],
+    ];
+
+    /**
+     * The ONE reusable Analytics chart panel's data (KPI tiles + chart
+     * rows) for a single granularity + reference date — this is the only
+     * method that computes chart data; switching the Day/Week/Month/Year
+     * tab or applying the date filter both just call this again with
+     * different arguments (see analyticsPanelRefresh() and dashboard()
+     * below), never a second, parallel computation.
+     *
+     * $asOf defaults to "now" — the live, un-filtered view — and the
+     * window always ENDS at $asOf, not always at "today", so picking a
+     * past date re-anchors the whole rolling window to look back from
+     * that point instead.
+     */
+    private function analyticsPanelData(string $granularity, ?\Carbon\Carbon $asOf = null): array
     {
-        $uploadBuckets = DocumentRepository::where('upload_date', '>=', $since)
+        $granularity = array_key_exists($granularity, self::ANALYTICS_GRANULARITIES) ? $granularity : 'day';
+        $cfg = self::ANALYTICS_GRANULARITIES[$granularity];
+        $asOf = ($asOf ?? now())->copy();
+
+        $until = match ($cfg['unit']) {
+            'hour' => $asOf->copy()->endOfDay(),
+            'week' => $asOf->copy()->endOfWeek(),
+            'month' => $asOf->copy()->endOfMonth(),
+            'year' => $asOf->copy()->endOfYear(),
+        };
+        $since = match ($cfg['unit']) {
+            'hour' => $asOf->copy()->startOfDay(),
+            'week' => $asOf->copy()->subWeeks($cfg['count'] - 1)->startOfWeek(),
+            'month' => $asOf->copy()->subMonths($cfg['count'] - 1)->startOfMonth(),
+            'year' => $asOf->copy()->subYears($cfg['count'] - 1)->startOfYear(),
+        };
+
+        $chartRows = $this->analyticsBuckets($cfg['unit'], $cfg['format'], $since, $until);
+
+        // The hourly Day tab needs its KPI tiles to summarize the WHOLE
+        // day, trended against the whole of yesterday — not the most
+        // recent hour trended against the hour before it, which would be
+        // noise (a document system isn't active every single hour) rather
+        // than a meaningful signal. Every other granularity's last bucket
+        // already IS one full period, so it can be used directly.
+        if ($cfg['unit'] === 'hour') {
+            $current = $this->analyticsAggregateRow($chartRows);
+            $previousDayRows = $this->analyticsBuckets('hour', $cfg['format'], $since->copy()->subDay(), $until->copy()->subDay());
+            $previous = $this->analyticsAggregateRow($previousDayRows);
+
+            // The raw "H:00" grouping key doesn't carry the actual calendar
+            // date and reads in 24-hour time — confusing on its own once
+            // you're looking at a specific chosen date rather than "today"
+            // by default. The chart hover, readout, and detail table all
+            // display $row->bucket directly, so rewriting it once here
+            // (into e.g. "Aug 8, 2026, 11:00 PM") fixes all three at once.
+            foreach ($chartRows as $row) {
+                $hour = (int) explode(':', $row->bucket)[0];
+                $row->bucket = $asOf->copy()->startOfDay()->addHours($hour)->format('M j, Y, g:i A');
+            }
+        } else {
+            $current = $chartRows[count($chartRows) - 1] ?? null;
+            $previous = $chartRows[count($chartRows) - 2] ?? null;
+        }
+
+        return [
+            'granularity' => $granularity,
+            'label' => $cfg['label'],
+            'trend_label' => $cfg['trend_label'],
+            'as_of' => $asOf->toDateString(),
+            'chart_rows' => $chartRows,
+            'kpi' => $this->analyticsKpis($current, $previous),
+        ];
+    }
+
+    /**
+     * Sums a list of bucket rows (see analyticsBuckets()) into one
+     * combined row of the same shape — used to roll the Day tab's 24
+     * hourly buckets up into "today" (and, for the trend comparison,
+     * "yesterday"). avg_minutes is weighted by each bucket's own decided
+     * count rather than a flat average of per-hour averages, so an hour
+     * with one decision doesn't count as much as an hour with ten.
+     */
+    private function analyticsAggregateRow(array $rows): object
+    {
+        $decidedRows = array_filter($rows, fn ($r) => $r->avg_minutes !== null);
+        $totalDecided = array_sum(array_map(fn ($r) => $r->approved + $r->rejected, $decidedRows));
+
+        return (object) [
+            'bucket' => null,
+            'uploaded' => array_sum(array_map(fn ($r) => $r->uploaded, $rows)),
+            'approved' => array_sum(array_map(fn ($r) => $r->approved, $rows)),
+            'rejected' => array_sum(array_map(fn ($r) => $r->rejected, $rows)),
+            'auto_approved' => array_sum(array_map(fn ($r) => $r->auto_approved, $rows)),
+            'avg_minutes' => $totalDecided > 0
+                ? (int) round(array_sum(array_map(fn ($r) => $r->avg_minutes * ($r->approved + $r->rejected), $decidedRows)) / $totalDecided)
+                : null,
+            'violations' => array_sum(array_map(fn ($r) => $r->violations, $rows)),
+            // Safe to sum across buckets — a document is decided exactly
+            // once, so it's counted in exactly one bucket's
+            // violated_documents, never double-counted across the sum.
+            'violated_documents' => array_sum(array_map(fn ($r) => $r->violated_documents, $rows)),
+        ];
+    }
+
+    /**
+     * KPI tiles for one "current" bucket (or aggregate — see
+     * analyticsAggregateRow()) plus a % trend against the "previous" one.
+     * Rates (approval/auto-approval/SLA-violation) are computed against
+     * decisions actually made in that period, not uploads, since a
+     * document uploaded in one period can easily be decided in a later
+     * one — approved/rejected counts are the meaningful denominator for
+     * "how did decisions go this period," uploaded is a separate,
+     * unrelated volume metric shown alongside it.
+     */
+    private function analyticsKpis($currentRow, $previousRow): array
+    {
+        $rate = fn (?int $num, int $den) => $den > 0 ? round($num / $den * 100, 1) : null;
+
+        $summarize = function ($row) use ($rate) {
+            if (!$row) {
+                return null;
+            }
+            $decidedTotal = $row->approved + $row->rejected;
+
+            return [
+                'uploaded' => $row->uploaded,
+                'approval_rate' => $rate($row->approved, $decidedTotal),
+                'auto_approval_rate' => $rate($row->auto_approved, $decidedTotal),
+                'avg_minutes' => $row->avg_minutes,
+                // violated_documents (not the raw 'violations' event
+                // count) — it's a subset of decidedTotal by construction
+                // (see analyticsBuckets()), so this can never exceed 100%,
+                // unlike dividing by a raw event count that can outnumber
+                // the documents it happened on.
+                'sla_violation_rate' => $rate($row->violated_documents, $decidedTotal),
+            ];
+        };
+
+        $current = $summarize($currentRow);
+        $previous = $summarize($previousRow);
+
+        $trendOf = function (string $metric) use ($current, $previous) {
+            if (!$current || !$previous || $current[$metric] === null || $previous[$metric] === null || $previous[$metric] == 0) {
+                return null;
+            }
+
+            return round((($current[$metric] - $previous[$metric]) / $previous[$metric]) * 100, 1);
+        };
+
+        return [
+            'current' => $current,
+            'trend' => $current ? [
+                'uploaded' => $trendOf('uploaded'),
+                'approval_rate' => $trendOf('approval_rate'),
+                'auto_approval_rate' => $trendOf('auto_approval_rate'),
+                'avg_minutes' => $trendOf('avg_minutes'),
+                'sla_violation_rate' => $trendOf('sla_violation_rate'),
+            ] : null,
+        ];
+    }
+
+    /**
+     * One row per period bucket between $since and $until INCLUSIVE, one
+     * row per period even when nothing happened that period (zero-filled)
+     * — a continuous timeline is what makes the line chart actually read
+     * as a trend; skipping empty periods would make it jump between
+     * non-adjacent points as if they were consecutive. $unit is a Carbon
+     * add*()-compatible unit name ('hour'/'week'/'month'/'year') used to
+     * step from $since to $until.
+     */
+    private function analyticsBuckets(string $unit, string $carbonFormat, \Carbon\Carbon $since, \Carbon\Carbon $until): array
+    {
+        $uploadBuckets = DocumentRepository::whereBetween('upload_date', [$since, $until])
             ->pluck('upload_date')
             ->groupBy(fn ($d) => $d->format($carbonFormat));
 
         $decidedBuckets = DocumentRepository::whereIn('global_status', ['approved', 'rejected', 'auto_approved'])
-            ->where('updated_at', '>=', $since)
-            ->get(['upload_date', 'updated_at', 'global_status'])
+            ->whereBetween('updated_at', [$since, $until])
+            ->get(['document_id', 'upload_date', 'updated_at', 'global_status'])
             ->groupBy(fn ($d) => $d->updated_at->format($carbonFormat));
 
-        $violationBuckets = SlaViolation::where('violation_timestamp', '>=', $since)
+        $violationBuckets = SlaViolation::whereBetween('violation_timestamp', [$since, $until])
             ->pluck('violation_timestamp')
             ->groupBy(fn ($v) => $v->format($carbonFormat));
 
-        $buckets = $uploadBuckets->keys()->merge($decidedBuckets->keys())->merge($violationBuckets->keys())
-            ->unique()->sort()->values();
+        // Which of the documents decided in this whole window have EVER had
+        // an SLA violation logged against them — deliberately not scoped to
+        // violation_timestamp falling in the same window, since a
+        // violation can predate its document's eventual decision by any
+        // amount. Fetched once for the whole range (not per bucket) to
+        // avoid an N+1 query per period; used below for
+        // 'violated_documents', a document-count metric distinct from
+        // 'violations' (a raw event count — one document can rack up more
+        // than one violation now that a stage can have several approvers
+        // in parallel, each independently escalating).
+        $decidedDocIds = $decidedBuckets->flatten()->pluck('document_id');
+        $violatedDocIds = SlaViolation::whereIn('document_id', $decidedDocIds)
+            ->pluck('document_id')->unique()->flip();
 
-        return $buckets->map(function ($bucket) use ($uploadBuckets, $decidedBuckets, $violationBuckets) {
+        $bucketKeys = [];
+        $cursor = $since->copy();
+        while ($cursor->lte($until)) {
+            $bucketKeys[] = $cursor->format($carbonFormat);
+            $cursor = match ($unit) {
+                'hour' => $cursor->addHour(),
+                'week' => $cursor->addWeek(),
+                'month' => $cursor->addMonth(),
+                'year' => $cursor->addYear(),
+            };
+        }
+
+        return collect($bucketKeys)->map(function ($bucket) use ($uploadBuckets, $decidedBuckets, $violationBuckets, $violatedDocIds) {
             $decided = $decidedBuckets->get($bucket, collect());
 
             return (object) [
@@ -199,22 +407,92 @@ class AdminController extends Controller
                 'avg_minutes' => $decided->isNotEmpty()
                     ? (int) round($decided->avg(fn ($d) => $d->upload_date->diffInMinutes($d->updated_at)))
                     : null,
+                // Raw violation-event count in this period — a distinct,
+                // still-correct metric on its own (shown in the detail
+                // table), NOT the basis for the SLA Violation Rate KPI
+                // (see 'violated_documents' below and analyticsKpis()).
                 'violations' => $violationBuckets->get($bucket, collect())->count(),
+                // How many of THIS bucket's decided documents have ever had
+                // a violation logged — a subset of $decided, so dividing
+                // this by the decided count can never exceed 100%, unlike
+                // the raw event count above.
+                'violated_documents' => $decided->pluck('document_id')->unique()
+                    ->filter(fn ($id) => $violatedDocIds->has($id))->count(),
             ];
         })->all();
     }
 
     /** Admin control-center overview. */
-    public function dashboard()
+    /**
+     * Reads the analytics panel's requested granularity/as-of date off the
+     * request — shared by dashboard() (so a bookmarked/shared URL with
+     * ?granularity=&as_of= renders that exact view on first load, not
+     * always the default) and analyticsPanelRefresh() (the AJAX swap).
+     * Invalid/missing granularity falls back to 'day'; invalid/missing
+     * as_of falls back to null (analyticsPanelData() then defaults to now()).
+     */
+    private function analyticsPanelRequestArgs(Request $request): array
+    {
+        $granularity = $request->string('granularity')->toString();
+        $granularity = array_key_exists($granularity, self::ANALYTICS_GRANULARITIES) ? $granularity : 'day';
+
+        $asOf = null;
+        if ($request->filled('as_of')) {
+            try {
+                $asOf = \Carbon\Carbon::parse($request->string('as_of')->toString());
+            } catch (\Exception) {
+                $asOf = null;
+            }
+        }
+
+        return [$granularity, $asOf];
+    }
+
+    public function dashboard(Request $request)
     {
         [$stats, $slaAlerts, $reviewCount] = $this->overviewData();
         [$recentActivity, $analytics] = $this->dashboardExtras();
         $activeModel = MlModelRepository::active();
+        $modelHistory = $this->modelHistory();
+
+        [$granularity, $asOf] = $this->analyticsPanelRequestArgs($request);
+        $panel = $this->analyticsPanelData($granularity, $asOf);
 
         return view('admin.dashboard', compact(
-            'stats', 'slaAlerts', 'reviewCount', 'activeModel',
-            'recentActivity', 'analytics'
+            'stats', 'slaAlerts', 'reviewCount', 'activeModel', 'modelHistory',
+            'recentActivity', 'analytics', 'panel'
         ));
+    }
+
+    /**
+     * The Active ML Model card's version history — the last few trained
+     * versions (including the currently active one), newest first, so an
+     * admin can see at a glance whether accuracy has been trending up or
+     * down across retrains instead of only ever seeing the single active
+     * snapshot. Same query shape already used by the ML Training page
+     * (see mlTrainingData()'s $history) — reused here rather than
+     * duplicated, just capped tighter since this is a sidebar card, not a
+     * dedicated page.
+     */
+    private function modelHistory(int $limit = 4): \Illuminate\Support\Collection
+    {
+        return MlModelRepository::orderByDesc('last_trained')->limit($limit)->get();
+    }
+
+    /**
+     * The ONE reusable Analytics chart panel's fragment — fetched via AJAX
+     * whenever the admin changes the Day/Week/Month/Year tab or applies
+     * the date filter, swapping in place instead of a page reload (see
+     * the script in admin/partials/overview.blade.php). Same data method
+     * as the initial page load (analyticsPanelData()), just returning the
+     * panel fragment instead of the whole dashboard.
+     */
+    public function analyticsPanelRefresh(Request $request)
+    {
+        [$granularity, $asOf] = $this->analyticsPanelRequestArgs($request);
+        $panel = $this->analyticsPanelData($granularity, $asOf);
+
+        return view('admin.partials.analytics-panel', compact('panel'));
     }
 
     /**
@@ -345,9 +623,10 @@ class AdminController extends Controller
         [$stats, $slaAlerts, $reviewCount] = $this->overviewData();
         [$recentActivity, $analytics] = $this->dashboardExtras();
         $activeModel = MlModelRepository::active();
+        $modelHistory = $this->modelHistory();
 
         return view('admin.partials.overview', compact(
-            'stats', 'slaAlerts', 'reviewCount', 'activeModel',
+            'stats', 'slaAlerts', 'reviewCount', 'activeModel', 'modelHistory',
             'recentActivity', 'analytics'
         ));
     }

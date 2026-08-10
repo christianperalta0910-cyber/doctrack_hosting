@@ -11,24 +11,33 @@
             <button class="text-xs font-medium text-primary-700 hover:underline">Mark all read</button>
         </form>
     </div>
-    <ul class="divide-y divide-surface-100">
-        @forelse($notifications as $n)
-            <li class="px-6 py-4 flex items-start justify-between gap-4 {{ $n->is_read ? '' : 'bg-primary-50/40' }}">
-                <div class="min-w-0">
-                    <p class="text-sm text-surface-800 {{ $n->priority === 'high' ? 'font-semibold text-rejected-700' : '' }}">{{ $n->message_body }}</p>
-                    <p class="text-xs text-surface-400 mt-1">{{ $n->created_at->format('M j, Y g:i A') }}</p>
-                </div>
-                @unless($n->is_read)
-                    <form method="POST" action="{{ route('notifications.read', $n) }}">
-                        @csrf
-                        <button class="text-xs font-medium text-primary-700 hover:underline whitespace-nowrap">Mark read</button>
-                    </form>
-                @endunless
-            </li>
-        @empty
-            <li class="px-6 py-10 text-center text-sm text-surface-400">No notifications yet.</li>
-        @endforelse
-    </ul>
-    <div class="px-6 py-4 border-t border-surface-200">{{ $notifications->links() }}</div>
+    <div id="notifications-list" data-refresh-url="{{ route('notifications.listRefresh') }}" data-poll-url="{{ route('notifications.poll') }}" data-user-id="{{ auth()->id() }}">
+        @include('notifications.partials.list')
+    </div>
 </div>
+
+<script>
+    // Realtime (Feature: a new notification while you're sitting on this
+    // page appears without a manual reload) — same startLiveChannel/
+    // startLivePoll pattern used everywhere else in this app (see
+    // resources/js/app.js), reusing the exact channel/event the
+    // notification bell already listens to (NotificationBroadcast), just
+    // targeting this page's full list instead of the dropdown. Wrapped in
+    // DOMContentLoaded since app.js's module script (which defines these
+    // functions) loads deferred — see the matching comment in
+    // admin/dashboard.blade.php for why that ordering matters.
+    document.addEventListener('DOMContentLoaded', function () {
+        const listEl = document.getElementById('notifications-list');
+        if (!listEl) return;
+
+        const opts = {
+            refreshUrl: listEl.dataset.refreshUrl,
+            target: listEl,
+            preserveQueryString: true, // keeps pagination (?page=N) intact across a live swap
+        };
+
+        startLiveChannel(`user.${listEl.dataset.userId}`, '.notification.created', opts);
+        startLivePoll({ ...opts, pollUrl: listEl.dataset.pollUrl });
+    });
+</script>
 @endsection

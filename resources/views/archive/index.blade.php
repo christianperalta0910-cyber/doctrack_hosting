@@ -121,7 +121,7 @@
                 </form>
             </div>
 
-            <div id="archive-results" data-refresh-url="{{ route('archive.refresh') }}">
+            <div id="archive-results" data-refresh-url="{{ route('archive.refresh') }}" data-user-id="{{ auth()->id() }}">
                 @include('archive.partials.results')
             </div>
         </div>
@@ -241,6 +241,34 @@
                     history.replaceState(null, '', link.href);
                 })
                 .catch(() => {});
+        });
+
+        // Realtime: a document newly reaching Archive (approved, or
+        // auto-approved) anywhere in the system re-runs the CURRENT
+        // search/filter/page automatically — reuses runSearch() itself
+        // (not a generic fragment swap) so it never disturbs whatever
+        // keyword/category/date/sort/page the admin, approver, or
+        // originator currently has active. Primary path is instant via
+        // Reverb; the interval below is only a fallback in case that
+        // connection is down, mirroring this app's SLA-check jobs (instant
+        // dispatch + a slow periodic sweep behind it).
+        //
+        // Deferred to DOMContentLoaded — this whole IIFE otherwise runs
+        // before app.js's deferred module script has defined window.Echo,
+        // so `if (window.Echo)` would silently evaluate false and never
+        // wire anything up (see the matching comment in
+        // admin/dashboard.blade.php for the full explanation).
+        document.addEventListener('DOMContentLoaded', function () {
+            if (window.Echo) {
+                @if(auth()->user()->isAdmin())
+                    window.Echo.private('admin-dashboard').listen('.document.status-changed', runSearch);
+                @elseif(auth()->user()->isOriginator())
+                    window.Echo.private(`originator.${resultsEl.dataset.userId}`).listen('.document.status-changed', runSearch);
+                @elseif(auth()->user()->isApprover())
+                    window.Echo.private('approvers').listen('.document.status-changed', runSearch);
+                @endif
+            }
+            setInterval(runSearch, (45 + Math.random() * 30) * 1000);
         });
     })();
 </script>

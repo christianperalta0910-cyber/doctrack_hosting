@@ -18,13 +18,28 @@ class NotificationController extends Controller
     public function index(Request $request)
     {
         // Real page route, not the implicit current-request path — this
-        // list is also built from within refresh() (the live-poll
+        // list is also built from within listRefresh() (the live-poll
         // fragment route); see AdminController::paginateContainers()'s
         // docblock for the full reasoning.
         $notifications = $request->user()->notifications()->with('document')->paginate(10)
             ->withPath(route('notifications.index'));
 
         return view('notifications.index', compact('notifications'));
+    }
+
+    /**
+     * The full Notifications page's list fragment (notifications/partials/
+     * list.blade.php) — fetched live whenever a new notification arrives
+     * for this user (see index.blade.php's script) so the page updates
+     * without a manual reload, distinct from refresh() below which only
+     * ever serves the bell dropdown's smaller unread-only preview.
+     */
+    public function listRefresh(Request $request)
+    {
+        $notifications = $request->user()->notifications()->with('document')->paginate(10)
+            ->withPath(route('notifications.index'));
+
+        return view('notifications.partials.list', compact('notifications'));
     }
 
     /**
