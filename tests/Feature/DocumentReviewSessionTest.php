@@ -111,23 +111,30 @@ it('does not open a review session for an originator merely viewing their own fi
 // Feature: revisiting an already-decided document (e.g. from Decision
 // History or Archive) still needs to be VIEWABLE — the approver
 // legitimately handled it — but shouldn't spin up a fresh tracking
-// session every time, since there's nothing left for them to "review".
-it('still allows viewing the file after the approver has already decided their seat, but opens no new session', function () {
+// session every time, since there's nothing left for anyone to "review".
+// Session tracking is now gated on the DOCUMENT as a whole having been
+// judged (see DocumentController::countsAsActiveReviewer()), not on this
+// one seat specifically — so the document's own global_status has to be
+// genuinely finalized here, not just the assignment row, to accurately
+// simulate what a real fully-resolved document looks like.
+it('still allows viewing the file after the document is fully resolved, but opens no new session', function () {
     [$approver, $document] = reviewSessionTestSetup();
     DocumentAssignment::where('document_id', $document->document_id)
         ->where('user_id', $approver->user_id)
         ->update(['individual_status' => 'approved', 'acted_at' => now()]);
+    $document->update(['global_status' => 'approved']);
 
     $this->actingAs($approver)->get(route('documents.file', $document))->assertOk();
 
     expect(DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $approver->user_id)->exists())->toBeFalse();
 });
 
-it('does not heartbeat or list the viewer in presence once their seat is already decided', function () {
+it('does not heartbeat or list the viewer in presence once the document is fully resolved', function () {
     [$approver, $document] = reviewSessionTestSetup();
     DocumentAssignment::where('document_id', $document->document_id)
         ->where('user_id', $approver->user_id)
         ->update(['individual_status' => 'rejected', 'acted_at' => now()]);
+    $document->update(['global_status' => 'rejected']);
 
     $response = $this->actingAs($approver)->get(route('documents.presence', $document));
 
@@ -136,11 +143,12 @@ it('does not heartbeat or list the viewer in presence once their seat is already
     expect(DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $approver->user_id)->exists())->toBeFalse();
 });
 
-it('does not close a session that was never opened for an already-decided seat', function () {
+it('does not close a session that was never opened for an already-resolved document', function () {
     [$approver, $document] = reviewSessionTestSetup();
     DocumentAssignment::where('document_id', $document->document_id)
         ->where('user_id', $approver->user_id)
         ->update(['individual_status' => 'approved', 'acted_at' => now()]);
+    $document->update(['global_status' => 'approved']);
 
     $this->actingAs($approver)->post(route('documents.presence.leave', $document))->assertNoContent();
 
@@ -151,9 +159,6 @@ it('still opens a review session for a co-approver seat that is genuinely still 
     [$approver, $document] = reviewSessionTestSetup();
     $stage = \App\Models\WorkflowStage::where('document_category', 'Job Order')->first();
 
-    // A second, still-pending stage for the SAME approver on the SAME
-    // document — proves the gate is per-seat (any pending row), not an
-    // all-or-nothing check against the first row found.
     $secondStage = \App\Models\WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Final', 'sequence_order' => 2]);
     DocumentAssignment::create([
         'document_id' => $document->document_id, 'user_id' => $approver->user_id, 'stage_id' => $secondStage->stage_id,
@@ -166,4 +171,61 @@ it('still opens a review session for a co-approver seat that is genuinely still 
     $this->actingAs($approver)->get(route('documents.file', $document))->assertOk();
 
     expect(DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $approver->user_id)->exists())->toBeTrue();
+});
+
+// Regression coverage for the actual reported bug: opening the same
+// undecided document in multiple approver accounts (and an admin) only
+// ever showed ONE of them in the "currently reviewing" presence cluster,
+// because a session only opened for whoever's OWN seat happened to be
+// the pending one right then. Fixed by gating on the document as a whole
+// not yet being judged (see DocumentController::countsAsActiveReviewer()),
+// not on "is it specifically this person's turn."
+it('opens a session for an approver whose own seat is already decided, as long as the document overall is still undecided', function () {
+    [$approver, $document] = reviewSessionTestSetup();
+    DocumentAssignment::where('document_id', $document->document_id)
+        ->where('user_id', $approver->user_id)
+        ->update(['individual_status' => 'approved', 'acted_at' => now()]);
+    // Document itself stays 'classified_validated' — other approvers/
+    // stages (not modeled here) are still pending, so it's genuinely NOT
+    // judged yet, unlike the "fully resolved" tests above.
+
+    $this->actingAs($approver)->get(route('documents.file', $document))->assertOk();
+
+    expect(DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $approver->user_id)->exists())->toBeTrue();
+});
+
+it('opens a session for an admin merely browsing an undecided document, even though nothing has escalated to them', function () {
+    [, $document] = reviewSessionTestSetup();
+    $admin = User::factory()->admin()->create();
+
+    $this->actingAs($admin)->get(route('documents.file', $document))->assertOk();
+
+    expect(DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $admin->user_id)->exists())->toBeTrue();
+});
+
+it('shows every simultaneous viewer in the presence feed — two approvers and an admin all on the same undecided document', function () {
+    [$approver, $document] = reviewSessionTestSetup();
+    $secondApprover = User::factory()->approver('Job Order')->create();
+    $admin = User::factory()->admin()->create();
+
+    // Needs its own assignment row to pass the plain view-authorization
+    // check (any assignment ever, decided or not — see
+    // DocumentController::approverAccessFor()) — a stage can have more
+    // than one eligible approver under the parallel-approval model.
+    DocumentAssignment::create([
+        'document_id' => $document->document_id, 'user_id' => $secondApprover->user_id,
+        'stage_id' => \App\Models\WorkflowStage::where('document_category', 'Job Order')->first()->stage_id,
+        'due_date' => $document->due_date, 'priority_rank' => 2, 'individual_status' => 'pending', 'sla_expires_at' => now()->addHours(3),
+    ]);
+
+    $this->actingAs($approver)->get(route('documents.file', $document));
+    $this->actingAs($secondApprover)->get(route('documents.file', $document));
+    $this->actingAs($admin)->get(route('documents.file', $document));
+
+    $response = $this->actingAs($approver)->get(route('documents.presence', $document));
+
+    $response->assertOk();
+    $viewerNames = collect($response->json('viewers'))->pluck('name');
+    expect($viewerNames)->toHaveCount(3)
+        ->and($viewerNames)->toContain($approver->full_name, $secondApprover->full_name, $admin->full_name);
 });

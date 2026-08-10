@@ -289,25 +289,25 @@ class DocumentController extends Controller
 
         $isOwner = $document->originator_id === $user->user_id;
         $isAdmin = $user->isAdmin();
-        ['isAssignedApprover' => $isAssignedApprover, 'hasPendingApproverSeat' => $hasPendingApproverSeat]
-            = $this->approverAccessFor($document, $user);
-        $isAdminDeciding = $isAdmin && $this->isAwaitingAdminDecision($document);
+        $isAssignedApprover = $this->approverAccessFor($document, $user);
 
         abort_unless($isOwner || $isAdmin || $isAssignedApprover, 403);
 
-        // A review session is only opened for someone about to actually
-        // DECIDE this document — an approver with a STILL-PENDING seat on
-        // it (not merely any seat ever, which would also match an already-
-        // decided one revisited from Decision History/Archive — see
-        // approverAccessFor()), or an admin viewing it while it's sitting
-        // in one of the queues where THEY are the one who has to act
-        // directly (Unassigned Documents, SLA Override, ML/Readability
-        // Review — see isAwaitingAdminDecision()). An Originator or Admin
-        // merely browsing (Archive, Audit Logs, a document with nothing
-        // pending on it) isn't "reviewing" it in that sense, and never
-        // hits closeFor(), so opening one for them would just accumulate
-        // never-closed rows.
-        if ($hasPendingApproverSeat || $isAdminDeciding) {
+        // A review session opens for anyone with a legitimate reviewing
+        // stake — any approver or admin — while the document as a whole
+        // hasn't been judged yet, not narrowly gated to "is it THIS
+        // person's specific seat pending right now." That narrower rule
+        // used to mean a second approver whose seat wasn't the currently-
+        // active one, or an admin just looking without the document being
+        // escalated to them specifically, never got tracked at all — so
+        // the "currently reviewing" presence cluster only ever showed one
+        // of several simultaneous viewers. See countsAsActiveReviewer()
+        // for the exact rule; presence()/presenceLeave() below apply the
+        // identical condition so opening and closing stay symmetric — an
+        // Originator (never an approver or admin) still never gets a
+        // session, and once the document IS judged, nobody accumulates a
+        // fresh one just from revisiting it in Archive/Decision History.
+        if ($this->countsAsActiveReviewer($document, $user)) {
             DocumentReviewSession::openFor($document, $user);
         }
 
@@ -341,13 +341,14 @@ class DocumentController extends Controller
 
     /**
      * Polled every few seconds by the document viewer modal while it's
-     * open — returns who's currently reviewing this document (approvers
-     * only, see DocumentReviewSession::openFor()'s caller in viewFile()
-     * above) and, if the requester is one of them, heartbeats their own
-     * session so it stays inside the live() window. Stopping the poll
-     * (closing the modal, navigating away, a dead tab) means no more
-     * heartbeats, so the icon disappears for everyone else within ~40s
-     * without needing an explicit "I closed the viewer" signal.
+     * open — returns who's currently reviewing this document (any
+     * approver or admin with a legitimate stake, see
+     * countsAsActiveReviewer()) and, if the requester is one of them,
+     * heartbeats their own session so it stays inside the live() window.
+     * Stopping the poll (closing the modal, navigating away, a dead tab)
+     * means no more heartbeats, so the icon disappears for everyone else
+     * within ~40s without needing an explicit "I closed the viewer"
+     * signal.
      */
     public function presence(Request $request, DocumentRepository $document)
     {
@@ -355,13 +356,11 @@ class DocumentController extends Controller
 
         $isOwner = $document->originator_id === $user->user_id;
         $isAdmin = $user->isAdmin();
-        ['isAssignedApprover' => $isAssignedApprover, 'hasPendingApproverSeat' => $hasPendingApproverSeat]
-            = $this->approverAccessFor($document, $user);
-        $isAdminDeciding = $isAdmin && $this->isAwaitingAdminDecision($document);
+        $isAssignedApprover = $this->approverAccessFor($document, $user);
 
         abort_unless($isOwner || $isAdmin || $isAssignedApprover, 403);
 
-        if ($hasPendingApproverSeat || $isAdminDeciding) {
+        if ($this->countsAsActiveReviewer($document, $user)) {
             DocumentReviewSession::heartbeat($document, $user);
         }
 
@@ -396,10 +395,7 @@ class DocumentController extends Controller
     {
         $user = $request->user();
 
-        $hasPendingApproverSeat = $this->approverAccessFor($document, $user)['hasPendingApproverSeat'];
-        $isAdminDeciding = $user->isAdmin() && $this->isAwaitingAdminDecision($document);
-
-        if ($hasPendingApproverSeat || $isAdminDeciding) {
+        if ($this->countsAsActiveReviewer($document, $user)) {
             DocumentReviewSession::closeFor($document, $user);
         }
 
@@ -407,54 +403,47 @@ class DocumentController extends Controller
     }
 
     /**
-     * This approver's assignment rows on $document, computed once and
-     * reused two ways: `isAssignedApprover` (any row at all, even an
-     * already-decided one) drives plain view AUTHORIZATION — an approver
-     * who already decided their seat can still legitimately look back at
-     * a document from Decision History/Archive. `hasPendingApproverSeat`
-     * (a still-PENDING row specifically) drives whether opening it right
-     * now counts as an active review session — see viewFile()'s docblock
-     * for why revisiting an already-decided document shouldn't spin up a
-     * fresh DocumentReviewSession every time.
+     * Whether $user has ANY assignment row on $document, even an
+     * already-decided one — drives plain view AUTHORIZATION only. An
+     * approver who already decided their seat can still legitimately
+     * look back at a document from Decision History/Archive; whether
+     * that particular visit counts as an active REVIEW SESSION is a
+     * separate question, answered by countsAsActiveReviewer() below.
      */
-    private function approverAccessFor(DocumentRepository $document, $user): array
+    private function approverAccessFor(DocumentRepository $document, $user): bool
     {
         if (!$user->isApprover()) {
-            return ['isAssignedApprover' => false, 'hasPendingApproverSeat' => false];
-        }
-
-        $assignments = DocumentAssignment::where('document_id', $document->document_id)
-            ->where('user_id', $user->user_id)
-            ->get(['individual_status']);
-
-        return [
-            'isAssignedApprover' => $assignments->isNotEmpty(),
-            'hasPendingApproverSeat' => $assignments->contains('individual_status', 'pending'),
-        ];
-    }
-
-    /**
-     * True when $document currently has something sitting in one of the
-     * queues where an ADMIN — not an approver — is the one who has to
-     * decide it directly: Unassigned Documents (no eligible approver),
-     * SLA Override (an approver timed out), or the ML/Readability review
-     * queues (see WorkflowService::adminDecideUnassigned(),
-     * SlaService::adminOverride(), AdminController's review confirm/
-     * reject actions). Drives whether an admin's file view counts as a
-     * genuine "review session" (see viewFile()/presence()/presenceLeave()
-     * above) — an admin merely browsing a document with nothing pending
-     * on it isn't reviewing it in that sense.
-     */
-    private function isAwaitingAdminDecision(DocumentRepository $document): bool
-    {
-        if ($document->ml_review_status === 'pending' || $document->readability_review_status === 'pending') {
-            return true;
+            return false;
         }
 
         return DocumentAssignment::where('document_id', $document->document_id)
-            ->where('individual_status', 'pending')
-            ->where(fn ($q) => $q->where('needs_approver', true)
-                ->orWhere(fn ($q2) => $q2->where('escalated_to_admin', true)->whereNull('admin_override_at')))
+            ->where('user_id', $user->user_id)
             ->exists();
+    }
+
+    /**
+     * Whether $user opening $document right now counts as an active
+     * review session (drives DocumentReviewSession::openFor()/heartbeat()/
+     * closeFor() in viewFile()/presence()/presenceLeave() above) —
+     * anyone with a genuine reviewing stake (any approver, or an admin)
+     * while the document as a whole hasn't been judged yet. Deliberately
+     * NOT narrowed to "is it specifically this person's seat pending
+     * right now" — that used to mean a second approver whose seat wasn't
+     * the currently-active one, or an admin looking at a document that
+     * hadn't happened to escalate to them, never got tracked at all, so
+     * the "currently reviewing" presence cluster only ever showed one of
+     * several simultaneous viewers. An Originator (never true for either
+     * isApprover() or isAdmin()) never counts here — the presence
+     * cluster is about who's reviewing it, not who owns it. Once the
+     * document IS judged (approved/rejected/auto_approved), nobody
+     * accumulates a fresh session just from revisiting it afterward.
+     */
+    private function countsAsActiveReviewer(DocumentRepository $document, $user): bool
+    {
+        if (!$user->isApprover() && !$user->isAdmin()) {
+            return false;
+        }
+
+        return !in_array($document->global_status, ['approved', 'rejected', 'auto_approved'], true);
     }
 }
