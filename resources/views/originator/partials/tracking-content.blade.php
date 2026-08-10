@@ -127,7 +127,13 @@
              of the page just to read more of it. --}}
         <div class="overflow-x-auto overflow-y-auto max-h-[70vh]">
             <table class="w-full text-sm">
-                <thead class="sticky top-0 bg-white z-10">
+                {{-- No explicit z-index — sticky already paints above the
+                     table's own scrolling rows from normal stacking order
+                     alone; adding one here previously created a stacking
+                     context that won against the notification dropdown
+                     elsewhere on the page (z-30), making Audit Trail labels
+                     incorrectly appear on top of it. --}}
+                <thead class="sticky top-0 bg-white">
                     <tr class="border-b border-surface-200 text-left text-[11px] uppercase tracking-wide text-surface-400">
                         <th class="px-6 py-2 font-medium">Timestamp</th>
                         <th class="px-4 py-2 font-medium">Action</th>

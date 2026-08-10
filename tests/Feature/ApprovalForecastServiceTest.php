@@ -146,3 +146,43 @@ test('the rendered "Est. Approval by" respects business hours instead of raw wal
 
     expect(app(\App\Services\BusinessHoursService::class)->isWithinWorkingWindow($renderedMoment))->toBeTrue();
 });
+
+test('the "Est. Approval by" estimate never exceeds the document\'s own due date', function () {
+    // Regression: ApprovalForecastService averages REAL historical
+    // decision times — a sparse/slow decision history (e.g. early on,
+    // before real usage settles into a consistent pace) can inflate that
+    // average enough that the raw forecast lands weeks or months past the
+    // document's own due date, which is a nonsensical thing to show next
+    // to a due date that's only a day or two away.
+    WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Only Stage', 'sequence_order' => 1]);
+    $originator = User::factory()->originator()->create();
+    $approver = User::factory()->approver('Job Order')->create();
+    $workflow = app(WorkflowService::class);
+
+    $this->travelTo(\Carbon\Carbon::parse('2026-08-12 10:00:00')); // Wednesday, business hours
+
+    // A wildly slow historical decision (30 days) — inflates
+    // avgSecondsPerStage enough that the raw forecast would land weeks
+    // past the current document's own due date if left unclamped.
+    $history = forecastDoc($originator);
+    $workflow->routeToWorkflow($history);
+    $this->travel(30)->days();
+    $workflow->decide(DocumentAssignment::where('document_id', $history->document_id)->first(), $approver, 'approved');
+
+    $this->travelTo(\Carbon\Carbon::parse('2026-08-12 10:00:00'));
+
+    // Due in 1 day (forecastDoc()'s default) — the raw (unclamped)
+    // forecast would blow well past this.
+    $current = forecastDoc($originator);
+    $workflow->routeToWorkflow($current);
+
+    $response = $this->actingAs($approver)->get(route('approver.dashboard'));
+    $response->assertOk();
+
+    preg_match('/Est\. Approval by:<\/span>\s*([^<]+)</', $response->getContent(), $matches);
+    expect($matches)->toHaveCount(2);
+
+    $renderedMoment = \Carbon\Carbon::parse(trim($matches[1]));
+
+    expect($renderedMoment->lessThanOrEqualTo($current->fresh()->due_date))->toBeTrue();
+});

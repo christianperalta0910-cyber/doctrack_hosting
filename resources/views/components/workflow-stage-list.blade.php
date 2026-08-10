@@ -106,6 +106,19 @@
         // never claim an approval will land at 8 PM or on a Sunday.
         $estApprovalBy = app(\App\Services\BusinessHoursService::class)
             ->addBusinessMinutes(now(), (int) ceil($forecast->totalSeconds / 60));
+
+        // Never claim a later estimate than the document's own hard
+        // deadline — a forecast "after your due date" isn't a useful
+        // estimate; the workflow's own SLA machinery (escalation,
+        // auto-approval) forces a resolution well before that regardless.
+        // This also guards against ApprovalForecastService's historical
+        // average getting skewed unrealistically high by a sparse/slow
+        // decision history (common early on, before real usage settles
+        // into a consistent pace) and ballooning the estimate out to
+        // absurd, due-date-defying lengths.
+        if ($document->due_date && $estApprovalBy->greaterThan($document->due_date)) {
+            $estApprovalBy = \Carbon\Carbon::parse($document->due_date);
+        }
     @endphp
     <p class="text-[11px] text-surface-500 mb-2">
         <span class="font-medium text-surface-600">Est. Approval by:</span> {{ $estApprovalBy->format('M j, Y, g:i A') }}
