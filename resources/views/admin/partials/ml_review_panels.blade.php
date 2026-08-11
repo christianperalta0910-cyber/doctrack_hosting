@@ -10,6 +10,21 @@
     them in something that ALWAYS renders is what makes an in-place swap
     possible when the very first item shows up.
 --}}
+@php
+    // Same "how much real business time is left before due_date" signal
+    // WorkflowService::extendDueDateIfReviewQueueAteTheBuffer() reacts to —
+    // surfaced on both queues below so an Admin sees an item running low
+    // on runway BEFORE that safety net has to kick in and auto-extend the
+    // due date on their behalf. Defined once here (not inside either
+    // @foreach below) since either queue can legitimately be empty while
+    // the other isn't.
+    $dueUrgencyStyles = [
+        1 => ['Urgent', 'bg-rejected-50 text-rejected-700 ring-rejected-500/20'],
+        2 => ['Normal', 'bg-processing-50 text-processing-700 ring-processing-500/20'],
+        3 => ['Low', 'bg-surface-100 text-surface-600 ring-surface-300'],
+        4 => ['Expired', 'bg-rejected-100 text-rejected-800 ring-rejected-500/40'],
+    ];
+@endphp
 @if($reviewQueue->isNotEmpty())
     <div class="lg:col-span-3">
         <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
@@ -27,10 +42,14 @@
                 @foreach($reviewQueue as $entry)
                     @php
                         $doc = $entry->document;
+                        [$dueLabel, $dueClass] = $dueUrgencyStyles[$doc->dueDateUrgencyRank()] ?? [null, null];
                     @endphp
                     <li class="px-6 py-4">
-                        <p class="text-sm font-medium text-surface-800 truncate">
-                            {{ $doc->title }}
+                        <p class="text-sm font-medium text-surface-800 truncate flex items-center gap-2">
+                            <span>{{ $doc->title }}</span>
+                            @if($dueLabel)
+                                <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ring-1 ring-inset {{ $dueClass }}" title="Time remaining before due date">{{ $dueLabel }}</span>
+                            @endif
                         </p>
                         <p class="text-xs text-surface-400 mt-0.5">
                             Predicted: <span class="font-medium text-surface-600">{{ $doc->ml_category ?? 'Unclassified' }}</span>
@@ -151,9 +170,15 @@
             </div>
             <ul class="divide-y divide-surface-100">
                 @foreach($readabilityQueue as $doc)
+                    @php
+                        [$dueLabel, $dueClass] = $dueUrgencyStyles[$doc->dueDateUrgencyRank()] ?? [null, null];
+                    @endphp
                     <li class="px-6 py-4">
-                        <p class="text-sm font-medium text-surface-800 truncate">
-                            {{ $doc->title }}
+                        <p class="text-sm font-medium text-surface-800 truncate flex items-center gap-2">
+                            <span>{{ $doc->title }}</span>
+                            @if($dueLabel)
+                                <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ring-1 ring-inset {{ $dueClass }}" title="Time remaining before due date">{{ $dueLabel }}</span>
+                            @endif
                         </p>
                         <p class="text-xs text-surface-400 mt-0.5">
                             Category: <span class="font-medium text-surface-600">{{ $doc->ml_category }}</span>

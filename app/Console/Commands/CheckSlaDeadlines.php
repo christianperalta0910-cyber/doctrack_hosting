@@ -25,7 +25,10 @@ class CheckSlaDeadlines extends Command
     {
         $result = $sla->sweep();
 
-        $this->info("SLA sweep complete: {$result['auto_approved']} document(s) auto-approved after the Admin grace window elapsed.");
+        $this->info("SLA sweep complete: {$result['auto_approved']} document(s) auto-approved after the Admin grace window elapsed, " .
+            "{$result['review_reminders_sent']} unreviewed auto-approval reminder(s) sent, " .
+            "{$result['urgent_approver_reminders_sent']} approver final-call reminder(s) sent, " .
+            "{$result['grace_reminders_sent']} Admin grace final-call reminder(s) sent.");
 
         return self::SUCCESS;
     }

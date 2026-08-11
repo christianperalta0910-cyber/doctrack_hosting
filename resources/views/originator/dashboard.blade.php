@@ -28,9 +28,15 @@
 
                 <div class="mt-4">
                     <label for="due_date" class="block text-xs font-medium text-surface-700 mb-1">Due date &amp; time <span class="text-rejected-700">*</span></label>
-                    <p class="text-[11px] text-surface-400 mb-1">Approvers' review window is 25% of the time left until this deadline (a flat 15 minutes if due within the next hour).</p>
-                    <input type="datetime-local" id="due_date" name="due_date" required min="{{ now()->addMinutes(15)->format('Y-m-d\TH:i') }}"
+                    <p class="text-[11px] text-surface-400 mb-1">Approvers' review window is 25% of the time left until this deadline (a flat 15 minutes if due within the next hour). Must fall within working hours (9 AM–5 PM, Mon–Sat).</p>
+                    <input type="datetime-local" id="due_date" name="due_date" required min="{{ now()->addMinutes(config('sla.min_due_date_buffer_minutes', 15))->format('Y-m-d\TH:i') }}"
                         class="w-full rounded-lg border-surface-300 focus:border-primary-500 focus:ring-primary-500 text-sm px-3 py-2">
+                    {{-- Client-side heads-up only — not authoritative. The
+                         server (WorkflowService::isDueDateWithinWorkingHours())
+                         is what actually enforces this; this just lets the
+                         originator notice and fix it before submitting
+                         instead of finding out after. --}}
+                    <p id="due-date-warning" class="hidden mt-1 text-[11px] text-rejected-700">This falls outside working hours (9 AM–5 PM, Mon–Sat) or on a holiday — pick a different date/time.</p>
                 </div>
 
                 <label class="mt-3 flex items-center gap-2 cursor-pointer">
@@ -119,6 +125,42 @@
     }
 
     document.getElementById('document-search')?.addEventListener('input', applySubmissionFilter);
+
+    // Heads-up only, not authoritative (see the <p> this toggles) — reuses
+    // the same [name="business-hours"] meta tag the live SLA countdown
+    // ticker in layouts/app.blade.php already reads, rather than a
+    // separate config source. datetime-local's value has no timezone
+    // attached (it's plain wall-clock numbers as typed), so this reads it
+    // with plain Date getters (getDay/getHours/...), NOT toISOString() —
+    // that would incorrectly convert through the browser's own local
+    // timezone, which has nothing to do with the number the user actually
+    // typed.
+    (function () {
+        const input = document.getElementById('due_date');
+        const warning = document.getElementById('due-date-warning');
+        if (!input || !warning) return;
+
+        const config = JSON.parse(document.querySelector('meta[name="business-hours"]')?.content || 'null');
+
+        function isWithinWorkingHours(date) {
+            if (!config || isNaN(date.getTime())) return true; // fail open — never block on missing/invalid data
+
+            if (!config.workingDays.includes(date.getDay())) return false;
+
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            if (config.holidays.includes(`${y}-${m}-${d}`)) return false;
+
+            const minutes = date.getHours() * 60 + date.getMinutes();
+            return minutes >= config.startMinutes && minutes < config.endMinutes;
+        }
+
+        input.addEventListener('change', function () {
+            const valid = !input.value || isWithinWorkingHours(new Date(input.value));
+            warning.classList.toggle('hidden', valid);
+        });
+    })();
 
     // Live-updates the submissions table without a full page reload —
     // instant via Reverb (see startLiveChannel in resources/js/app.js)

@@ -82,6 +82,7 @@ class DocumentAssignment extends Model
         'individual_status', 'comments', 'sla_expires_at', 'admin_override_at',
         'admin_override_by', 'escalated_to_admin', 'escalated_at', 'escalation_reason', 'auto_approved', 'acted_at',
         'admin_reviewed_at', 'admin_reviewed_by', 'admin_review_note', 'admin_review_outcome',
+        'review_reminder_sent_at', 'urgent_reminder_sent_at', 'grace_reminder_sent_at',
         'reassigned_at', 'reassigned_from', 'reassignment_reason', 'needs_approver', 'needs_approver_at',
         'cascade_closed_by',
     ];
@@ -95,6 +96,9 @@ class DocumentAssignment extends Model
         'escalated_at' => 'datetime',
         'auto_approved' => 'boolean',
         'admin_reviewed_at' => 'datetime',
+        'review_reminder_sent_at' => 'datetime',
+        'urgent_reminder_sent_at' => 'datetime',
+        'grace_reminder_sent_at' => 'datetime',
         'reassigned_at' => 'datetime',
         'needs_approver' => 'boolean',
         'needs_approver_at' => 'datetime',
@@ -207,8 +211,26 @@ class DocumentAssignment extends Model
 
     /**
      * When the system will auto-approve this assignment if no Admin acts —
-     * escalated_at + config('sla.admin_grace_hours'). Null once the window
-     * no longer applies (already resolved, or never escalated).
+     * escalated_at + config('sla.admin_grace_hours') when that comfortably
+     * fits before the document's own due_date. When it doesn't (a
+     * short-due-date document), using ALL the remaining time as grace would
+     * mean auto-approval lands exactly AT due_date — leaving zero room for
+     * the post-auto-approval admin review (see AdminController::
+     * reviewAutoApproval()) to actually happen before the originator sees
+     * "Approved" and assumes it's final. So instead, only HALF of the
+     * remaining time gets used as grace, deliberately reserving the other
+     * half as a real window for that review to happen before due_date
+     * arrives. This is the single source of truth for the grace deadline —
+     * SlaService::escalate() (which schedules the real auto-approval job)
+     * and autoApproveUnresolved() (the periodic backstop) both call this
+     * method rather than recomputing the formula themselves, so all three
+     * can never drift out of sync.
+     *
+     * If escalation itself happened after due_date already passed (e.g. a
+     * late sweep), the halved remainder is negative, meaning this clamps to
+     * a moment already in the past — the next sweep auto-approves it
+     * immediately. Correct for that edge case, not a bug. Null once the
+     * window no longer applies (already resolved, or never escalated).
      */
     public function adminGraceExpiresAt(): ?\Carbon\Carbon
     {
@@ -216,7 +238,18 @@ class DocumentAssignment extends Model
             return null;
         }
 
-        return $this->escalated_at->copy()->addHours(config('sla.admin_grace_hours', 12));
+        $flatGrace = $this->escalated_at->copy()->addHours(config('sla.admin_grace_hours', 12));
+
+        if (!$this->document?->due_date || $flatGrace->lessThanOrEqualTo($this->document->due_date)) {
+            return $flatGrace;
+        }
+
+        // The flat grace window would exceed due_date — use half of
+        // whatever time is actually left instead of all of it.
+        $remainingSeconds = max(0, $this->escalated_at->diffInSeconds($this->document->due_date, false));
+        $graceExpiresAt = $this->escalated_at->copy()->addSeconds((int) round($remainingSeconds / 2));
+
+        return $graceExpiresAt;
     }
 
     /**

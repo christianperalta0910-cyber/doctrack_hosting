@@ -13,12 +13,14 @@ use Illuminate\Http\UploadedFile;
 it('names the actual failing file in a multi-file upload validation error, not a raw array index', function () {
     $originator = User::factory()->originator()->create();
 
+    $this->travelTo(\Carbon\Carbon::parse('2026-08-12 10:00:00')); // Wednesday, business hours
+
     $response = $this->actingAs($originator)->post(route('originator.documents.store'), [
         'files' => [
             UploadedFile::fake()->create('bad-file.exe', 10),
             UploadedFile::fake()->createWithContent('good-file.txt', 'legitimate content here'),
         ],
-        'due_date' => now()->addHour()->format('Y-m-d\TH:i'),
+        'due_date' => now()->addHours(4)->format('Y-m-d\TH:i'), // within business hours, comfortably past the 1-hour minimum
     ]);
 
     $response->assertSessionHasErrors();

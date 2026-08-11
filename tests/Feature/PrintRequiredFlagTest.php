@@ -43,6 +43,8 @@ it('leaves requires_printing false when not checked, with no category-level over
 });
 
 it('carries the flag forward on resubmission instead of resetting it', function () {
+    $this->travelTo(\Carbon\Carbon::parse('2026-08-12 10:00:00')); // Wednesday, business hours
+
     $originator = User::factory()->originator()->create();
     $rejected = DocumentRepository::create([
         'originator_id' => $originator->user_id, 'title' => 'rejected.txt', 'file_path' => 'documents/rejected.txt',
@@ -52,7 +54,7 @@ it('carries the flag forward on resubmission instead of resetting it', function 
 
     $this->actingAs($originator)->post(route('originator.documents.resubmit', $rejected), [
         'file' => UploadedFile::fake()->createWithContent('revised.txt', 'Revised content.'),
-        'due_date' => now()->addDay()->format('Y-m-d\TH:i'),
+        'due_date' => now()->addHours(4)->format('Y-m-d\TH:i'),
     ]);
 
     $revision = DocumentRepository::where('previous_version_id', $rejected->document_id)->first();

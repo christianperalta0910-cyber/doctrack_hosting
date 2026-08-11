@@ -81,6 +81,42 @@ class DocumentRepository extends Model
         return $this->global_status;
     }
 
+    /**
+     * Urgent=1, Normal=2, Low=3, Expired=4 — driven by real (business-
+     * hours-aware) remaining time before this document's own due_date,
+     * using the exact same 30-minute/2-hour thresholds
+     * DocumentAssignment::urgencyRank() already uses for an approver's own
+     * SLA countdown elsewhere in this app. Meant for documents that
+     * haven't reached an approver yet (an Admin review queue item), where
+     * there's no assignment/sla_expires_at to check yet — this is the same
+     * "how much real runway is left" signal WorkflowService::
+     * extendDueDateIfReviewQueueAteTheBuffer() reacts to, surfaced here so
+     * an Admin sees a queue item running low on runway BEFORE that safety
+     * net has to kick in.
+     */
+    public function dueDateUrgencyRank(): ?int
+    {
+        if (!$this->due_date) {
+            return null;
+        }
+
+        $remaining = app(\App\Services\BusinessHoursService::class)->businessSecondsRemaining(now(), $this->due_date);
+
+        return match(true) {
+            $remaining <= 0 => 4,
+            $remaining <= 1800 => 1,
+            $remaining <= 7200 => 2,
+            default => 3,
+        };
+    }
+
+    public function dueDateUrgencyLabel(): ?string
+    {
+        $rank = $this->dueDateUrgencyRank();
+
+        return $rank ? [1 => 'Urgent', 2 => 'Normal', 3 => 'Low', 4 => 'Expired'][$rank] : null;
+    }
+
     public function originator()
     {
         return $this->belongsTo(User::class, 'originator_id', 'user_id');

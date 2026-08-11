@@ -38,6 +38,36 @@
 
         startLiveChannel(`originator.${contentEl.dataset.userId}`, '.document.status-changed', opts);
         startLivePoll({ ...opts, pollUrl: contentEl.dataset.pollUrl });
+
+        // Heads-up only, not authoritative — same check as the main
+        // upload form's (see originator/dashboard.blade.php's matching
+        // comment for the full reasoning). Delegated on #tracking-content
+        // — the stable wrapper that survives every live swap above —
+        // rather than bound directly to the input, which gets replaced
+        // wholesale on every swap along with the rest of this fragment.
+        const businessHoursConfig = JSON.parse(document.querySelector('meta[name="business-hours"]')?.content || 'null');
+
+        function isWithinWorkingHours(date) {
+            if (!businessHoursConfig || isNaN(date.getTime())) return true;
+            if (!businessHoursConfig.workingDays.includes(date.getDay())) return false;
+
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            if (businessHoursConfig.holidays.includes(`${y}-${m}-${d}`)) return false;
+
+            const minutes = date.getHours() * 60 + date.getMinutes();
+            return minutes >= businessHoursConfig.startMinutes && minutes < businessHoursConfig.endMinutes;
+        }
+
+        contentEl.addEventListener('change', function (e) {
+            const input = e.target.closest('#resubmit-due-date');
+            if (!input) return;
+            const warning = contentEl.querySelector('#resubmit-due-date-warning');
+            if (!warning) return;
+            const valid = !input.value || isWithinWorkingHours(new Date(input.value));
+            warning.classList.toggle('hidden', valid);
+        });
     });
 </script>
 @endsection

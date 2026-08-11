@@ -20,7 +20,7 @@ use Laravel\Sanctum\HasApiTokens;
  * sendEmailVerificationNotification()/sendPasswordResetNotification() are
  * overridden below to send this app's own branded Mailables instead of
  * Laravel's default bare notification styling, matching every other email
- * this app already sends (DocumentAssignedMail, SlaEscalationMail, etc.).
+ * this app already sends (DocumentAssignedMail, DocumentDecisionMail, etc.).
  */
 class User extends Authenticatable implements MustVerifyEmail
 {

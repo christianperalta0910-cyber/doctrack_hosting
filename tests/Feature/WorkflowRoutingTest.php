@@ -42,6 +42,24 @@ test('a validated document is routed to every configured stage for its category'
     expect(DocumentAssignment::where('document_id', $document->document_id)->count())->toBe(2);
 });
 
+test('every stage of a document shares the exact same SLA deadline, computed once for the whole document', function () {
+    $originator = User::factory()->originator()->create();
+    User::factory()->approver('Job Order')->create();
+    $workflow = app(WorkflowService::class);
+
+    $document = classifiedJobOrder($originator);
+    $workflow->routeToWorkflow($document);
+
+    // Two stages (Technical Review, Final Approval) — every assignment
+    // across BOTH must carry the identical deadline, guaranteed by a
+    // single up-front computation rather than each stage separately
+    // calling now() a few milliseconds apart (see routeToWorkflow()).
+    $deadlines = DocumentAssignment::where('document_id', $document->document_id)->pluck('sla_expires_at');
+
+    expect($deadlines)->toHaveCount(2)
+        ->and($deadlines->unique())->toHaveCount(1);
+});
+
 test('a stage is routed to every eligible approver simultaneously, not just one', function () {
     $originator = User::factory()->originator()->create();
     $approverA = User::factory()->approver('Job Order')->create();

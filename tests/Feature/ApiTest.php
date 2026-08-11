@@ -47,9 +47,11 @@ it('rejects requests to protected routes with no token', function () {
 it('lets an originator submit a document via the API using the exact same classification/routing pipeline', function () {
     $originator = User::factory()->originator()->create();
 
+    $this->travelTo(\Carbon\Carbon::parse('2026-08-12 10:00:00')); // Wednesday, business hours
+
     $response = $this->actingAs($originator, 'sanctum')->postJson('/api/v1/documents', [
         'files' => [UploadedFile::fake()->createWithContent('doc.txt', 'some document content ' . str_repeat('word ', 20))],
-        'due_date' => now()->addHours(2)->format('Y-m-d\TH:i'),
+        'due_date' => now()->addHours(4)->format('Y-m-d\TH:i'),
     ]);
 
     $response->assertStatus(201);

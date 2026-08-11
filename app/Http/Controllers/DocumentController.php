@@ -139,18 +139,19 @@ class DocumentController extends Controller
                 $buffer = config('sla.min_due_date_buffer_minutes', 15);
                 if (Carbon::parse($value)->lt(now()->addMinutes($buffer))) {
                     $fail("The due date must be at least {$buffer} minutes from now.");
+                    return;
+                }
+                // Section 1 (extended): reject a due date outside working
+                // hours/days outright rather than silently moving it — see
+                // WorkflowService::isDueDateWithinWorkingHours()'s docblock.
+                if (!$this->workflow->isDueDateWithinWorkingHours($value)) {
+                    $fail('The due date must fall within working hours (9 AM–5 PM, Mon–Sat, excluding holidays). Please pick a valid date and time.');
                 }
             }],
             'requires_printing' => ['sometimes', 'boolean'],
         ], [], $fileAttributeNames);
 
-        // Section 1 (extended): a due date landing on a non-working day
-        // (weekend/holiday) is auto-shifted forward to the next working
-        // day BEFORE the batch/documents are created, so the batch header,
-        // every document, and every routed assignment all agree on the
-        // same (possibly adjusted) due date instead of drifting apart.
-        $requestedDueDate = Carbon::parse($validated['due_date']);
-        $effectiveDueDate = $this->workflow->resolveEffectiveDueDate($validated['due_date']);
+        $effectiveDueDate = Carbon::parse($validated['due_date']);
         // Unchecked means "no explicit override" — WorkflowService::ingest()
         // still applies the category's own default once classification
         // determines it, this only ever adds the requirement, never
@@ -166,10 +167,6 @@ class DocumentController extends Controller
             ->map(fn ($file) => $this->workflow->ingest($file, $request->user(), $effectiveDueDate->toDateTimeString(), $batch->batch_id, null, $requiresPrinting));
 
         $status = $this->buildSubmissionStatusMessage($documents);
-        if (!$effectiveDueDate->equalTo($requestedDueDate)) {
-            $status .= " Note: your requested due date ({$requestedDueDate->format('M j, Y g:i A')}) fell on a non-working day, " .
-                "so it was automatically moved to {$effectiveDueDate->format('M j, Y g:i A')}.";
-        }
 
         return redirect()
             ->route('originator.dashboard')
@@ -254,11 +251,15 @@ class DocumentController extends Controller
                 $buffer = config('sla.min_due_date_buffer_minutes', 15);
                 if (Carbon::parse($value)->lt(now()->addMinutes($buffer))) {
                     $fail("The due date must be at least {$buffer} minutes from now.");
+                    return;
+                }
+                if (!$this->workflow->isDueDateWithinWorkingHours($value)) {
+                    $fail('The due date must fall within working hours (9 AM–5 PM, Mon–Sat, excluding holidays). Please pick a valid date and time.');
                 }
             }],
         ]);
 
-        $effectiveDueDate = $this->workflow->resolveEffectiveDueDate($validated['due_date']);
+        $effectiveDueDate = Carbon::parse($validated['due_date']);
 
         $newDocument = $this->workflow->ingest(
             $validated['file'],

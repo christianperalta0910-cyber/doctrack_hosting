@@ -5,7 +5,6 @@ namespace App\Services;
 use App\Events\DocumentStatusChanged;
 use App\Jobs\AutoApproveAssignmentJob;
 use App\Mail\DocumentDecisionMail;
-use App\Mail\SlaEscalationMail;
 use App\Models\AuditLog;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentReviewSession;
@@ -41,13 +40,169 @@ use Illuminate\Support\Facades\Mail;
  */
 class SlaService
 {
+    /**
+     * Reuses the exact threshold the grace-period countdown already turns
+     * red at (see admin/partials/sla-queue-results.blade.php's
+     * data-live-urgent-under="7200") — the extra urgent notification fires
+     * exactly when an admin would already see this flagged urgent on the
+     * page, not a separately-invented number.
+     */
+    private const SHORT_GRACE_URGENT_SECONDS = 7200; // 2 hours
+
     public function __construct(private WorkflowService $workflow)
     {
     }
 
+    /**
+     * Reuses the same "Urgent" threshold (30 minutes or less of real
+     * remaining time — see DocumentAssignment::URGENT_THRESHOLD_SECONDS)
+     * already used everywhere else in this app, rather than a separately
+     * invented number, for when the unreviewed-auto-approval reminder
+     * escalates.
+     */
+    private const REVIEW_REMINDER_DUE_SOON_SECONDS = 1800; // 30 minutes
+
+    /**
+     * Same 30-minute "Urgent" threshold as above, reused (not a separately
+     * invented number) as the final-call point for the two one-shot urgent
+     * notifications below — each fires exactly once when its situation
+     * first becomes urgent (see WorkflowService::assignStage() and
+     * escalate()'s SHORT_GRACE_URGENT_SECONDS check), with no follow-up if
+     * that first ping goes unseen. This is the ONE additional nudge, right
+     * before the thing actually happens (SLA breach/escalation, or
+     * auto-approval), guarded by its own *_reminder_sent_at column so it
+     * can never repeat.
+     */
+    private const URGENT_FOLLOWUP_SECONDS = 1800; // 30 minutes
+
     public function sweep(): array
     {
-        return ['auto_approved' => $this->autoApproveUnresolved()];
+        return [
+            'auto_approved' => $this->autoApproveUnresolved(),
+            'review_reminders_sent' => $this->remindUnreviewedAutoApprovals(),
+            'urgent_approver_reminders_sent' => $this->remindStillUrgentApprovers(),
+            'grace_reminders_sent' => $this->remindShortGraceWindows(),
+        ];
+    }
+
+    /**
+     * The "born urgent" notification (WorkflowService::assignStage()) fires
+     * exactly once, the instant an assignment is created with an already-
+     * short window. If the approver isn't looking right then, nothing
+     * nudges them again before it actually escalates to Admin — this sends
+     * ONE follow-up, right as the same Urgent window is about to run out,
+     * guarded by urgent_reminder_sent_at.
+     */
+    private function remindStillUrgentApprovers(): int
+    {
+        $count = 0;
+
+        DocumentAssignment::query()
+            ->where('individual_status', 'pending')
+            ->where('escalated_to_admin', false)
+            ->whereNull('urgent_reminder_sent_at')
+            ->whereNotNull('sla_expires_at')
+            ->with(['document', 'stage'])
+            ->get()
+            ->each(function (DocumentAssignment $assignment) use (&$count) {
+                if ($assignment->urgencyRank() !== 1) {
+                    return;
+                }
+
+                $assignment->urgent_reminder_sent_at = now();
+                $assignment->save();
+
+                NotificationRecord::send($assignment->user_id, $assignment->document_id,
+                    "FINAL CALL: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') is about to breach its SLA window " .
+                    '— please act now before it escalates to Admin.',
+                    'high');
+
+                $count++;
+            });
+
+        return $count;
+    }
+
+    /**
+     * The "grace window is already short" notification (escalate()) fires
+     * exactly once, at the moment of escalation itself. If it isn't seen,
+     * nothing nudges Admins again as auto-approval gets closer — this
+     * sends ONE follow-up right before the system actually auto-approves,
+     * guarded by grace_reminder_sent_at. Reuses adminGraceExpiresAt() (the
+     * same single source of truth escalate() and autoApproveUnresolved()
+     * both use), so this can never disagree with when auto-approval will
+     * actually happen.
+     */
+    private function remindShortGraceWindows(): int
+    {
+        $count = 0;
+
+        DocumentAssignment::query()
+            ->where('individual_status', 'pending')
+            ->where('escalated_to_admin', true)
+            ->whereNull('admin_override_at')
+            ->whereNull('grace_reminder_sent_at')
+            ->with(['document', 'stage'])
+            ->get()
+            ->each(function (DocumentAssignment $assignment) use (&$count) {
+                $graceExpiresAt = $assignment->adminGraceExpiresAt();
+                if (!$graceExpiresAt || now()->diffInSeconds($graceExpiresAt, false) > self::URGENT_FOLLOWUP_SECONDS) {
+                    return;
+                }
+
+                $assignment->grace_reminder_sent_at = now();
+                $assignment->save();
+
+                foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
+                    NotificationRecord::send($admin->user_id, $assignment->document_id,
+                        "FINAL CALL: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') will be auto-approved by the system " .
+                        'very soon unless an Admin acts now.',
+                        'high');
+                }
+
+                $count++;
+            });
+
+        return $count;
+    }
+
+    /**
+     * Closes the gap between "the system auto-approved this" and "an admin
+     * actually looked at it" — autoApproveOne() already sends an immediate
+     * in-app notification the moment auto-approval happens, but nothing
+     * previously followed up if that sat unreviewed. If a stage is still
+     * auto_approved, still unreviewed, and its document's due date is now
+     * within the same "Urgent" window used everywhere else in this app,
+     * every admin gets ONE escalated reminder (review_reminder_sent_at
+     * guards against re-sending it every sweep cycle for as long as it
+     * stays unreviewed).
+     */
+    private function remindUnreviewedAutoApprovals(): int
+    {
+        $count = 0;
+
+        DocumentAssignment::query()
+            ->where('auto_approved', true)
+            ->whereNull('admin_reviewed_at')
+            ->whereNull('review_reminder_sent_at')
+            ->whereHas('document', fn ($q) => $q->where('due_date', '<=', now()->addSeconds(self::REVIEW_REMINDER_DUE_SOON_SECONDS)))
+            ->with(['document', 'stage'])
+            ->get()
+            ->each(function (DocumentAssignment $assignment) use (&$count) {
+                $assignment->review_reminder_sent_at = now();
+                $assignment->save();
+
+                foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
+                    NotificationRecord::send($admin->user_id, $assignment->document_id,
+                        "URGENT: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') was auto-approved " .
+                        "and still hasn't been reviewed — its due date is approaching. Please confirm or dispute it now.",
+                        'high');
+                }
+
+                $count++;
+            });
+
+        return $count;
     }
 
     /**
@@ -77,7 +232,13 @@ class SlaService
             // exactly when the Admin grace window lapses, instead of waiting
             // for the next 5-minute sla:check poll. sla:check stays wired into
             // the scheduler as a backstop only (see bootstrap/app.php).
-            $graceExpiresAt = $escalatedAt->copy()->addHours(config('sla.admin_grace_hours', 12));
+            //
+            // Reuses DocumentAssignment::adminGraceExpiresAt() — the single
+            // source of truth for the grace deadline (due_date clamp AND the
+            // short-due-date halving rule both live there) — instead of
+            // recomputing the formula here, so this can never drift from
+            // what the displayed countdown or the backstop sweep compute.
+            $graceExpiresAt = $assignment->adminGraceExpiresAt();
             AutoApproveAssignmentJob::dispatch($assignment->assignment_id, $graceExpiresAt)->delay($graceExpiresAt);
 
             // abs()+round(): Carbon 3's diffInMinutes() returns a signed
@@ -93,14 +254,27 @@ class SlaService
                 'stage_name' => $assignment->stage->stage_name,
             ]);
 
-            foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
+            $admins = User::where('role', 'admin')->where('is_active', true)->get();
+            foreach ($admins as $admin) {
                 NotificationRecord::send($admin->user_id, $assignment->document_id,
                     "SLA violation: '{$assignment->document->title}' at stage '{$assignment->stage->stage_name}' " .
                     '(approver: ' . ($assignment->approver->full_name ?? 'unassigned') . ') needs Admin attention.',
                     'high');
+            }
 
-                if ($admin->email) {
-                    Mail::to($admin->email)->queue(new SlaEscalationMail($assignment));
+            // A SEPARATE, extra-urgent notification — not a duplicate of
+            // the one above — for the specific case where the grace window
+            // just computed is already short (reusing the same 2-hour mark
+            // the grace countdown itself turns red at, so this fires
+            // exactly when an admin would already see it flagged urgent on
+            // the page). Escalation alone doesn't tell an admin whether
+            // they have 6 hours or 20 minutes to act; this does.
+            if (now()->diffInSeconds($graceExpiresAt, false) <= self::SHORT_GRACE_URGENT_SECONDS) {
+                foreach ($admins as $admin) {
+                    NotificationRecord::send($admin->user_id, $assignment->document_id,
+                        "URGENT: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') has a very short " .
+                        'grace window before the system auto-approves it — please review now.',
+                        'high');
                 }
             }
 
@@ -122,7 +296,6 @@ class SlaService
     private function autoApproveUnresolved(): int
     {
         $count = 0;
-        $graceCutoff = now()->subHours(config('sla.admin_grace_hours', 12));
 
         // No ->unique('document_id') — a stage can now have more than one
         // eligible-approver seat (see WorkflowService::assignStage()), so
@@ -130,16 +303,26 @@ class SlaService
         // legitimately qualify for auto-approval in the same sweep; each
         // needs its own independent auto-approval, not just the first one
         // found per document.
+        //
+        // Fetches every still-escalated, still-pending, not-yet-overridden
+        // row (there's normally very few of these at once) and checks each
+        // one's real grace deadline in PHP via adminGraceExpiresAt() —
+        // the same single source of truth escalate() uses to schedule the
+        // actual auto-approval job. A flat SQL cutoff can't express the
+        // due-date clamp or the short-due-date halving rule that method
+        // applies, so this is precise rather than an approximation of it.
         DocumentAssignment::query()
             ->where('individual_status', 'pending')
             ->where('escalated_to_admin', true)
             ->whereNull('admin_override_at')
-            ->where('sla_expires_at', '<=', $graceCutoff)
             ->with(['document', 'stage'])
             ->get()
             ->each(function (DocumentAssignment $assignment) use (&$count) {
-                $this->autoApproveOne($assignment);
-                $count++;
+                $graceExpiresAt = $assignment->adminGraceExpiresAt();
+                if ($graceExpiresAt && now()->greaterThanOrEqualTo($graceExpiresAt)) {
+                    $this->autoApproveOne($assignment);
+                    $count++;
+                }
             });
 
         return $count;

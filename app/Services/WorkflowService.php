@@ -100,17 +100,22 @@ class WorkflowService
     }
 
     /**
-     * Section 1 (extended): if the requested due date falls on a
-     * non-working day (weekend/holiday per the current calendar), bumps it
-     * forward to the next working day — same time-of-day, only the date
-     * moves. Called by DocumentController::store() BEFORE the
-     * SubmissionBatch and its documents are created, so the batch header,
-     * every document, and every routed assignment all agree on the same
-     * (possibly adjusted) due date instead of drifting apart.
+     * Section 1 (extended): a submitted due date has to fall inside an
+     * actual working window (working day, between start/end time) —
+     * otherwise the whole approve/escalate/grace chain built on top of it
+     * (see DocumentAssignment::adminGraceExpiresAt()) inherits a deadline
+     * nobody's ever actually working during. Used at submission time
+     * (DocumentController::store()/resubmit()) to REJECT an invalid pick
+     * outright rather than silently moving it — an in-flight document's
+     * due_date can still legitimately shift later via
+     * syncDueDatesWithCalendar() below (an admin retroactively closing a
+     * day has no "reject" option for something already submitted), but a
+     * brand-new submission always has the option of picking a valid date
+     * instead.
      */
-    public function resolveEffectiveDueDate(string $dueDate): Carbon
+    public function isDueDateWithinWorkingHours(string $dueDate): bool
     {
-        return $this->businessHours->nextWorkingDueDate(Carbon::parse($dueDate));
+        return $this->businessHours->isWithinWorkingWindow(Carbon::parse($dueDate));
     }
 
     /**
@@ -381,6 +386,8 @@ class WorkflowService
      */
     public function routeToWorkflow(DocumentRepository $document): void
     {
+        $this->extendDueDateIfReviewQueueAteTheBuffer($document);
+
         $stages = WorkflowStage::forCategory($document->ml_category)->where('is_archived', false)->get();
 
         if ($stages->isEmpty()) {
@@ -391,9 +398,60 @@ class WorkflowService
             )]);
         }
 
+        // Computed ONCE for the whole document, not once per stage — every
+        // stage is routed together in the loop below (see class docblock),
+        // so every approver across every stage of this document shares
+        // this exact same deadline, guaranteed, rather than each stage
+        // separately calling now() a few milliseconds apart.
+        $slaExpiresAt = $this->computeApproverSlaExpiry($document);
+
         foreach ($stages as $stage) {
-            $this->assignStage($document, $stage);
+            $this->assignStage($document, $stage, $slaExpiresAt);
         }
+    }
+
+    /**
+     * A document can sit in an Admin review queue for an unpredictable
+     * amount of time before ever reaching routeToWorkflow() — either the
+     * ML classifier wasn't confident (see AdminController::
+     * confirmMlReview()) or the content failed the readability check (see
+     * confirmReadabilityReview()). due_date was only ever validated
+     * against the ORIGINAL upload moment (see DocumentController::store()'s
+     * business-hours check), so if review processing ate into the runway,
+     * the approver about to be assigned could inherit a deadline that's
+     * already unrealistically close — or even already passed — through no
+     * fault of their own or the originator's. Restores the exact same
+     * minimum buffer upload itself guarantees, rather than silently
+     * handing the approver a broken countdown. A no-op for the normal
+     * (non-held) path, since routeToWorkflow() runs there within the same
+     * request as the already-validated upload — there's never a realistic
+     * gap to close in that case.
+     */
+    private function extendDueDateIfReviewQueueAteTheBuffer(DocumentRepository $document): void
+    {
+        if (!$document->due_date) {
+            return;
+        }
+
+        $minBuffer = config('sla.min_due_date_buffer_minutes', 60);
+        $realMinutesLeft = $this->businessHours->businessSecondsRemaining(now(), Carbon::parse($document->due_date)) / 60;
+
+        if ($realMinutesLeft >= $minBuffer) {
+            return;
+        }
+
+        $oldDueDate = Carbon::parse($document->due_date);
+        $newDueDate = $this->businessHours->addBusinessMinutes(now(), $minBuffer);
+        $document->due_date = $newDueDate;
+        $document->save();
+
+        AuditLog::record(null, $document->document_id, 'due_date_extended',
+            "Due date extended from {$oldDueDate->toDayDateTimeString()} to {$newDueDate->toDayDateTimeString()} " .
+            '— review-queue processing time had left an approver with less than the minimum realistic window to act.');
+
+        NotificationRecord::send($document->originator_id, $document->document_id,
+            "Your document '{$document->title}' had its due date extended to {$newDueDate->format('M j, Y g:i A')} " .
+            'because admin review processing left too little time for an approver to realistically act on it.');
     }
 
     /**
@@ -612,14 +670,16 @@ class WorkflowService
     /**
      * Creates one DocumentAssignment PER eligible approver for this stage
      * (Feature: unanimous approval — every eligible approver must sign off
-     * before the stage completes; see completeStage()). All seats share an
-     * identical sla_expires_at, computed once here rather than once per
-     * approver, so nobody's window is skewed by loop wall-clock time.
-     * is_busy is not consulted — every eligible approver gets a seat
-     * regardless of busy status, since "assign everyone" and "skip busy
-     * ones" can't both hold.
+     * before the stage completes; see completeStage()). $slaExpiresAt is
+     * supplied by the caller rather than computed here, so that when every
+     * stage of a document is routed together (the normal case — see
+     * routeToWorkflow()), every approver on every stage shares the exact
+     * same deadline as a guarantee, not as an accident of how fast the
+     * routing loop happens to run. is_busy is not consulted — every
+     * eligible approver gets a seat regardless of busy status, since
+     * "assign everyone" and "skip busy ones" can't both hold.
      */
-    private function assignStage(DocumentRepository $document, WorkflowStage $stage): void
+    private function assignStage(DocumentRepository $document, WorkflowStage $stage, Carbon $slaExpiresAt): void
     {
         $approvers = $this->eligibleApproversForStage($document, $stage);
 
@@ -636,7 +696,6 @@ class WorkflowService
             return;
         }
 
-        $slaExpiresAt = $this->computeApproverSlaExpiry($document);
         $priorityRank = $this->computePriority($document->due_date);
 
         foreach ($approvers as $approver) {
@@ -662,6 +721,23 @@ class WorkflowService
 
             if ($approver->email) {
                 Mail::to($approver->email)->queue(new DocumentAssignedMail($document, $stage, $approver));
+            }
+
+            // A SEPARATE, extra-urgent notification for assignments born
+            // with an already-tight window — reuses the exact "Urgent"
+            // threshold (urgencyRank() === 1, 30 minutes or less of real
+            // remaining time) already shown as a badge everywhere this
+            // assignment appears, rather than a new, separately-invented
+            // number. A short-due-date document's flat 15-minute SLA
+            // window (see tieredApproverSlaMinutes()) always qualifies —
+            // this makes sure the approver is actively told the instant it
+            // happens instead of only seeing a badge if they happen to
+            // check their queue in time.
+            if ($assignment->urgencyRank() === 1) {
+                NotificationRecord::send($approver->user_id, $document->document_id,
+                    "URGENT: '{$document->title}' (stage '{$stage->stage_name}') has a very short window to act — " .
+                    'please review it now.',
+                    'high');
             }
         }
 
@@ -1030,7 +1106,12 @@ class WorkflowService
                 ->exists();
 
             if (!$alreadyAssigned) {
-                $this->assignStage($document, $nextStage);
+                // Computed fresh here, deliberately NOT reusing the
+                // original routing-time deadline — this stage genuinely
+                // didn't exist until later, so "now" for its own SLA
+                // budget is this moment, not the document's original
+                // upload time.
+                $this->assignStage($document, $nextStage, $this->computeApproverSlaExpiry($document));
             }
         }
 

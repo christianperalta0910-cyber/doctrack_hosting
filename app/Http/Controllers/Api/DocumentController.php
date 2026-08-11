@@ -67,11 +67,15 @@ class DocumentController extends Controller
                 $buffer = config('sla.min_due_date_buffer_minutes', 15);
                 if (Carbon::parse($value)->lt(now()->addMinutes($buffer))) {
                     $fail("The due date must be at least {$buffer} minutes from now.");
+                    return;
+                }
+                if (!$this->workflow->isDueDateWithinWorkingHours($value)) {
+                    $fail('The due date must fall within working hours (9 AM–5 PM, Mon–Sat, excluding holidays). Please pick a valid date and time.');
                 }
             }],
         ]);
 
-        $effectiveDueDate = $this->workflow->resolveEffectiveDueDate($validated['due_date']);
+        $effectiveDueDate = Carbon::parse($validated['due_date']);
 
         $batch = SubmissionBatch::create([
             'originator_id' => $request->user()->user_id,

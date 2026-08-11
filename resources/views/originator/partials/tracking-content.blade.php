@@ -96,8 +96,10 @@
                             </div>
                             <div>
                                 <label class="block text-xs font-medium text-surface-700 mb-1">Due date &amp; time</label>
-                                <input type="datetime-local" name="due_date" required min="{{ now()->addMinutes(15)->format('Y-m-d\TH:i') }}"
+                                <p class="text-[11px] text-surface-400 mb-1">Must fall within working hours (9 AM–5 PM, Mon–Sat).</p>
+                                <input type="datetime-local" id="resubmit-due-date" name="due_date" required min="{{ now()->addMinutes(config('sla.min_due_date_buffer_minutes', 15))->format('Y-m-d\TH:i') }}"
                                     class="w-full rounded-lg border-surface-300 text-sm px-3 py-2">
+                                <p id="resubmit-due-date-warning" class="hidden mt-1 text-[11px] text-rejected-700">This falls outside working hours (9 AM–5 PM, Mon–Sat) or on a holiday — pick a different date/time.</p>
                             </div>
                             <button class="w-full bg-primary-700 hover:bg-primary-800 text-white text-xs font-medium py-2 rounded-lg">Resubmit</button>
                         </form>
