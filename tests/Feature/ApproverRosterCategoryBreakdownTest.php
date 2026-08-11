@@ -52,7 +52,12 @@ test('an approver reassigned between categories shows breach history split by ca
     breachFor($approver, 'Job Order', $originator);
     breachFor($approver, 'Purchase Requisition', $originator);
 
-    $response = $this->actingAs($admin)->get(route('admin.sla.violations'));
+    // The approver roster only renders once a category is picked or a
+    // search is run — see SlaViolationsFolderViewTest. Using a document
+    // SEARCH here rather than a category filter, deliberately: this test's
+    // whole point is seeing one approver's breach history split ACROSS
+    // categories, which a category filter would itself narrow away.
+    $response = $this->actingAs($admin)->get(route('admin.sla.violations', ['document' => '-doc.txt']));
     $response->assertOk();
 
     $byApproverCategory = $response->viewData('byApproverCategory')->get($approver->user_id);

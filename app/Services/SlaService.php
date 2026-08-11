@@ -215,6 +215,14 @@ class SlaService
      * depending entirely on the next cron tick. Without this, an approver
      * could still approve/reject an assignment whose SLA had already
      * lapsed, simply because the periodic sweep hadn't run yet.
+     *
+     * Also the entry point for a needs_approver seat's OWN deadline lapsing
+     * (see WorkflowService::markNeedsApprover()) — same escalation, grace
+     * period, and eventual auto-approval as a normal approver miss, but
+     * $assignment->needs_approver branches the wording/record below: there's
+     * no approver to blame here (that's the whole reason it's stuck), so
+     * this must never read as "the approver missed it" or count against
+     * whoever used to hold the seat.
      */
     public function escalate(DocumentAssignment $assignment): void
     {
@@ -224,9 +232,15 @@ class SlaService
             $assignment->escalated_at = $escalatedAt;
             $assignment->save();
 
-            AuditLog::record(null, $assignment->document_id, 'sla_escalation',
-                "Approver assignment #{$assignment->assignment_id} (stage '{$assignment->stage->stage_name}') " .
-                'exceeded its SLA window and was flagged for Admin escalation.');
+            if ($assignment->needs_approver) {
+                AuditLog::record(null, $assignment->document_id, 'sla_escalation',
+                    "Stage '{$assignment->stage->stage_name}' on '{$assignment->document->title}' has had no eligible " .
+                    'approver for too long and was flagged for Admin escalation.');
+            } else {
+                AuditLog::record(null, $assignment->document_id, 'sla_escalation',
+                    "Approver assignment #{$assignment->assignment_id} (stage '{$assignment->stage->stage_name}') " .
+                    'exceeded its SLA window and was flagged for Admin escalation.');
+            }
 
             // Event-driven auto-approval (mirrors EscalateAssignmentJob): fires
             // exactly when the Admin grace window lapses, instead of waiting
@@ -241,25 +255,36 @@ class SlaService
             $graceExpiresAt = $assignment->adminGraceExpiresAt();
             AutoApproveAssignmentJob::dispatch($assignment->assignment_id, $graceExpiresAt)->delay($graceExpiresAt);
 
-            // abs()+round(): Carbon 3's diffInMinutes() returns a signed
-            // float even with the default $absolute param, so the sign and
-            // fractional part both need normalizing before this hits an
-            // unsignedInteger column.
-            SlaViolation::create([
-                'document_id' => $assignment->document_id,
-                'assignment_id' => $assignment->assignment_id,
-                'approver_id' => $assignment->user_id,
-                'violation_timestamp' => now(),
-                'duration_overdue' => (int) round(abs(now()->diffInMinutes($assignment->sla_expires_at))),
-                'stage_name' => $assignment->stage->stage_name,
-            ]);
+            // No SlaViolation for a needs_approver seat — that table feeds
+            // the approver leaderboard/roster on the Violations page, and
+            // whoever used to hold this seat didn't fail anything; they
+            // were deactivated with nobody else eligible. Logging one here
+            // would unfairly count against their record for something that
+            // isn't theirs.
+            if (!$assignment->needs_approver) {
+                // abs()+round(): Carbon 3's diffInMinutes() returns a signed
+                // float even with the default $absolute param, so the sign
+                // and fractional part both need normalizing before this
+                // hits an unsignedInteger column.
+                SlaViolation::create([
+                    'document_id' => $assignment->document_id,
+                    'assignment_id' => $assignment->assignment_id,
+                    'approver_id' => $assignment->user_id,
+                    'violation_timestamp' => now(),
+                    'duration_overdue' => (int) round(abs(now()->diffInMinutes($assignment->sla_expires_at))),
+                    'stage_name' => $assignment->stage->stage_name,
+                ]);
+            }
 
             $admins = User::where('role', 'admin')->where('is_active', true)->get();
             foreach ($admins as $admin) {
-                NotificationRecord::send($admin->user_id, $assignment->document_id,
-                    "SLA violation: '{$assignment->document->title}' at stage '{$assignment->stage->stage_name}' " .
-                    '(approver: ' . ($assignment->approver->full_name ?? 'unassigned') . ') needs Admin attention.',
-                    'high');
+                $message = $assignment->needs_approver
+                    ? "'{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') still has no eligible " .
+                        'approver and its own deadline has now passed — needs Admin attention.'
+                    : "SLA violation: '{$assignment->document->title}' at stage '{$assignment->stage->stage_name}' " .
+                        '(approver: ' . ($assignment->approver->full_name ?? 'unassigned') . ') needs Admin attention.';
+
+                NotificationRecord::send($admin->user_id, $assignment->document_id, $message, 'high');
             }
 
             // A SEPARATE, extra-urgent notification — not a duplicate of

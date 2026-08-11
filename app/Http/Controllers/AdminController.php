@@ -1936,6 +1936,11 @@ class AdminController extends Controller
     {
         $containers = DocumentAssignment::where('needs_approver', true)
             ->where('individual_status', 'pending')
+            // Once its own deadline lapses, a needs_approver seat escalates
+            // just like any other (see SlaService::escalate()) and moves
+            // to the SLA Override Queue instead — it shouldn't still show
+            // here once that's happened.
+            ->where('escalated_to_admin', false)
             ->with(['document.originator', 'stage', 'reassignedFrom'])
             ->orderBy('needs_approver_at')
             ->get()
@@ -2332,11 +2337,14 @@ class AdminController extends Controller
         $query = $this->violationsQuery($request);
 
         // Same "folders first" pattern as the Archive (Feature: browse by
-        // category) — but unlike the Archive, the stat cards and the
-        // approver-roster control stay visible either way; only the
-        // filter form + results list are gated behind picking a category
-        // (or searching), since those are the pieces that don't mean
-        // anything until you've narrowed down to something.
+        // category). The stat cards, the approver-roster control, the
+        // filter form, and the results list are ALL gated behind picking a
+        // category (or searching) — an unfiltered "Top Category: Job
+        // Order" card (or a roster full of real violation counts) on first
+        // load reads as if the report already defaulted to Job Order, so
+        // none of that computes/shows until something's actually picked.
+        // Only the folder tiles themselves (each showing its own count)
+        // render on the bare landing screen.
         $hasActiveFilters = $request->filled('category') || $request->filled('document')
             || $request->filled('date_from') || $request->filled('date_to');
         $showFolders = !$hasActiveFilters;
@@ -2426,8 +2434,11 @@ class AdminController extends Controller
     }
 
     /**
-     * Everything the stat cards + approver roster need — always computed
-     * regardless of $showFolders, since those stay visible on both screens.
+     * Everything the stat cards + approver roster need. Still computed
+     * regardless of $showFolders, but the view only renders either of them
+     * once $showFolders is false (see violationsReport()) — on the bare
+     * folder screen this result is simply unused rather than wired to
+     * anything, since nothing on that screen needs it yet.
      */
     private function violationStats($query, Request $request): array
     {

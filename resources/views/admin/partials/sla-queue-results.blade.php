@@ -62,7 +62,15 @@
                                 <span class="text-xs text-surface-500 font-medium">Stage: {{ $activeAssignment->stage->stage_name }}</span>
                             </div>
                             <p class="text-xs text-surface-500">
-                                Approver: {{ $activeAssignment->approver->full_name ?? 'Unassigned' }} &middot;
+                                @if($activeAssignment->needs_approver)
+                                    No approver eligible for this category/stage
+                                    @if($activeAssignment->reassignedFrom)
+                                        (was {{ $activeAssignment->reassignedFrom->full_name }}, now deactivated)
+                                    @endif
+                                    &middot;
+                                @else
+                                    Approver: {{ $activeAssignment->approver->full_name ?? 'Unassigned' }} &middot;
+                                @endif
                                 Expired <span data-live-time="{{ $activeAssignment->sla_expires_at->timestamp }}">{{ $activeAssignment->sla_expires_at->diffForHumans() }}</span>
                                 @if($activeAssignment->adminGraceExpiresAt())
                                     &middot; <span data-live-time="{{ $activeAssignment->adminGraceExpiresAt()->timestamp }}" data-live-urgent-under="7200" class="font-medium">{{ $activeAssignment->adminGraceExpiresAt()->diffForHumans() }}</span> until system auto-approval

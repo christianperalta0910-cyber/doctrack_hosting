@@ -840,29 +840,44 @@ class WorkflowService
      * findReplacementApprover() found nobody either, using the exact same
      * category+stage eligibility rule normal routing uses (deliberately
      * NOT broadened for this case). Unlike the old escalateForReassignment
-     * Failure() this replaces, this never touches escalated_to_admin or
-     * creates any SLA-flavored trail — the assignment's holder didn't fail
-     * an SLA deadline, they were deactivated with nothing else available,
-     * so folding it into the SLA Override Queue would misrepresent it and
-     * unfairly count against them once resolved. Instead it's flagged
-     * needs_approver and surfaced in the separate Unassigned Documents
-     * module (see AdminController::unassignedDocuments()), where an Admin
-     * decides it directly themselves — see adminDecideUnassigned() below.
-     * Deliberately no "assign anyone" bypass: eligibility stays strictly
-     * tied to each approver's assigned category/stages even here.
+     * Failure() this replaces, this never blames the deactivated approver —
+     * they didn't fail an SLA deadline, they were deactivated with nothing
+     * else available. It's flagged needs_approver and surfaced in the
+     * separate Unassigned Documents module (see AdminController::
+     * unassignedDocuments()), where an Admin decides it directly — see
+     * adminDecideUnassigned() below. Deliberately no "assign anyone"
+     * bypass: eligibility stays strictly tied to each approver's assigned
+     * category/stages even here.
+     *
+     * It DOES get its own SLA deadline, though — the same tiered formula
+     * an approver's own window uses, anchored at this moment instead of
+     * routing time — so a seat nobody's eligible for still can't sit
+     * unresolved forever. If that deadline lapses, CheckParallelSlas's
+     * existing sweep (and the event-driven job dispatched below) picks it
+     * up exactly like any other expired seat and escalates it — but
+     * SlaService::escalate() branches on needs_approver so the resulting
+     * violation/notification reads as "nobody was eligible in time," not
+     * as blaming whoever used to hold the seat. See adminGraceExpiresAt()
+     * and autoApproveUnresolved() for why nothing else needs to change to
+     * make grace-period-then-auto-approve work for this too.
      */
     public function markNeedsApprover(DocumentAssignment $assignment, User $oldApprover, ?string $reason = null): void
     {
+        $slaExpiresAt = $this->computeApproverSlaExpiry($assignment->document);
+
         $assignment->needs_approver = true;
         $assignment->needs_approver_at = now();
         $assignment->reassigned_from = $oldApprover->user_id;
         $assignment->reassignment_reason = $reason;
+        $assignment->sla_expires_at = $slaExpiresAt;
         $assignment->save();
+
+        EscalateAssignmentJob::dispatch($assignment->assignment_id, $slaExpiresAt)->delay($slaExpiresAt);
 
         AuditLog::record(null, $assignment->document_id, 'needs_approver',
             "Stage '{$assignment->stage->stage_name}' on '{$assignment->document->title}' has no eligible approver — " .
             "{$oldApprover->full_name}'s account was deactivated and nobody else qualifies for this category/stage." .
-            ($reason ? " Reason: \"{$reason}\"" : '') . ' Moved to the Unassigned Documents queue.');
+            ($reason ? " Reason: \"{$reason}\"" : '') . " Moved to the Unassigned Documents queue, due {$slaExpiresAt->toDayDateTimeString()}.");
 
         foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
             NotificationRecord::send($admin->user_id, $assignment->document_id,

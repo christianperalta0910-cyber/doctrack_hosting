@@ -7,6 +7,7 @@ use App\Models\NotificationRecord;
 use App\Models\SlaViolation;
 use App\Models\User;
 use App\Models\WorkflowStage;
+use Illuminate\Support\Facades\Queue;
 
 function pendingHandoffAssignmentFor(User $approver, string $category, string $stageName = 'Review'): DocumentAssignment
 {
@@ -94,6 +95,14 @@ test('an optional deactivation reason is stored on the reassigned assignment and
 });
 
 test('when no eligible approver exists, the assignment is flagged needs_approver instead of escalated to SLA', function () {
+    // markNeedsApprover() now dispatches EscalateAssignmentJob for its own
+    // deadline (see WorkflowService::markNeedsApprover()) — the test env's
+    // sync queue driver would otherwise run it immediately rather than
+    // waiting for the real delay, prematurely escalating before this
+    // assertion even runs (same reason UnassignedDocumentsTest.php fakes
+    // the queue for this exact flow).
+    Queue::fake();
+
     $admin = User::factory()->admin()->create();
     // The ONLY approver for this category — no one else eligible.
     $onlyApprover = User::factory()->approver('Service Report')->create();

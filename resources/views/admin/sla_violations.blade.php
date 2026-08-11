@@ -5,39 +5,50 @@
 @section('content')
 <div class="space-y-6">
 
-    <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
-        <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
-            <p class="text-xs text-surface-500 mb-1">Total Violations</p>
-            <p class="text-2xl font-bold text-rejected-700">{{ $totalCount }}</p>
+    {{-- Gated behind picking a category (or searching), same as the filter
+         form + results list below — an unfiltered "Top Category: Job
+         Order" card on first load reads as if the report already defaulted
+         to Job Order, even though nothing was picked yet. Blank until a
+         real selection narrows these numbers down to something meaningful. --}}
+    @unless($showFolders)
+        <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+            <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
+                <p class="text-xs text-surface-500 mb-1">Total Violations</p>
+                <p class="text-2xl font-bold text-rejected-700">{{ $totalCount }}</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
+                <p class="text-xs text-surface-500 mb-1">Avg. Minutes Overdue</p>
+                <p class="text-2xl font-bold text-surface-900">{{ $avgOverdue }}</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
+                <p class="text-xs text-surface-500 mb-1">Top Approver</p>
+                <p class="text-sm font-semibold text-surface-900">{{ optional($byApprover->first()?->approver)->full_name ?? '—' }}</p>
+                <p class="text-xs text-surface-400">{{ $byApprover->first()->total ?? 0 }} violation(s)</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
+                <p class="text-xs text-surface-500 mb-1">Top Bottleneck Stage</p>
+                <p class="text-sm font-semibold text-surface-900">{{ $byStage->first()->stage_name ?? '—' }}</p>
+                <p class="text-xs text-surface-400">{{ $byStage->first()->total ?? 0 }} violation(s)</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
+                <p class="text-xs text-surface-500 mb-1">Top Category</p>
+                <p class="text-sm font-semibold text-surface-900">{{ $byCategory->ml_category ?? '—' }}</p>
+                <p class="text-xs text-surface-400">{{ $byCategory->total ?? 0 }} violation(s)</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
+                <p class="text-xs text-surface-500 mb-1">Disputed</p>
+                <p class="text-2xl font-bold text-processing-700">{{ $disputedCount }}</p>
+            </div>
         </div>
-        <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
-            <p class="text-xs text-surface-500 mb-1">Avg. Minutes Overdue</p>
-            <p class="text-2xl font-bold text-surface-900">{{ $avgOverdue }}</p>
-        </div>
-        <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
-            <p class="text-xs text-surface-500 mb-1">Top Approver</p>
-            <p class="text-sm font-semibold text-surface-900">{{ optional($byApprover->first()?->approver)->full_name ?? '—' }}</p>
-            <p class="text-xs text-surface-400">{{ $byApprover->first()->total ?? 0 }} violation(s)</p>
-        </div>
-        <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
-            <p class="text-xs text-surface-500 mb-1">Top Bottleneck Stage</p>
-            <p class="text-sm font-semibold text-surface-900">{{ $byStage->first()->stage_name ?? '—' }}</p>
-            <p class="text-xs text-surface-400">{{ $byStage->first()->total ?? 0 }} violation(s)</p>
-        </div>
-        <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
-            <p class="text-xs text-surface-500 mb-1">Top Category</p>
-            <p class="text-sm font-semibold text-surface-900">{{ $byCategory->ml_category ?? '—' }}</p>
-            <p class="text-xs text-surface-400">{{ $byCategory->total ?? 0 }} violation(s)</p>
-        </div>
-        <div class="bg-white rounded-xl shadow-card border border-surface-200 p-5">
-            <p class="text-xs text-surface-500 mb-1">Disputed</p>
-            <p class="text-2xl font-bold text-processing-700">{{ $disputedCount }}</p>
-        </div>
-    </div>
+    @endunless
 
     {{-- Full-width and right under the stat cards on purpose — this used to
          be a small text link buried under a filter form that isn't even
-         visible by default anymore, easy to miss entirely. --}}
+         visible by default anymore, easy to miss entirely. Gated behind a
+         category pick same as the stat cards above — an approver roster
+         full of real violation counts shouldn't be sitting right there on
+         the bare landing screen either. --}}
+    @unless($showFolders)
     <details class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden group [&_summary::-webkit-details-marker]:hidden">
         <summary class="px-6 py-4 cursor-pointer select-none text-sm font-semibold text-primary-700 hover:bg-surface-50 flex items-center gap-2">
             <svg class="w-4 h-4 transition-transform group-open:rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
@@ -101,6 +112,7 @@
             });
         </script>
     </details>
+    @endunless
 
     @if($showFolders)
         {{-- Folders only — the search/filter panel and results list only
@@ -156,7 +168,13 @@
                             <input type="date" name="date_to" value="{{ request('date_to') }}" class="rounded-lg border-surface-300 text-xs px-3 py-2">
                         </div>
                         <button class="text-xs font-medium bg-primary-700 hover:bg-primary-800 text-white px-4 py-2.5 rounded-lg">Filter</button>
-                        <a href="{{ url()->current() }}" class="text-xs font-medium text-surface-500 hover:underline pb-2.5">Clear</a>
+                        {{-- Clears document/date_from/date_to only — MUST keep
+                             category, or this falls back to url()->current()
+                             with no query at all, which flips $showFolders
+                             back to true and bounces you all the way out to
+                             the folder grid instead of just clearing the
+                             search fields within the category you picked. --}}
+                        <a href="{{ url()->current() }}?category={{ urlencode(request('category')) }}" class="text-xs font-medium text-surface-500 hover:underline pb-2.5">Clear</a>
                     </div>
                 </form>
             </div>

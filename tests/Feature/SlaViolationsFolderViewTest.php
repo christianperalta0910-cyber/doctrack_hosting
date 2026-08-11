@@ -55,17 +55,31 @@ test('visiting the bare SLA violations URL shows category folders, not the resul
     $response->assertDontSee('Search document');
 });
 
-test('the stat cards remain visible on the folder-grid screen', function () {
+test('the stat cards and approver roster stay hidden on the folder-grid screen, so nothing looks pre-filtered before a category is picked', function () {
     $admin = User::factory()->admin()->create();
     violationIn('Job Order');
 
     $response = $this->actingAs($admin)->get(route('admin.sla.violations'));
 
     $response->assertOk();
+    $response->assertDontSee('Total Violations');
+    $response->assertDontSee('Top Category');
+    $response->assertDontSee('Avg. Minutes Overdue');
+    $response->assertDontSee('View All Approvers');
+});
+
+test('the stat cards and approver roster appear once a category is picked, scoped to it', function () {
+    $admin = User::factory()->admin()->create();
+    violationIn('Job Order');
+    violationIn('Service Report');
+
+    $response = $this->actingAs($admin)->get(route('admin.sla.violations', ['category' => 'Job Order']));
+
+    $response->assertOk();
     $response->assertSee('Total Violations');
     $response->assertSee('Top Category');
-    $response->assertSee('Disputed');
     $response->assertSee('View All Approvers');
+    $response->assertSee('Disputed');
 });
 
 test('clicking into a category folder shows the search panel and scoped results', function () {
@@ -78,6 +92,18 @@ test('clicking into a category folder shows the search panel and scoped results'
     $response->assertOk();
     $response->assertSee('Search document');
     $response->assertDontSee('Browse by Category');
+});
+
+test('the Clear link keeps the selected category instead of bouncing back to the folder grid', function () {
+    $admin = User::factory()->admin()->create();
+    violationIn('Job Order');
+
+    $response = $this->actingAs($admin)->get(route('admin.sla.violations', ['category' => 'Job Order']));
+
+    // The Clear link must only drop document/date_from/date_to — dropping
+    // category too would flip $showFolders back to true and silently
+    // bounce the admin out of the category they were looking at.
+    $response->assertSee('?category=Job+Order" class="text-xs font-medium text-surface-500', false);
 });
 
 test('the Top Category card reflects the category with the most breaches', function () {
