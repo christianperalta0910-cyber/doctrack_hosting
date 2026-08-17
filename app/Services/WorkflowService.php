@@ -319,11 +319,16 @@ class WorkflowService
                 NotificationRecord::send($originator->user_id, $document->document_id,
                     "Your document '{$document->title}' is awaiting admin review for both its classification confidence " .
                     "({$result['confidence']}%) and its content readability ({$validation['readability_score']}%) before it's routed for approval.");
+                $this->notifyAdminsDocumentNeedsReview($document,
+                    "'{$document->title}' needs admin review — both classification confidence ({$result['confidence']}%) " .
+                    'and content readability are unresolved.');
                 event(new DocumentStatusChanged($document));
             } elseif ($needsClassificationReview) {
                 NotificationRecord::send($originator->user_id, $document->document_id,
                     "Your document '{$document->title}' passed validation, but its classification confidence was low " .
                     "({$result['confidence']}%). An admin will confirm its category before it's routed for approval.");
+                $this->notifyAdminsDocumentNeedsReview($document,
+                    "'{$document->title}' needs admin review — classification confidence was low ({$result['confidence']}%).");
 
                 // DocumentRepository::booted() only broadcasts on an UPDATE
                 // to global_status/disputed_at — this is a brand new row, so
@@ -336,6 +341,9 @@ class WorkflowService
                     "Your document '{$document->title}' passed classification and its required sections, but its content " .
                     "didn't clearly match known vocabulary for '{$result['category']}' (readability score " .
                     "{$validation['readability_score']}%). An admin will review it before it's routed for approval.");
+                $this->notifyAdminsDocumentNeedsReview($document,
+                    "'{$document->title}' needs admin review — content readability score was low " .
+                    "({$validation['readability_score']}%).");
                 event(new DocumentStatusChanged($document));
             } else {
                 NotificationRecord::send($originator->user_id, $document->document_id,
@@ -344,6 +352,24 @@ class WorkflowService
 
             return $document->fresh();
         });
+    }
+
+    /**
+     * Every other "needs an Admin's attention" moment in this app (SLA
+     * escalation, an orphaned needs_approver seat) already notifies every
+     * active admin — a document held for ML/readability review was the one
+     * spot that only ever told the originator, leaving admins with no way
+     * to know a new item landed short of manually checking the ML Training
+     * page. Deliberately normal priority, not the urgent/red flag those
+     * other cases use — nothing about a freshly-held document is on a
+     * burning clock the instant it lands, this is the same tone as the
+     * routine "new document assigned" notification an approver gets.
+     */
+    private function notifyAdminsDocumentNeedsReview(DocumentRepository $document, string $message): void
+    {
+        foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
+            NotificationRecord::send($admin->user_id, $document->document_id, $message);
+        }
     }
 
     /**

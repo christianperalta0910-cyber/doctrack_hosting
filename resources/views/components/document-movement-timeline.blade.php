@@ -1,4 +1,4 @@
-@props(['document'])
+    @props(['document'])
 
 {{--
     Every recorded movement on a document, merged into one chronological

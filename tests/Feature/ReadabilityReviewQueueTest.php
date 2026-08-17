@@ -215,6 +215,76 @@ it('does not route a document until BOTH classification and readability review c
         ->and(DocumentAssignment::where('document_id', $document->document_id)->count())->toBe(1);
 });
 
+it('stages a dual-review document into ML training only once, not once per gate', function () {
+    User::factory()->approver('Job Order')->create();
+    WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
+    stageVocabulary('Job Order');
+
+    $originator = User::factory()->originator()->create();
+    $document = DocumentRepository::create([
+        'originator_id' => $originator->user_id,
+        'title' => 'dual-pending-staging-check.txt', 'file_path' => 'documents/dual-pending-staging-check.txt',
+        'mime_type' => 'text/plain', 'ocr_text' => READABILITY_GOOD_JOB_ORDER,
+        'due_date' => now()->addDay(), 'global_status' => 'processing',
+        'ml_category' => 'Job Order', 'ml_confidence' => 30.0, 'ml_review_status' => 'pending',
+        'readability_score' => 55, 'readability_review_status' => 'pending',
+    ]);
+
+    $admin = readabilityAdmin();
+
+    seedReviewTime($admin, $document);
+    $this->actingAs($admin)->post(route('admin.ml.review.readability', $document), ['action' => 'confirm']);
+
+    expect(MlStagingSample::where('original_filename', 'dual-pending-staging-check.txt')->count())->toBe(1);
+
+    seedReviewTime($admin, $document);
+    $this->actingAs($admin)->post(route('admin.ml.review', $document), ['action' => 'confirm', 'category' => 'Job Order']);
+
+    // Still just the one sample — the classification confirm must not have
+    // staged this exact document a second time now that readability's
+    // confirm already did.
+    expect(MlStagingSample::where('original_filename', 'dual-pending-staging-check.txt')->count())->toBe(1);
+});
+
+it('notifies every active admin when a document is held for readability review', function () {
+    stageVocabulary('Job Order');
+    $admin = User::factory()->admin()->create();
+
+    $document = ingestWithText('Job Order', READABILITY_GARBLED_JOB_ORDER);
+
+    expect($document->readability_review_status)->toBe('pending')
+        ->and(NotificationRecord::where('recipient_id', $admin->user_id)
+            ->where('document_id', $document->document_id)
+            ->where('message_body', 'like', '%needs admin review%readability%')
+            ->exists())->toBeTrue();
+});
+
+it('notifies every active admin when a document is held for classification confidence review', function () {
+    $admin = User::factory()->admin()->create();
+
+    $document = ingestWithText('Job Order', READABILITY_GOOD_JOB_ORDER, confidence: 30.0);
+
+    expect($document->ml_review_status)->toBe('pending')
+        ->and(NotificationRecord::where('recipient_id', $admin->user_id)
+            ->where('document_id', $document->document_id)
+            ->where('message_body', 'like', '%needs admin review%classification confidence%')
+            ->exists())->toBeTrue();
+});
+
+it('notifies admins once, not twice, when a document needs both classification and readability review', function () {
+    stageVocabulary('Job Order');
+    $admin = User::factory()->admin()->create();
+
+    $document = ingestWithText('Job Order', READABILITY_GARBLED_JOB_ORDER, confidence: 30.0);
+
+    expect($document->ml_review_status)->toBe('pending')
+        ->and($document->readability_review_status)->toBe('pending')
+        ->and(NotificationRecord::where('recipient_id', $admin->user_id)
+            ->where('document_id', $document->document_id)
+            ->where('message_body', 'like', '%needs admin review%')
+            ->count())->toBe(1);
+});
+
 it('shows the Content Readability Review panel on the ML training page', function () {
     stageVocabulary('Job Order');
     $document = ingestWithText('Job Order', READABILITY_GARBLED_JOB_ORDER);

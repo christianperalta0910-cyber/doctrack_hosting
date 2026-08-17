@@ -6,9 +6,7 @@
 <div class="space-y-6">
     <div class="rounded-lg bg-processing-50 border border-processing-500/30 text-processing-700 px-4 py-3 text-xs">
         These stages have nobody currently eligible to review them — usually because the only qualified approver
-        for that category/stage was deactivated. This is separate from the SLA Override Queue: nothing here is an
-        SLA failure, so resolving it never counts against anyone's violation history. Decide the stage directly —
-        eligibility stays strictly tied to each approver's assigned category/stages, so this is yours to resolve.
+        for that category/stage was deactivated.
     </div>
 
     <div id="unassigned-wrapper" data-poll-url="{{ route('admin.unassigned.poll') }}" data-refresh-url="{{ route('admin.unassigned.refresh') }}">

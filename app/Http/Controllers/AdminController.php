@@ -1307,7 +1307,14 @@ class AdminController extends Controller
 
         $duplicateWarning = null;
 
-        if ($stageForTraining) {
+        // A document can need BOTH classification and readability review at
+        // once — if readability was already confirmed first, THAT call
+        // already staged this exact document (see confirmReadabilityReview()).
+        // Staging it again here would double-count the same text in the
+        // training corpus instead of adding a genuinely new example.
+        $alreadyStagedByOtherGate = $document->readability_review_status === 'confirmed';
+
+        if ($stageForTraining && !$alreadyStagedByOtherGate) {
             foreach (MlStagingSample::where('category', $category)->get(['original_filename', 'extracted_text']) as $existing) {
                 $similarity = $this->classifier->wordOverlapSimilarity((string) $document->ocr_text, $existing->extracted_text);
                 if ($similarity >= self::NEAR_DUPLICATE_THRESHOLD) {
@@ -1504,26 +1511,37 @@ class AdminController extends Controller
         $oldScore = $document->readability_score;
         $vocabularyBefore = ValidationService::vocabularySize($category);
 
-        $duplicateWarning = null;
-        foreach (MlStagingSample::where('category', $category)->get(['original_filename', 'extracted_text']) as $existing) {
-            $similarity = $this->classifier->wordOverlapSimilarity((string) $document->ocr_text, $existing->extracted_text);
-            if ($similarity >= self::NEAR_DUPLICATE_THRESHOLD) {
-                $duplicateWarning = sprintf(
-                    '"%s" looks like a near-duplicate of already-staged "%s" (%d%% word overlap) — staged anyway, but consider whether a more varied example would help more.',
-                    $document->title,
-                    $existing->original_filename,
-                    round($similarity * 100)
-                );
-                break;
-            }
-        }
+        // A document can need BOTH classification and readability review at
+        // once — if classification was already confirmed first, THAT call
+        // already staged this exact document (see confirmReviewedDocument()).
+        // Staging it again here would double-count the same text in the
+        // training corpus instead of adding a genuinely new example.
+        // $newWords below naturally comes out 0 in that case (vocabulary
+        // genuinely didn't change), so no other logic needs adjusting.
+        $alreadyStagedByOtherGate = $document->ml_review_status === 'confirmed';
 
-        MlStagingSample::create([
-            'category' => $category,
-            'original_filename' => $document->original_filename ?? $document->title,
-            'extracted_text' => (string) $document->ocr_text,
-            'staged_by' => $admin->user_id,
-        ]);
+        $duplicateWarning = null;
+        if (!$alreadyStagedByOtherGate) {
+            foreach (MlStagingSample::where('category', $category)->get(['original_filename', 'extracted_text']) as $existing) {
+                $similarity = $this->classifier->wordOverlapSimilarity((string) $document->ocr_text, $existing->extracted_text);
+                if ($similarity >= self::NEAR_DUPLICATE_THRESHOLD) {
+                    $duplicateWarning = sprintf(
+                        '"%s" looks like a near-duplicate of already-staged "%s" (%d%% word overlap) — staged anyway, but consider whether a more varied example would help more.',
+                        $document->title,
+                        $existing->original_filename,
+                        round($similarity * 100)
+                    );
+                    break;
+                }
+            }
+
+            MlStagingSample::create([
+                'category' => $category,
+                'original_filename' => $document->original_filename ?? $document->title,
+                'extracted_text' => (string) $document->ocr_text,
+                'staged_by' => $admin->user_id,
+            ]);
+        }
 
         // Recomputed AFTER staging, against the now-grown vocabulary — this
         // document's own words are trivially all "known" now (it just

@@ -121,7 +121,6 @@
     <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
         <div class="px-6 py-4 border-b border-surface-200">
             <h3 class="text-sm font-semibold text-surface-900">Audit Trail</h3>
-            <p class="text-xs text-surface-400 mt-0.5">Every recorded movement on this document, including when each approver reviewed it.</p>
         </div>
         @php $movementTimeline = \App\Services\DocumentMovementTimeline::build($document); @endphp
         {{-- Scrolls internally instead of the whole page — a long audit
