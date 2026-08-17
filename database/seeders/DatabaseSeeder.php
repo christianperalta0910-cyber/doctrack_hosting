@@ -44,7 +44,7 @@ class DatabaseSeeder extends Seeder
             ['username' => 'vlessur'],
             [
                 'full_name' => 'Vinz Lessur',
-                'email' => 'vinzlesur@gmail.com',
+                'email' => 'vinzlessur@gmail.com',
                 'role' => 'originator',
                 // Explicit null: an earlier seeder version used this same
                 // username for a different (approver) role — clearing this
