@@ -41,16 +41,16 @@ class DatabaseSeeder extends Seeder
         );
 
         $allenRose = User::updateOrCreate(
-            ['username' => 'arose'],
+            ['username' => 'vlessur'],
             [
-                'full_name' => 'Allen Rose',
-                'email' => 'anastacioalena23@gmail.com',
+                'full_name' => 'Vinz Lessur',
+                'email' => 'vinzlesur@gmail.com',
                 'role' => 'originator',
                 // Explicit null: an earlier seeder version used this same
                 // username for a different (approver) role — clearing this
                 // avoids a stale assigned_category surviving the switch.
                 'assigned_category' => null,
-                'password_hash' => Hash::make('arose123'),
+                'password_hash' => Hash::make('vlessur123'),
                 'created_by' => $admin->user_id,
                 'is_active' => true,
             ]
