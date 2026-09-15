@@ -15,9 +15,11 @@ already declares every PHP dependency this project actually uses.
 ### Requirements
 
 - **PHP 8.2+** with the standard extensions Laravel itself needs: `mbstring`, `openssl`,
-  `pdo_mysql`, `tokenizer`, `xml`, `ctype`, `fileinfo`. All of these ship by default with
-  XAMPP/Laragon on Windows and with `php8.2-*`/`php8.3-*` packages on Ubuntu/Debian — this
-  is only worth checking if `composer install` fails with a "requires ext-xxx" error.
+  `pdo_mysql`, `tokenizer`, `xml`, `ctype`, `fileinfo`, plus **`zip`** (`composer.json`
+  declares it explicitly — needed for ML model artifact/backup archives). All of these
+  ship by default with XAMPP/Laragon on Windows and with `php8.2-*`/`php8.3-*` packages
+  on Ubuntu/Debian — this is only worth checking if `composer install` fails with a
+  "requires ext-xxx" error.
 - **`ext-pcntl`** — required (`composer.json` declares it), needed by `php artisan
   reverb:start` for signal handling (§2.5). Ships by default on Linux/macOS PHP builds.
   **Not available on native Windows PHP at all** (it's POSIX-only — there's no build of
@@ -134,18 +136,28 @@ a different distro/architecture, or have root and prefer a real system install i
 SLA escalation, live-updating dashboards/notifications, the safety-net sweep, nightly
 backups, and document classification/routing all work unattended from here on.
 
-### Demo accounts (created by the seeder)
+### Accounts (created by the seeder)
 
-| Role       | Username | Password    |
-|------------|----------|-------------|
-| Admin      | `admin`  | `admin123`  |
-| Originator | `jsantos`| `jsantos123`|
-| Approver   | `mreyes` | `mreyes123` |
-| Approver   | `arose`  | `arose123`  |
-| Approver   | `lvinz`  | `lvinz123`  |
+`DatabaseSeeder` no longer creates fictional demo accounts — it seeds this project's own
+real team accounts (real names/Gmail addresses), matching how it's actually been used
+throughout development. Idempotent via `updateOrCreate()`/`firstOrCreate()` throughout,
+so `php artisan db:seed` is safe to re-run at any time without duplicate-key errors.
 
-> Change these before any real use. `DatabaseSeeder` uses `updateOrCreate()`/`firstOrCreate()`
-> throughout, so `php artisan db:seed` is safe to re-run at any time without duplicate-key errors.
+| Role       | Username  | Password     | Category / Department          |
+|------------|-----------|--------------|---------------------------------|
+| Admin      | `rvinz`   | `rvinz123`   | —                                |
+| Originator | `arose`   | `arose123`   | —                                |
+| Approver   | `lvinz`   | `lvinz123`   | Job Order — Engineering, staff   |
+| Approver   | `cperalta`| `cperalta123`| Job Order — Engineering, head    |
+| Approver   | `vlessur` | `vlessur123` | Job Order — Finance, staff       |
+| Approver   | `gfunelas`| `gfunelas123`| Job Order — Finance, head        |
+
+**On a genuinely fresh device/deployment**, either edit `DatabaseSeeder.php` to use your
+own placeholder accounts first, or be aware that seeding as-is creates accounts under
+real people's real email addresses and emails each one a real verification link (see the
+seeder's own docblock) — harmless with the default `MAIL_MAILER=log` (nothing actually
+sends, it's just written to `storage/logs/laravel.log`), but worth knowing before pointing
+a fresh install at real SMTP/Brevo credentials (§2.6).
 
 ---
 
@@ -188,11 +200,24 @@ sudo loginctl enable-linger $USER
 ```
 Verify anytime with: `systemctl --user status docuwise-queue-worker.service`
 
-### 2.2 The scheduler (safety-net sweeps)
+### 2.2 The scheduler (safety-net sweeps + housekeeping)
 
-Two backstop commands run on a timer regardless of the queue worker's health — see the
-`withSchedule()` closure in `bootstrap/app.php` for exactly what and why. They only fire
-if Laravel's scheduler is driven every minute:
+Five commands run on a timer via the `withSchedule()` closure in `bootstrap/app.php` —
+see that closure for exactly what and why each exists. They only fire if Laravel's
+scheduler is driven every minute:
+
+- `workflow:check-parallel-slas` (every 5 min) and `sla:check` (every 5 min) — the SLA
+  safety-net sweeps that back up the event-driven escalation in §2.1 if the queue worker
+  is ever down.
+- `backup:run` (daily 02:00) — nightly database + storage backup, see §2.4.
+- `records:archive` (daily 02:30) — exports old rows past their retention window to
+  compressed files under `storage/app/archives/` (config in `config/archiving.php`) and
+  deletes only what was archived; `audit_logs` and `document_review_sessions` are
+  deliberately excluded since the Document Tracker reads both live with no archive
+  fallback.
+- `ml:train-time-estimator` (hourly) — retrains the separate approval-time-estimate
+  regression model (not the classification SVM — see §5) for every category/department
+  combo with enough real decision history.
 
 **Production (cron — add once):**
 ```
@@ -388,6 +413,19 @@ is registered in `ml_model_repository` (Table 3.5.5) with its accuracy and sampl
 count, so every classified document records exactly which SVM version produced its
 category. The admin ML dashboard enforces the **5–10 samples per category** rule
 from Scope 1.4.
+
+### A second, separate ML model — approval-time estimation
+
+Everything above is the **classification** SVM. There's a distinct second model powering
+the "Est. Approval by" estimate shown throughout the app (`ApprovalTimeMlService`, `Phpml\
+Regression\LeastSquares`): one Linear Regression model per (category, department) combo,
+predicting how long that combo's next decision will take from two features — the
+deciding approver's own historical average speed and the day of week. It trains fully
+automatically (no admin "train now" button) via `ml:train-time-estimator`, scheduled
+hourly (§2.2), and only activates once a combo has at least `MIN_TRAINING_SAMPLES` (20)
+real decisions — below that, `ApprovalForecastService` falls back to a plain statistical
+average instead, and estimates for stages beyond the immediate next one always use that
+average too, since the model can't know in advance which department handles those.
 
 ### Verified working
 
