@@ -10,7 +10,7 @@ class WorkflowStage extends Model
     protected $primaryKey = 'stage_id';
 
     protected $fillable = [
-        'document_category', 'stage_name', 'sequence_order', 'description', 'is_archived',
+        'document_category', 'stage_name', 'sequence_order', 'description', 'is_archived', 'document_id',
     ];
 
     protected $casts = [
@@ -46,5 +46,25 @@ class WorkflowStage extends Model
     public function scopeForCategory($query, string $category)
     {
         return $query->where('document_category', $category)->orderBy('sequence_order');
+    }
+
+    /**
+     * The real, admin-configured, category-wide pipeline only — excludes
+     * one-off stages created for a single originator-directed document
+     * (see WorkflowService::routeToCustomApprovers() and document_id's
+     * migration docblock). Every admin-facing listing/management query
+     * (Workflow Config, approver stage assignment, category routing
+     * lookups) must go through this rather than querying the table
+     * directly, so a document-scoped stage never appears there or gets
+     * reused for some OTHER document's auto-routing.
+     */
+    public function scopeConfigured($query)
+    {
+        return $query->whereNull('document_id');
+    }
+
+    public function document()
+    {
+        return $this->belongsTo(DocumentRepository::class, 'document_id', 'document_id');
     }
 }

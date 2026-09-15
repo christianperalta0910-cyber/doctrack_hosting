@@ -12,8 +12,9 @@
     tracking.blade.php's sizeDocumentTracker() — a fixed CSS calc() can't do
     this correctly since the header card's own height varies with its
     content: version badge, resubmit form, Imported/Superseded notices,
-    etc.), Approval Stages alone filling the right half. Stacks back to one
-    column on narrow/mobile. Shared by both the Originator's own tracking
+    etc.), Approval Stages plus any open Revision Requests stacked in the
+    right half. Stacks back to one column on narrow/mobile. Shared by both
+    the Originator's own tracking
     page and Admin's Document Tracking module, since both route through
     DocumentController::show() to this same partial.
 --}}
@@ -25,36 +26,53 @@
                     <div class="flex items-center gap-2">
                         <h2 class="text-base font-semibold text-surface-900">{{ $document->title }}</h2>
                         @if($document->version_number > 1)
-                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-50 text-indigo-700">v{{ $document->version_number }}</span>
+                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700">v{{ $document->version_number }}</span>
                         @endif
                         @if($document->is_legacy_import)
-                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-processing-50 text-processing-700">Imported</span>
+                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-processing-50 text-processing-700">Imported</span>
+                        @endif
+                        {{-- Feature: originator-directed routing — a permanent
+                             marker that this document skipped the standard
+                             pipeline in favor of hand-picked approver(s), kept
+                             after routing completes (see WorkflowService::
+                             routeToCustomApprovers()). --}}
+                        @if($document->custom_routed)
+                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700" title="Routed directly to hand-picked approver(s) instead of the standard pipeline">Custom Routed</span>
                         @endif
                         @if($document->requires_printing && in_array($document->global_status, ['approved', 'auto_approved']))
                             @if(auth()->user()->isOriginator())
                                 <button type="button"
                                     onclick="openDocumentViewer('{{ route('documents.file', $document) }}', '{{ $document->mime_type }}', '{{ addslashes($document->original_filename ?? $document->title) }}', {{ $document->document_id }}, true)"
-                                    class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors cursor-pointer">
+                                    class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors cursor-pointer">
                                     🖨 Print Required
                                 </button>
                             @else
-                                <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-50 text-indigo-700">🖨 Print Required</span>
+                                <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700">🖨 Print Required</span>
                             @endif
                         @endif
                     </div>
                     @if($document->is_legacy_import)
-                        <p class="text-xs text-processing-700 mt-1">
+                        <p class="text-sm text-processing-700 mt-1">
                             Imported directly by an administrator — not classified, validated, or peer-reviewed through the normal approval workflow.
                         </p>
                     @endif
                     @if($document->is_security_blocked)
-                        <p class="text-xs text-rejected-700 mt-1">
+                        <p class="text-sm text-rejected-700 mt-1">
                             This upload could not be accepted — it failed an automatic security scan and was blocked before reaching any reviewer.
                             If you believe this is a mistake, resubmit a corrected version below.
                         </p>
                     @endif
+                    @if($document->pending_custom_routing_at && auth()->user()->isOriginator())
+                        <p class="text-sm text-amber-700 mt-1">
+                            Ready to route —
+                            <button type="button"
+                                onclick="openKpiDrilldown('select-approvers', 'Select Approver(s) — {{ addslashes($document->title) }}', '{{ route('originator.documents.selectApprovers', $document) }}')"
+                                class="font-medium hover:underline">select the approver(s)</button>
+                            you'd like this to go to.
+                        </p>
+                    @endif
                     @if($document->previousVersion)
-                        <p class="text-xs text-surface-500 mt-1">
+                        <p class="text-sm text-surface-500 mt-1">
                             Resubmission of
                             <a href="{{ route('originator.documents.show', $document->previousVersion) }}" class="text-primary-700 hover:underline font-medium">
                                 "{{ $document->previousVersion->title }}" (v{{ $document->previousVersion->version_number }})
@@ -62,19 +80,26 @@
                         </p>
                     @endif
                     @if($document->nextVersion)
-                        <p class="text-xs text-rejected-700 mt-1">
+                        <p class="text-sm text-rejected-700 mt-1">
                             Superseded by
                             <a href="{{ route('originator.documents.show', $document->nextVersion) }}" class="hover:underline font-medium">
                                 a resubmitted version (v{{ $document->nextVersion->version_number }})
                             </a> — that one reflects the current state of this request.
                         </p>
                     @endif
-                    <p class="text-xs text-surface-500 mt-1">
-                        Category: <span class="font-medium text-surface-700">{{ $document->ml_category ?? 'Unclassified' }}</span>
-                        @if($document->ml_rechecked_at)
-                            &middot; <span class="text-surface-400">Recheck Confidence: {{ $document->ml_confidence }}% &rarr; {{ $document->ml_recheck_confidence }}%</span>
-                        @elseif($document->ml_confidence)
-                            &middot; Confidence: {{ $document->ml_confidence }}%
+                    <p class="text-sm text-surface-500 mt-1">
+                        Category: <span class="font-medium text-surface-700">{{ $document->display_category ?? 'Unclassified' }}</span>
+                        {{-- Confidence is confidence IN the classifier's
+                             guess — showing it next to "Unclassified"
+                             would read as contradicting itself, since
+                             that guess isn't what's displayed anymore
+                             (see DocumentRepository::display_category). --}}
+                        @if($document->desired_routing !== 'unrelated')
+                            @if($document->ml_rechecked_at)
+                                &middot; <span class="text-surface-400">Recheck Confidence: {{ $document->ml_confidence }}% &rarr; {{ $document->ml_recheck_confidence }}%</span>
+                            @elseif($document->ml_confidence)
+                                &middot; Confidence: {{ $document->ml_confidence }}%
+                            @endif
                         @endif
                         @if($document->readability_score !== null)
                             &middot; Readability: {{ $document->readability_score }}%
@@ -105,17 +130,17 @@
                         <form method="POST" action="{{ route('originator.documents.resubmit', $document) }}" enctype="multipart/form-data" class="mt-3 space-y-3 max-w-sm">
                             @csrf
                             <div>
-                                <label class="block text-xs font-medium text-surface-700 mb-1">Revised document</label>
-                                <input type="file" name="file" required class="w-full text-xs">
+                                <label class="block text-sm font-medium text-surface-700 mb-1">Revised document</label>
+                                <input type="file" name="file" required class="w-full text-sm">
                             </div>
                             <div>
-                                <label class="block text-xs font-medium text-surface-700 mb-1">Due date &amp; time</label>
-                                <p class="text-[11px] text-surface-400 mb-1">Must fall within working hours (9 AM–5 PM, Mon–Sat).</p>
+                                <label class="block text-sm font-medium text-surface-700 mb-1">Due date &amp; time</label>
+                                <p class="text-xs text-surface-400 mb-1">Must fall within working hours (9 AM–5 PM, Mon–Sat).</p>
                                 <input type="datetime-local" id="resubmit-due-date" name="due_date" required min="{{ now()->addMinutes(config('sla.min_due_date_buffer_minutes', 15))->format('Y-m-d\TH:i') }}"
                                     class="w-full rounded-lg border-surface-300 text-sm px-3 py-2">
-                                <p id="resubmit-due-date-warning" class="hidden mt-1 text-[11px] text-rejected-700">This falls outside working hours (9 AM–5 PM, Mon–Sat) or on a holiday — pick a different date/time.</p>
+                                <p id="resubmit-due-date-warning" class="hidden mt-1 text-xs text-rejected-700">This falls outside working hours (9 AM–5 PM, Mon–Sat) or on a holiday — pick a different date/time.</p>
                             </div>
-                            <button class="w-full bg-primary-700 hover:bg-primary-800 text-white text-xs font-medium py-2 rounded-lg">Resubmit</button>
+                            <button class="w-full bg-primary-700 hover:bg-primary-800 text-white text-sm font-medium py-2 rounded-lg">Resubmit</button>
                         </form>
                     </details>
                 </div>
@@ -148,7 +173,7 @@
                          elsewhere on the page (z-30), making Document Tracker
                          labels incorrectly appear on top of it. --}}
                     <thead class="sticky top-0 bg-white">
-                        <tr class="border-b-2 border-surface-200 text-left text-[11px] uppercase tracking-wide text-surface-400">
+                        <tr class="border-b-2 border-surface-200 text-left text-xs uppercase tracking-wide text-surface-400">
                             <th class="px-6 py-2 font-medium border-r border-surface-200">Timestamp</th>
                             <th class="px-4 py-2 font-medium border-r border-surface-200">Action</th>
                             <th class="px-4 py-2 font-medium border-r border-surface-200">Employee</th>
@@ -158,9 +183,9 @@
                     <tbody class="divide-y divide-surface-200">
                         @forelse($movementTimeline as $event)
                             <tr>
-                                <td class="px-6 py-3 text-xs text-surface-400 whitespace-nowrap align-top border-r border-surface-200">{{ $event['timestamp']->format('M j, Y g:i A') }}</td>
+                                <td class="px-6 py-3 text-sm text-surface-400 whitespace-nowrap align-top border-r border-surface-200">{{ $event['timestamp']->format('M j, Y g:i A') }}</td>
                                 <td class="px-4 py-3 align-top border-r border-surface-200">
-                                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold whitespace-nowrap
+                                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold whitespace-nowrap
                                         {{ $event['kind'] === 'session_group' ? 'bg-primary-50 text-primary-700' : 'bg-surface-100 text-surface-600' }}">
                                         {{ $event['label'] }}
                                     </span>
@@ -172,7 +197,7 @@
                                              shown plainly underneath — see
                                              DocumentMovementTimeline::build()'s docblock. --}}
                                         {{ $event['note'] }}
-                                        <p class="mt-1 text-xs text-surface-400">{{ $event['passes_detail'] }}</p>
+                                        <p class="mt-1 text-sm text-surface-400">{{ $event['passes_detail'] }}</p>
                                     @else
                                         {{ $event['note'] }}
                                     @endif
@@ -189,12 +214,85 @@
         </div>
     </div>
 
-    <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
-        <div class="px-6 py-4 border-b border-surface-200">
-            <h3 class="text-sm font-semibold text-surface-900">Approval Stages</h3>
+    {{-- overflow-y-auto + JS-computed max-height (sizeTrackingRightColumn()
+         in tracking.blade.php), same trick #document-tracker-scroll on the
+         left already uses. Approval Stages alone always fit — it was
+         Revision Requests being added underneath it (Feature: editable
+         document) that first made this column tall enough to occasionally
+         outgrow the viewport, forcing <main> — the real page scroll
+         container — to scroll the WHOLE page instead of just this one
+         column scrolling internally. --}}
+    <div id="tracking-right-column" class="space-y-6 overflow-y-auto">
+        <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
+            <div class="px-6 py-4 border-b border-surface-200">
+                <h3 class="text-sm font-semibold text-surface-900">Approval Stages</h3>
+            </div>
+            <div class="p-6">
+                <x-workflow-stage-list :document="$document" />
+            </div>
         </div>
-        <div class="p-6">
-            <x-workflow-stage-list :document="$document" />
-        </div>
+
+        {{-- "Editable document" (Feature: an approver flagged a specific
+             passage — see WorkflowService::requestRevision() — the
+             originator fixes it right here instead of re-uploading a
+             whole new file). Only shown at all once there's something
+             open; only the document's actual owner gets the edit
+             controls (see DocumentRepositoryPolicy::editText()) — an
+             Admin viewing someone else's tracking page sees the same
+             flagged passages, read-only, for context. Sits under
+             Approval Stages rather than in the left column — it's about
+             those same per-approver decisions, not the document's raw
+             activity log next to it on the left. --}}
+        @if($document->openAnnotations->isNotEmpty())
+            <div class="bg-white rounded-xl shadow-card border border-rejected-500/20 p-6">
+                <h3 class="text-sm font-semibold text-surface-900 mb-1">Revision Requests</h3>
+                <p class="text-sm text-surface-500 mb-4">{{ $document->openAnnotations->count() }} open — flagged by a reviewer, not yet addressed.</p>
+
+                @can('editText', $document)
+                    <form method="POST" action="{{ route('originator.documents.saveRevision', $document) }}" class="space-y-4">
+                        @csrf
+                        <ul class="space-y-3">
+                            @foreach($document->openAnnotations as $annotation)
+                                <li class="rounded-lg border border-surface-200 p-3">
+                                    <label class="flex items-start gap-2 cursor-pointer">
+                                        {{-- data-start/data-end (Feature: jump straight to the
+                                             flagged spot in the text below instead of leaving the
+                                             originator to hunt for it — see the delegated 'change'
+                                             listener in tracking.blade.php). Same character
+                                             positions stored against ocr_text when this was raised
+                                             — see DocumentAnnotation's docblock for the one caveat:
+                                             they can drift if an EARLIER partial save already
+                                             changed the surrounding text length while this
+                                             particular flag stayed unresolved. --}}
+                                        <input type="checkbox" name="resolved_annotation_ids[]" value="{{ $annotation->annotation_id }}"
+                                            data-start="{{ $annotation->start_offset }}" data-end="{{ $annotation->end_offset }}"
+                                            class="mt-1 rounded border-surface-300">
+                                        <span class="min-w-0">
+                                            <span class="block text-sm text-surface-800 italic">&ldquo;{{ $annotation->selected_text }}&rdquo;</span>
+                                            <span class="block text-sm text-surface-500 mt-1">{{ $annotation->raisedBy->full_name }}: {{ $annotation->comment }}</span>
+                                        </span>
+                                    </label>
+                                </li>
+                            @endforeach
+                        </ul>
+                        <p class="text-xs text-surface-400">Check off whichever flags this edit addresses — only those reviewers are notified to re-review. Checking one selects the exact flagged passage below so it's not confused with similar-looking text elsewhere in the document.</p>
+                        <div>
+                            <label class="block text-sm font-medium text-surface-700 mb-1">Document text</label>
+                            <textarea id="revision-text-editor" name="text" rows="10" required class="w-full rounded-lg border-surface-300 text-sm px-3 py-2 font-mono">{{ $document->ocr_text }}</textarea>
+                        </div>
+                        <button type="submit" class="bg-primary-700 hover:bg-primary-800 text-white text-sm font-semibold px-4 py-2.5 rounded-lg">Save Revision</button>
+                    </form>
+                @else
+                    <ul class="space-y-3">
+                        @foreach($document->openAnnotations as $annotation)
+                            <li class="rounded-lg border border-surface-200 p-3">
+                                <span class="block text-sm text-surface-800 italic">&ldquo;{{ $annotation->selected_text }}&rdquo;</span>
+                                <span class="block text-sm text-surface-500 mt-1">{{ $annotation->raisedBy->full_name }}: {{ $annotation->comment }}</span>
+                            </li>
+                        @endforeach
+                    </ul>
+                @endcan
+            </div>
+        @endif
     </div>
 </div>

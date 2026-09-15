@@ -82,6 +82,27 @@ class DocumentReviewSession extends Model
     }
 
     /**
+     * Whether $user opening $document right now counts as an active
+     * review session — shared by every entry point that can open/
+     * heartbeat/close one: DocumentController::viewFile()/presence()/
+     * presenceLeave() (the "View original file" popup) and
+     * ApprovalController::annotationsPanel() (the "Review & Comment"
+     * popup, given feature parity with the file viewer). Any approver or
+     * admin, while the document as a whole hasn't been judged yet —
+     * deliberately NOT narrowed to "is it specifically this person's seat
+     * pending right now", since that used to mean a second approver whose
+     * seat wasn't the currently-active one never got tracked at all.
+     */
+    public static function countsAsActiveReviewer(DocumentRepository $document, User $user): bool
+    {
+        if (!$user->isApprover() && !$user->isAdmin()) {
+            return false;
+        }
+
+        return !in_array($document->global_status, ['approved', 'rejected', 'auto_approved'], true);
+    }
+
+    /**
      * For the "currently reviewing" presence icon specifically — stillOpen()
      * alone with no recency bound, since a session only ever explicitly
      * closes when the approver submits a decision (see closeFor()), an
@@ -139,6 +160,32 @@ class DocumentReviewSession extends Model
      * correctly reads as a second review pass rather than losing the
      * earlier time entirely.
      */
+    /**
+     * Like openFor(), but a no-op if $user already has a still-open
+     * session on $document — for an entry point that can legitimately be
+     * fetched more than once for the same open "visit", unlike viewFile()
+     * (hit exactly once per real navigation/iframe load). ApprovalController::
+     * annotationsPanel() is exactly that: it's also the URL the Approver
+     * Queue's own live-refresh re-fetches on every '.document.status-changed'
+     * broadcast — and opening a session fires exactly that broadcast (see
+     * notifyStakeholders() above). Calling openFor() unconditionally there
+     * meant every refresh opened ANOTHER session, which broadcast AGAIN,
+     * which refreshed AGAIN — a self-sustaining loop that also permanently
+     * froze the review-time countdown (each loop tick replaced the ticking
+     * countdown's DOM before it ever advanced).
+     */
+    public static function openForIfNotAlreadyOpen(DocumentRepository $document, User $user): void
+    {
+        $alreadyOpen = static::stillOpen()
+            ->where('document_id', $document->document_id)
+            ->where('user_id', $user->user_id)
+            ->exists();
+
+        if (!$alreadyOpen) {
+            static::openFor($document, $user);
+        }
+    }
+
     public static function openFor(DocumentRepository $document, User $user): self
     {
         $hasPriorClosedSession = static::where('document_id', $document->document_id)

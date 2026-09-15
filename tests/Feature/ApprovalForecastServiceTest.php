@@ -86,6 +86,11 @@ test('pads the estimate for a next-stage approver who already has a deep pending
     $workflow = app(WorkflowService::class);
     $forecast = app(ApprovalForecastService::class);
 
+    // Wednesday mid-morning — a fixed, known-safe business-hours moment so
+    // the 1-hour gap below lands entirely inside the same working window
+    // regardless of when the test suite itself happens to run.
+    $this->travelTo(\Carbon\Carbon::parse('2026-08-12 10:00:00'));
+
     // History so avg-per-stage isn't null AND non-zero — decided a
     // simulated hour after routing, so the queue-depth padding below has
     // something non-trivial to multiply against.
@@ -124,11 +129,13 @@ test('the rendered "Est. Approval by" respects business hours instead of raw wal
     // now()->addSeconds() would have shown before this was fixed.
     $this->travelTo(\Carbon\Carbon::parse('2026-08-14 16:45:00'));
 
-    // 10-hour historical decision time so avgSecondsPerStage is large
-    // enough to guarantee the estimate crosses out of today's window.
+    // Historical decision made Saturday at noon — since the average is now
+    // itself business-hours-aware, this is Friday's remaining 15 minutes
+    // plus 3 real business hours of Saturday, comfortably enough to guarantee
+    // the projected estimate crosses out of today's window.
     $history = forecastDoc($originator);
     $workflow->routeToWorkflow($history);
-    $this->travel(10)->hours();
+    $this->travelTo(\Carbon\Carbon::parse('2026-08-15 12:00:00'));
     $workflow->decide(DocumentAssignment::where('document_id', $history->document_id)->first(), $approver, 'approved');
 
     $this->travelTo(\Carbon\Carbon::parse('2026-08-14 16:45:00'));

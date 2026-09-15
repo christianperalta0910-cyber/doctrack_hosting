@@ -31,7 +31,7 @@ function classifiedJobOrderDueIn(User $originator, int $minutesUntilDue): Docume
     ]);
 }
 
-function escalatableAssignment(int $minutesUntilDue = 60 * 24): DocumentAssignment
+function escalatableAssignment(int $minutesUntilDue = 60 * 24, bool $needsApprover = false): DocumentAssignment
 {
     $originator = User::factory()->originator()->create();
     $approver = User::factory()->approver('Job Order')->create();
@@ -55,6 +55,8 @@ function escalatableAssignment(int $minutesUntilDue = 60 * 24): DocumentAssignme
         'priority_rank' => 2,
         'individual_status' => 'pending',
         'sla_expires_at' => now()->subMinutes(5),
+        'needs_approver' => $needsApprover,
+        'needs_approver_at' => $needsApprover ? now()->subHours(1) : null,
     ]);
 }
 
@@ -88,33 +90,11 @@ test('an approver does NOT get the extra URGENT notification when their new assi
         ->exists())->toBeFalse();
 });
 
-// --- Admin "short grace window" notification (SlaService::escalate()) ---
-
-test('admins get a separate URGENT notification when the computed grace window is already short', function () {
-    $admin = User::factory()->admin()->create();
-    // due_date only 2 hours out -> the flat 6-hour grace would blow past
-    // it, so adminGraceExpiresAt() halves the remainder (~1 hour) — well
-    // under the 2-hour short-grace threshold.
-    $assignment = escalatableAssignment(120);
-
-    app(SlaService::class)->escalate($assignment);
-
-    expect(NotificationRecord::where('recipient_id', $admin->user_id)
-        ->where('priority', 'high')
-        ->where('message_body', 'like', '%very short grace window%')
-        ->exists())->toBeTrue();
-});
-
-test('admins do NOT get the short-grace notification when the flat 6-hour grace window comfortably fits before due_date', function () {
-    $admin = User::factory()->admin()->create();
-    $assignment = escalatableAssignment(60 * 24 * 3); // 3 days out -> flat 6h grace applies
-
-    app(SlaService::class)->escalate($assignment);
-
-    expect(NotificationRecord::where('recipient_id', $admin->user_id)
-        ->where('message_body', 'like', '%very short grace window%')
-        ->exists())->toBeFalse();
-});
+// The "short grace window" notification (old SlaService::escalate()'s
+// needs_approver branch) is gone along with the grace window itself — a
+// needs_approver seat now auto-approves the instant ITS OWN deadline
+// passes, same as a real approver's miss, so there's no second window
+// left to warn about.
 
 test('escalate() no longer sends any email — SLA escalation is in-app/notification only now', function () {
     Mail::fake();
@@ -127,9 +107,17 @@ test('escalate() no longer sends any email — SLA escalation is in-app/notifica
     Mail::assertNothingSent();
 });
 
-// --- Two-stage auto-approval review reminder (SlaService::remindUnreviewedAutoApprovals()) ---
+// --- Late-review tracking (SlaService::trackLateReviews()) ---
 
-function unreviewedAutoApproval(int $minutesUntilDue): DocumentAssignment
+/**
+ * $reviewDueOffsetMinutes is relative to now — negative means
+ * review_due_at has already passed (the 6-hour Admin review window
+ * elapsed, see SlaService::autoApproveOne()), positive means it's still
+ * ahead. Due date is deliberately always far in the future here — the
+ * reminder is triggered by review_due_at now, not due-date proximity
+ * (see remindUnreviewedAutoApprovals()'s docblock for why).
+ */
+function unreviewedAutoApproval(int $reviewDueOffsetMinutes): DocumentAssignment
 {
     $originator = User::factory()->originator()->create();
     $approver = User::factory()->approver('Job Order')->create();
@@ -140,7 +128,7 @@ function unreviewedAutoApproval(int $minutesUntilDue): DocumentAssignment
         'title' => 'unreviewed-auto-approval.txt',
         'file_path' => 'documents/unreviewed-auto-approval.txt',
         'mime_type' => 'text/plain',
-        'due_date' => now()->addMinutes($minutesUntilDue),
+        'due_date' => now()->addDays(3),
         'global_status' => 'auto_approved',
         'ml_category' => 'Job Order',
     ]);
@@ -155,46 +143,65 @@ function unreviewedAutoApproval(int $minutesUntilDue): DocumentAssignment
         'auto_approved' => true,
         'acted_at' => now()->subHour(),
         'sla_expires_at' => now()->subHours(13),
+        'review_due_at' => now()->addMinutes($reviewDueOffsetMinutes),
     ]);
 }
 
-test('an unreviewed auto-approval with an approaching due date triggers one reminder to every admin', function () {
+test('an unreviewed auto-approval already past its review window triggers one reminder to every admin and opens an Admin violation', function () {
     $admin = User::factory()->admin()->create();
-    $assignment = unreviewedAutoApproval(20); // due in 20 minutes, under the 30-minute reminder threshold
+    $assignment = unreviewedAutoApproval(-10); // review_due_at was 10 minutes ago
 
-    $sent = app(SlaService::class)->sweep()['review_reminders_sent'];
+    $sent = app(SlaService::class)->sweep()['late_review_reminders_sent'];
+
+    $violation = \App\Models\AdminViolation::where('assignment_id', $assignment->assignment_id)->where('violation_type', 'late_review')->first();
 
     expect($sent)->toBe(1)
-        ->and($assignment->fresh()->review_reminder_sent_at)->not->toBeNull()
+        ->and($violation)->not->toBeNull()
+        ->and($violation->resolved_at)->toBeNull() // still open — nobody's reviewed it yet
+        ->and($violation->notification_count)->toBe(1)
         ->and(NotificationRecord::where('recipient_id', $admin->user_id)
             ->where('priority', 'high')
             ->where('message_body', 'like', '%auto-approved%still hasn\'t been reviewed%')
             ->exists())->toBeTrue();
 });
 
-test('an unreviewed auto-approval with a due date still far away does not trigger a reminder yet', function () {
-    unreviewedAutoApproval(60 * 5); // due in 5 hours — well outside the 30-minute window
+test('an unreviewed auto-approval still within its review window does not trigger a reminder yet', function () {
+    unreviewedAutoApproval(60 * 5); // review_due_at is still 5 hours away
 
-    $sent = app(SlaService::class)->sweep()['review_reminders_sent'];
+    $sent = app(SlaService::class)->sweep()['late_review_reminders_sent'];
 
     expect($sent)->toBe(0);
 });
 
-test('the reminder only fires once — a second sweep does not re-notify', function () {
+test('the reminder does not repeat within the same hour — a second sweep right after does not re-notify', function () {
     User::factory()->admin()->create();
-    unreviewedAutoApproval(20);
+    $assignment = unreviewedAutoApproval(-10);
 
-    $first = app(SlaService::class)->sweep()['review_reminders_sent'];
-    $second = app(SlaService::class)->sweep()['review_reminders_sent'];
+    $first = app(SlaService::class)->sweep()['late_review_reminders_sent'];
+    $second = app(SlaService::class)->sweep()['late_review_reminders_sent'];
 
     expect($first)->toBe(1)->and($second)->toBe(0);
+    // Still exactly one violation row — the second sweep updated it in
+    // place rather than creating a duplicate.
+    expect(\App\Models\AdminViolation::where('assignment_id', $assignment->assignment_id)->count())->toBe(1);
 });
 
-test('a reviewed auto-approval never triggers the reminder, regardless of due date', function () {
-    $assignment = unreviewedAutoApproval(20);
+test('the reminder fires again once an hour has passed since the last one', function () {
+    User::factory()->admin()->create();
+    unreviewedAutoApproval(-10);
+
+    app(SlaService::class)->sweep();
+    $this->travel(61)->minutes();
+    $sent = app(SlaService::class)->sweep()['late_review_reminders_sent'];
+
+    expect($sent)->toBe(1);
+});
+
+test('a reviewed auto-approval never triggers the reminder, regardless of its review window', function () {
+    $assignment = unreviewedAutoApproval(-10);
     $assignment->update(['admin_reviewed_at' => now(), 'admin_review_outcome' => 'confirmed']);
 
-    $sent = app(SlaService::class)->sweep()['review_reminders_sent'];
+    $sent = app(SlaService::class)->sweep()['late_review_reminders_sent'];
 
     expect($sent)->toBe(0);
 });

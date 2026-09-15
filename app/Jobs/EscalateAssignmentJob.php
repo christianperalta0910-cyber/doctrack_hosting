@@ -58,6 +58,21 @@ class EscalateAssignmentJob implements ShouldQueue
             return; // resolved, already escalated, or a newer deadline superseded this job
         }
 
+        // Belt-and-suspenders, matching AutoApproveAssignmentJob's own
+        // guard: the queue's delay() is what's supposed to guarantee this
+        // never runs before the deadline, but the 'sync' driver (tests —
+        // see phpunit.xml) ignores delay() and runs jobs immediately on
+        // dispatch. A document with a very tight due_date can be born
+        // with an SLA window that's already elapsed by the time this
+        // executes; without this check, escalate() (now auto-approving
+        // immediately for a real approver miss — see SlaService::
+        // escalateApproverMiss()) would cascade through every remaining
+        // stage synchronously, right inside the original request, instead
+        // of only ever firing once the deadline genuinely arrives.
+        if (now()->lt($assignment->sla_expires_at)) {
+            return;
+        }
+
         $sla->escalate($assignment);
     }
 }

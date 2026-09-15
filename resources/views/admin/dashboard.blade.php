@@ -9,6 +9,64 @@
     </div>
 </div>
 
+{{-- Shared KPI card tooltip — ONE element, positioned via JS with
+     position:fixed (not CSS absolute) so it can render above the card
+     without being clipped by <main>'s overflow-y-auto (a fixed-position
+     element is relative to the viewport, immune to any ancestor's
+     overflow/scroll clipping — see openKpiTooltip() below). Lives outside
+     #admin-overview so it survives every live-refresh swap of that
+     wrapper; the buttons inside it just carry a data-kpi-tooltip
+     attribute the delegated listener below reads fresh each time. --}}
+<div id="kpi-tooltip" class="hidden fixed z-50 rounded-lg bg-surface-900 px-3 py-2 text-xs leading-snug text-white shadow-lg pointer-events-none"></div>
+
+<script>
+    (function () {
+        const tooltip = document.getElementById('kpi-tooltip');
+
+        function openKpiTooltip(card) {
+            const description = card.dataset.kpiTooltip;
+            if (!description || !tooltip) return;
+
+            tooltip.textContent = description;
+            tooltip.classList.remove('hidden');
+
+            const rect = card.getBoundingClientRect();
+            tooltip.style.left = rect.left + 'px';
+            tooltip.style.width = rect.width + 'px';
+            // Above the card — measure the tooltip's own height AFTER it
+            // has content/is visible, so this works regardless of how many
+            // lines the description wraps to.
+            tooltip.style.top = (rect.top - tooltip.getBoundingClientRect().height - 8) + 'px';
+        }
+
+        function closeKpiTooltip() {
+            if (tooltip) tooltip.classList.add('hidden');
+        }
+
+        // Delegated on <body> (not #admin-overview) so it keeps working
+        // across every live-refresh swap without needing to be rebound —
+        // mouseover/mouseout bubble (unlike mouseenter/mouseleave), so
+        // .closest() below is what limits this to actually entering/
+        // leaving a KPI card rather than firing on every pixel of movement.
+        document.body.addEventListener('mouseover', function (e) {
+            const card = e.target.closest('[data-kpi-tooltip]');
+            if (card) openKpiTooltip(card);
+        });
+        document.body.addEventListener('mouseout', function (e) {
+            const card = e.target.closest('[data-kpi-tooltip]');
+            if (card && !card.contains(e.relatedTarget)) closeKpiTooltip();
+        });
+        document.body.addEventListener('focusin', function (e) {
+            const card = e.target.closest('[data-kpi-tooltip]');
+            if (card) openKpiTooltip(card);
+        });
+        document.body.addEventListener('focusout', function (e) {
+            const card = e.target.closest('[data-kpi-tooltip]');
+            if (card) closeKpiTooltip();
+        });
+    })();
+</script>
+
 <script>
     // Live-updates the KPI cards + SLA alerts without a full page reload —
     // instant via Reverb (see startLiveChannel in resources/js/app.js) the
@@ -48,12 +106,35 @@
         scrollEl.style.maxHeight = Math.max(available - 8, 90) + 'px';
     }
 
+    // The Auto-Approval Alerts/Unassigned Documents column (see
+    // overview.blade.php's matching comment) needs to match the Analytics
+    // card's height exactly, not just "whichever of the two naturally
+    // needs more room" — CSS grid's default stretch behavior gives the
+    // latter, which at wide viewports (Analytics needs less height there,
+    // real per-document alert rows don't shrink) left dead space under
+    // Analytics instead of matching it. Measuring and setting this
+    // explicitly, same technique as sizeRecentActivity() above, is what
+    // actually pins it to Analytics specifically regardless of viewport
+    // width. Must run BEFORE sizeRecentActivity(), which measures against
+    // wherever this column's bottom edge lands.
+    function sizeAlertColumn() {
+        const analyticsCard = document.getElementById('admin-analytics-card');
+        const alertsColumn = document.getElementById('admin-alerts-column');
+        if (!analyticsCard || !alertsColumn) return;
+
+        alertsColumn.style.height = analyticsCard.getBoundingClientRect().height + 'px';
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         const overviewEl = document.getElementById('admin-overview');
         if (!overviewEl) return;
 
+        sizeAlertColumn();
         sizeRecentActivity();
-        window.addEventListener('resize', sizeRecentActivity);
+        window.addEventListener('resize', function () {
+            sizeAlertColumn();
+            sizeRecentActivity();
+        });
 
         const opts = {
             refreshUrl: overviewEl.dataset.refreshUrl,
@@ -86,7 +167,16 @@
 
             fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
                 .then((r) => r.text())
-                .then((html) => { panelEl.innerHTML = html; })
+                .then((html) => {
+                    panelEl.innerHTML = html;
+                    // The Analytics card's height can change once the
+                    // fetched panel content actually lands (it renders
+                    // empty until then) — re-measure against it now,
+                    // not just at swap time, or the alerts column can be
+                    // pinned to a too-short pre-fetch height.
+                    sizeAlertColumn();
+                    sizeRecentActivity();
+                })
                 .catch(() => {});
         }
 
@@ -189,6 +279,7 @@
         // a different height than before.
         opts.onSwap = function (signalData) {
             loadAnalyticsPanel(signalData);
+            sizeAlertColumn();
             sizeRecentActivity();
         };
 

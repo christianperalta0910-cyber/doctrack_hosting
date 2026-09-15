@@ -58,7 +58,7 @@ it('renders the redesigned Analytics panel with real KPI/category/backlog data',
     $response->assertSee('Approval Rate');
     $response->assertSee('Auto-Approval Rate');
     $response->assertSee('SLA Violation Rate');
-    $response->assertSee('Category Volume');
+    $response->assertSee('Unassigned Documents');
     $response->assertSee('Currently in progress');
     $response->assertSee('View detailed breakdown');
 });

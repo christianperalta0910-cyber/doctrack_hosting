@@ -43,7 +43,7 @@ function violationIn(string $category, string $stageName = 'Review'): SlaViolati
     ]);
 }
 
-test('visiting the bare SLA violations URL shows category folders, not the results list', function () {
+test('visiting the bare SLA violations URL shows category folders, not the approver/admin tables', function () {
     $admin = User::factory()->admin()->create();
     violationIn('Job Order');
 
@@ -52,7 +52,7 @@ test('visiting the bare SLA violations URL shows category folders, not the resul
     $response->assertOk();
     $response->assertSee('Browse by Category');
     $response->assertSee('Job Order');
-    $response->assertDontSee('Search document');
+    $response->assertDontSee('Approvers — Violation Counts');
 });
 
 test('the stat cards and approver roster stay hidden on the folder-grid screen, so nothing looks pre-filtered before a category is picked', function () {
@@ -65,10 +65,10 @@ test('the stat cards and approver roster stay hidden on the folder-grid screen, 
     $response->assertDontSee('Total Violations');
     $response->assertDontSee('Top Category');
     $response->assertDontSee('Avg. Minutes Overdue');
-    $response->assertDontSee('View All Approvers');
+    $response->assertDontSee('Approvers — Violation Counts');
 });
 
-test('the stat cards and approver roster appear once a category is picked, scoped to it', function () {
+test('the stat cards and approver table appear once a category is picked, scoped to it', function () {
     $admin = User::factory()->admin()->create();
     violationIn('Job Order');
     violationIn('Service Report');
@@ -78,11 +78,11 @@ test('the stat cards and approver roster appear once a category is picked, scope
     $response->assertOk();
     $response->assertSee('Total Violations');
     $response->assertSee('Top Category');
-    $response->assertSee('View All Approvers');
+    $response->assertSee('Approvers — Violation Counts');
     $response->assertSee('Disputed');
 });
 
-test('clicking into a category folder shows the search panel and scoped results', function () {
+test('clicking into a category folder shows the Admin/Approver tables and hides the folder grid', function () {
     $admin = User::factory()->admin()->create();
     violationIn('Job Order');
     violationIn('Service Report');
@@ -90,20 +90,9 @@ test('clicking into a category folder shows the search panel and scoped results'
     $response = $this->actingAs($admin)->get(route('admin.sla.violations', ['category' => 'Job Order']));
 
     $response->assertOk();
-    $response->assertSee('Search document');
+    $response->assertSee('Admin Violations');
+    $response->assertSee('Approvers — Violation Counts');
     $response->assertDontSee('Browse by Category');
-});
-
-test('the Clear link keeps the selected category instead of bouncing back to the folder grid', function () {
-    $admin = User::factory()->admin()->create();
-    violationIn('Job Order');
-
-    $response = $this->actingAs($admin)->get(route('admin.sla.violations', ['category' => 'Job Order']));
-
-    // The Clear link must only drop document/date_from/date_to — dropping
-    // category too would flip $showFolders back to true and silently
-    // bounce the admin out of the category they were looking at.
-    $response->assertSee('?category=Job+Order" class="text-xs font-medium text-surface-500', false);
 });
 
 test('the Top Category card reflects the category with the most breaches', function () {
@@ -129,17 +118,4 @@ test('the Disputed card counts violations whose document was later disputed', fu
     $response = $this->actingAs($admin)->get(route('admin.sla.violations', ['category' => 'Job Order']));
 
     expect($response->viewData('disputedCount'))->toBe(1);
-});
-
-test('the refresh endpoint returns only the results fragment', function () {
-    $admin = User::factory()->admin()->create();
-    violationIn('Job Order', 'Findable Stage Name');
-
-    $response = $this->actingAs($admin)->get(route('admin.sla.violations.refresh', ['category' => 'Job Order']));
-
-    $response->assertOk();
-    $response->assertSee('Findable Stage Name');
-    $response->assertDontSee('<html', false);
-    $response->assertDontSee('Browse by Category');
-    $response->assertDontSee('Total Violations');
 });

@@ -105,7 +105,7 @@
                                       data-live-urgent-under="3600">
                                     ({{ $realRemainingLabel }})
                                 </span>
-                                before this escalates to the SLA Override Queue.
+                                before this auto-approves and moves to the Auto-Approval Review page.
                             </p>
                         </div>
 

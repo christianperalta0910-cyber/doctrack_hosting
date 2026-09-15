@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\AdminViolation;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentRepository;
 use App\Models\NotificationRecord;
@@ -77,21 +78,13 @@ it('paginates the ML Review Queue and Readability Review Queue at 5 per page eac
     $page2->assertOk();
 });
 
-it('paginates the SLA Override Queue and Auto-Approved section at 2 per page each, independently', function () {
+it('paginates the Auto-Approval Review queue at 2 per page', function () {
     $admin = User::factory()->admin()->create();
     $approver = User::factory()->approver('Job Order')->create();
     WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
 
     for ($i = 0; $i < 3; $i++) {
-        $doc = paginationDoc($approver, ['global_status' => 'processing']);
-        DocumentAssignment::create([
-            'document_id' => $doc->document_id, 'user_id' => $approver->user_id,
-            'stage_id' => WorkflowStage::first()->stage_id, 'due_date' => $doc->due_date,
-            'priority_rank' => 2, 'individual_status' => 'pending', 'sla_expires_at' => now()->subHour(),
-            'escalated_to_admin' => true, 'escalated_at' => now()->subMinutes(30),
-        ]);
-
-        $autoDoc = paginationDoc($approver, ['global_status' => 'approved']);
+        $autoDoc = paginationDoc($approver, ['title' => "auto-{$i}.txt", 'global_status' => 'approved']);
         DocumentAssignment::create([
             'document_id' => $autoDoc->document_id, 'user_id' => $approver->user_id,
             'stage_id' => WorkflowStage::first()->stage_id, 'due_date' => $autoDoc->due_date,
@@ -100,15 +93,12 @@ it('paginates the SLA Override Queue and Auto-Approved section at 2 per page eac
         ]);
     }
 
-    // 3 escalated + 3 auto-approved, each over the 2/page bar.
+    // 3 auto-approved documents, over the 2/page bar.
     $response = $this->actingAs($admin)->get(route('admin.sla.queue'));
-    $response->assertOk();
+    $response->assertOk()->assertViewHas('reviewContainers', fn ($containers) => $containers->total() === 3 && $containers->count() === 2);
 
-    // Paging the escalated section to page 2 must not also page the auto-approved section.
     $page2 = $this->actingAs($admin)->get(route('admin.sla.queue', ['page' => 2]));
-    $page2->assertOk();
-    $autoPage2 = $this->actingAs($admin)->get(route('admin.sla.queue', ['auto_approved_page' => 2]));
-    $autoPage2->assertOk();
+    $page2->assertOk()->assertViewHas('reviewContainers', fn ($containers) => $containers->count() === 1);
 });
 
 it('honors both pagination params at once on the ML Training refresh fragment (Feature: AJAX pagination)', function () {
@@ -137,20 +127,12 @@ it('honors both pagination params at once on the ML Training refresh fragment (F
     $response->assertDontSee('ml-0.txt')->assertDontSee('read-0.txt');
 });
 
-it('honors both pagination params at once on the SLA Queue refresh fragment (Feature: AJAX pagination)', function () {
+it('honors the pagination param on the SLA Queue refresh fragment (Feature: AJAX pagination)', function () {
     $admin = User::factory()->admin()->create();
     $approver = User::factory()->approver('Job Order')->create();
     WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
 
     for ($i = 0; $i < 3; $i++) {
-        $doc = paginationDoc($approver, ['title' => "esc-{$i}.txt", 'global_status' => 'processing']);
-        DocumentAssignment::create([
-            'document_id' => $doc->document_id, 'user_id' => $approver->user_id,
-            'stage_id' => WorkflowStage::first()->stage_id, 'due_date' => $doc->due_date,
-            'priority_rank' => 2, 'individual_status' => 'pending', 'sla_expires_at' => now()->subHour(),
-            'escalated_to_admin' => true, 'escalated_at' => now()->subMinutes(30),
-        ]);
-
         $autoDoc = paginationDoc($approver, ['title' => "auto-{$i}.txt", 'global_status' => 'approved']);
         DocumentAssignment::create([
             'document_id' => $autoDoc->document_id, 'user_id' => $approver->user_id,
@@ -160,12 +142,10 @@ it('honors both pagination params at once on the SLA Queue refresh fragment (Fea
         ]);
     }
 
-    $response = $this->actingAs($admin)->get(route('admin.sla.queue.refresh', ['page' => 2, 'auto_approved_page' => 2]));
+    $response = $this->actingAs($admin)->get(route('admin.sla.queue.refresh', ['page' => 2]));
 
     $response->assertOk();
-    // Page 2 of a 3-item/2-per-page list has exactly 1 item left, for BOTH
-    // sections at once — proves neither param was dropped/overwritten by the other.
-    $response->assertDontSee('esc-0.txt')->assertDontSee('esc-1.txt')->assertSee('esc-2.txt');
+    // Page 2 of a 3-item/2-per-page list has exactly 1 item left.
     $response->assertDontSee('auto-0.txt')->assertDontSee('auto-1.txt')->assertSee('auto-2.txt');
 });
 
@@ -225,23 +205,22 @@ it('paginates the Originator "Upload & Track Documents" list at 5 per page', fun
     $this->actingAs($originator)->get(route('originator.dashboard'))->assertSee('Next');
 });
 
-it('paginates SLA Violations at 5 per page', function () {
+it('paginates Admin Violations at 5 per page', function () {
     $admin = User::factory()->admin()->create();
     $originator = User::factory()->originator()->create();
-    $approver = User::factory()->approver('Job Order')->create();
-    WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
+    $stage = WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
 
     for ($i = 0; $i < 6; $i++) {
-        $doc = paginationDoc($originator, ['global_status' => 'processing']);
+        $doc = paginationDoc($originator, ['global_status' => 'auto_approved']);
         $assignment = DocumentAssignment::create([
-            'document_id' => $doc->document_id, 'user_id' => $approver->user_id,
-            'stage_id' => WorkflowStage::first()->stage_id, 'due_date' => $doc->due_date,
-            'priority_rank' => 2, 'individual_status' => 'pending', 'sla_expires_at' => now()->subHour(),
+            'document_id' => $doc->document_id, 'user_id' => null,
+            'stage_id' => $stage->stage_id, 'due_date' => $doc->due_date,
+            'priority_rank' => 2, 'individual_status' => 'approved', 'auto_approved' => true,
         ]);
-        SlaViolation::create([
+        AdminViolation::create([
             'document_id' => $doc->document_id, 'assignment_id' => $assignment->assignment_id,
-            'approver_id' => $approver->user_id, 'violation_timestamp' => now(),
-            'duration_overdue' => 3600, 'stage_name' => 'Review',
+            'violation_type' => 'missed_approval', 'stage_name' => 'Review',
+            'first_violated_at' => now(), 'resolved_at' => now(),
         ]);
     }
 

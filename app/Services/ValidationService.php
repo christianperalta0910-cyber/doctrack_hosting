@@ -88,6 +88,38 @@ class ValidationService
     }
 
     /**
+     * For a document the originator flagged as not belonging to any of
+     * the trained categories (DocumentRepository::desired_routing ===
+     * 'unrelated' — see WorkflowService::ingest()) — none of validate()'s
+     * checks apply here: required_sections and the vocabulary-based
+     * readability score are both defined per category, and there's no
+     * real category to check against (the classifier's guess is kept for
+     * reference only, never authoritative for this document). This is a
+     * bare sanity filter instead — not "does this look like a Job
+     * Order," just "is there actually meaningful content here" — so an
+     * obviously blank/garbage upload still doesn't reach a human
+     * approver, without pretending to validate something it can't.
+     *
+     * @return array{is_valid: bool, errors: array<int,string>, readability_score: ?int, readability_only_failure: bool}
+     */
+    public function validateGeneric(string $text): array
+    {
+        $minWordCount = config('ml.generic_min_word_count', 20);
+        $wordCount = str_word_count($text);
+
+        if ($wordCount < $minWordCount) {
+            return [
+                'is_valid' => false,
+                'errors' => ["Document content is too short ({$wordCount} words; minimum {$minWordCount}). Possible incomplete submission."],
+                'readability_score' => null,
+                'readability_only_failure' => false,
+            ];
+        }
+
+        return ['is_valid' => true, 'errors' => [], 'readability_score' => null, 'readability_only_failure' => false];
+    }
+
+    /**
      * A real-word-ratio heuristic, not semantic understanding — true
      * "is this professional/nonsense" detection isn't reliable at this
      * project's scale. This only catches text where most tokens simply

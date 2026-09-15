@@ -1,6 +1,6 @@
 <?php
 
-use App\Models\AuditLog;
+use App\Models\AdminViolation;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentRepository;
 use App\Models\NotificationRecord;
@@ -61,35 +61,28 @@ test('markNeedsApprover() gives the seat its own SLA deadline instead of leaving
         ->and($assignment->escalated_to_admin)->toBeFalse(); // not yet — only once that deadline actually lapses
 });
 
-test('once the deadline lapses, the seat escalates without blaming the deactivated approver', function () {
-    [$admin, $oldApprover, $assignment] = orphanedAssignment();
+test('once the deadline lapses, the seat auto-approves immediately, logging an Admin violation instead of blaming the deactivated approver', function () {
+    [, $oldApprover, $assignment] = orphanedAssignment();
     $assignment->update(['sla_expires_at' => now()->subMinutes(5)]);
 
     app(SlaService::class)->escalate($assignment->fresh());
 
     $fresh = $assignment->fresh();
-    expect($fresh->escalated_to_admin)->toBeTrue()
-        ->and($fresh->escalated_at)->not->toBeNull()
+    expect($fresh->individual_status)->toBe('approved')
+        ->and($fresh->auto_approved)->toBeTrue()
         // The whole point: this must never count against the old approver's record.
-        ->and(SlaViolation::where('assignment_id', $fresh->assignment_id)->exists())->toBeFalse();
-
-    expect(AuditLog::where('document_id', $fresh->document_id)->where('action_type', 'sla_escalation')->first()->description)
-        ->toContain('no eligible')
-        ->not->toContain('exceeded its SLA window'); // that phrasing is reserved for a real approver miss
+        ->and(SlaViolation::where('assignment_id', $fresh->assignment_id)->exists())->toBeFalse()
+        ->and(AdminViolation::where('assignment_id', $fresh->assignment_id)->where('violation_type', 'missed_approval')->exists())->toBeTrue();
 
     // markNeedsApprover() already sent its own "needs an approver"
-    // notification when first flagged — this checks for the SEPARATE one
-    // escalate() sends once the deadline actually lapses, not that one.
-    $notification = NotificationRecord::where('recipient_id', $admin->user_id)
-        ->where('document_id', $fresh->document_id)->where('priority', 'high')
-        ->where('message_body', 'like', '%deadline has now passed%')->first();
-    expect($notification)->not->toBeNull()
-        ->and($notification->message_body)
-        ->toContain('no eligible')
-        ->not->toContain('approver: ' . $oldApprover->full_name);
+    // notification when first flagged; the auto-approval itself sends the
+    // Originator/Admin notifications autoApproveOne() always sends —
+    // neither should ever name the deactivated old approver as at fault.
+    $notification = NotificationRecord::where('document_id', $fresh->document_id)->where('priority', 'high')->get();
+    expect($notification->contains(fn ($n) => str_contains($n->message_body, 'approver: ' . $oldApprover->full_name)))->toBeFalse();
 });
 
-test('once escalated, the seat disappears from Unassigned Documents and appears in the SLA Override Queue', function () {
+test('once auto-approved, the seat disappears from Unassigned Documents and appears in Auto-Approved — Awaiting Review', function () {
     [$admin, , $assignment] = orphanedAssignment();
     $assignment->update(['sla_expires_at' => now()->subMinutes(5)]);
     app(SlaService::class)->escalate($assignment->fresh());
@@ -98,22 +91,7 @@ test('once escalated, the seat disappears from Unassigned Documents and appears 
     $unassigned->assertViewHas('containers', fn ($paginator) => $paginator->total() === 0);
 
     $slaQueue = $this->actingAs($admin)->get(route('admin.sla.queue'));
-    $slaQueue->assertViewHas('assignments', fn ($assignments) => $assignments->count() === 1);
-});
-
-test('an escalated needs_approver seat still auto-approves via the existing grace-period backstop', function () {
-    [, , $assignment] = orphanedAssignment();
-    $assignment->update([
-        'sla_expires_at' => now()->subHours(7),
-        'escalated_to_admin' => true,
-        'escalated_at' => now()->subHours(7), // past the flat 6-hour admin grace window
-    ]);
-
-    $count = app(SlaService::class)->sweep()['auto_approved'];
-
-    expect($count)->toBe(1)
-        ->and($assignment->fresh()->individual_status)->toBe('approved')
-        ->and($assignment->fresh()->auto_approved)->toBeTrue();
+    $slaQueue->assertViewHas('reviewContainers', fn ($containers) => $containers->total() === 1);
 });
 
 test('the Unassigned Documents view shows only the earliest pending stage as actionable, one panel not several', function () {

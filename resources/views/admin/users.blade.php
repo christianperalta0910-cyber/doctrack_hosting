@@ -24,10 +24,13 @@
                 </div>
                 <div>
                     <label class="block text-xs font-medium text-surface-700 mb-1">Role</label>
+                    {{-- No "Admin" option — the system is locked to exactly
+                         one Admin account; there is no in-app way to
+                         create a second one (see AdminController::
+                         storeUser()'s matching validation). --}}
                     <select name="role" id="create-role" required class="w-full rounded-lg border-surface-300 text-sm px-3 py-2 focus:border-primary-500 focus:ring-primary-500">
                         <option value="originator" @selected(old('role', 'originator') === 'originator')>Staff (Originator)</option>
                         <option value="approver" @selected(old('role') === 'approver')>Staff (Approver)</option>
-                        <option value="admin" @selected(old('role') === 'admin')>Admin</option>
                     </select>
                 </div>
                 <div id="create-category-field">

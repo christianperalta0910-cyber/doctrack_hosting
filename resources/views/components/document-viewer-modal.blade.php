@@ -24,7 +24,10 @@
     heartbeat decay, and the time spent on this review pass is correctly
     recorded instead of lost.
 --}}
-<div id="doc-viewer-overlay" class="hidden fixed inset-0 z-50 bg-surface-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+{{-- Flat tint, NOT backdrop-blur — see layouts/app.blade.php's
+     #connection-status comment for why: blur measurably lags on weaker
+     graphics hardware, a flat semi-transparent tint doesn't. --}}
+<div id="doc-viewer-overlay" class="hidden fixed inset-0 z-50 bg-surface-900/70 flex items-center justify-center p-4"
      data-presence-url-template="{{ route('documents.presence', ['document' => '__ID__']) }}"
      data-presence-leave-url-template="{{ route('documents.presence.leave', ['document' => '__ID__']) }}"
      onclick="if(event.target === this) closeDocumentViewer()">

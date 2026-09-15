@@ -8,19 +8,19 @@ use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Str;
 
 /**
- * Shared by AuthController's own login (wrong password OR wrong code) and
- * AdminController::backupCodes() (an Admin verifying a target user's
- * password to view their Sign In Backup Codes) — extracted so both share
- * IDENTICAL lockout behavior (same attempt count, same decay window, same
- * "reset the timer to a full window the instant the cap trips" fix)
- * rather than two copies that could quietly drift out of sync.
+ * Used by AuthController::login()'s per-email+IP lockout — a standalone
+ * trait rather than inline logic so a future second consumer (an admin
+ * action, another sensitive form) can share IDENTICAL lockout behavior
+ * (same attempt count, same decay window, same "reset the timer to a
+ * full window the instant the cap trips" fix) instead of a second copy
+ * that could quietly drift out of sync.
  */
 trait ThrottlesAttempts
 {
     private int $maxAttempts = 5;
     private int $decaySeconds = 60;
 
-    /** Keyed by identifier+IP (the same approach Laravel's own Breeze starter kit uses) rather than IP alone, so one account's mistakes can't lock out everyone else behind the same NAT/office network. $scope namespaces different throttled actions (e.g. "login" vs "backup-codes:{$targetUserId}") so they never share a counter by accident. */
+    /** Keyed by identifier+IP (the same approach Laravel's own Breeze starter kit uses) rather than IP alone, so one account's mistakes can't lock out everyone else behind the same NAT/office network. $scope namespaces different throttled actions so they never share a counter by accident. */
     private function throttleKeyFor(string $scope, string $identifier, Request $request): string
     {
         return $scope . ':' . Str::lower($identifier) . '|' . $request->ip();

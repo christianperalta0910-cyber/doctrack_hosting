@@ -164,6 +164,42 @@
                 @endforeach
             </ul>
         </div>
+
+        {{--
+            Estimated Approval Time models — read-only, no "train now"
+            control here on purpose (see ApprovalTimeMlService's docblock):
+            this one trains itself automatically on a schedule once a
+            category/department combo has enough real decision history.
+        --}}
+        <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
+            <div class="px-5 py-3 border-b border-surface-200">
+                <h3 class="text-xs font-semibold text-surface-900 uppercase tracking-wide">Estimated Approval Time Models</h3>
+                <p class="text-xs text-surface-400 mt-0.5">Trains itself automatically once a category/department pair has {{ $timeEstimateTrainingFloor }}+ real decisions — no action needed here.</p>
+            </div>
+            <ul class="divide-y divide-surface-100 text-sm">
+                @forelse($timeEstimateGroups as $group)
+                    <li class="px-5 py-3">
+                        <div class="flex justify-between items-center">
+                            <p class="font-medium text-surface-800">{{ $group['ml_category'] }} &middot; {{ $group['department'] }}</p>
+                            @if($group['model'])
+                                <span class="text-xs font-semibold text-approved-700">{{ $group['model']->version }}</span>
+                            @else
+                                <span class="text-xs font-semibold text-surface-400">{{ $group['sample_count'] }}/{{ $timeEstimateTrainingFloor }}</span>
+                            @endif
+                        </div>
+                        <p class="text-xs text-surface-400 mt-0.5">
+                            @if($group['model'])
+                                Off by ~{{ \Carbon\CarbonInterval::seconds($group['model']->mae_seconds)->cascade()->forHumans(['short' => true]) }} on average &middot; {{ $group['model']->training_sample_count }} samples &middot; trained {{ $group['model']->trained_at->diffForHumans() }}
+                            @else
+                                Not trained yet — using the plain average estimate until enough history builds up.
+                            @endif
+                        </p>
+                    </li>
+                @empty
+                    <li class="px-5 py-6 text-center text-xs text-surface-400">No real decision history yet.</li>
+                @endforelse
+            </ul>
+        </div>
     </div>
 </div>
 

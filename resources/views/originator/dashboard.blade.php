@@ -44,6 +44,30 @@
                     <span class="text-xs text-surface-600">Requires a printed copy</span>
                 </label>
 
+                {{-- Originator-directed routing (Feature: bypass the standard
+                     pipeline and pick the approver(s) yourself — see
+                     WorkflowService::routeToCustomApprovers()). Collapsed by
+                     default — the standard process is what almost every
+                     upload should use; this is an opt-in exception, not
+                     something to make more prominent than the normal path. --}}
+                <details class="mt-3 group">
+                    <summary class="text-xs font-medium text-primary-700 hover:underline cursor-pointer select-none">Need a different approval process?</summary>
+                    <div class="mt-2 space-y-2 pl-1">
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="radio" name="routing_mode" value="auto" checked class="mt-0.5 border-surface-300 text-primary-600 focus:ring-primary-500">
+                            <span class="text-xs text-surface-600"><span class="font-medium text-surface-800">Standard process</span> — classified and routed through the full approval pipeline automatically.</span>
+                        </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="radio" name="routing_mode" value="custom" class="mt-0.5 border-surface-300 text-primary-600 focus:ring-primary-500">
+                            <span class="text-xs text-surface-600"><span class="font-medium text-surface-800">Choose the approver(s) yourself</span> — for a document that doesn't need the full pipeline this time (e.g. only needs one specific person's sign-off). Still classified and validated normally; you'll pick who reviews it right after this uploads.</span>
+                        </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="radio" name="routing_mode" value="unrelated" class="mt-0.5 border-surface-300 text-primary-600 focus:ring-primary-500">
+                            <span class="text-xs text-surface-600"><span class="font-medium text-surface-800">This doesn't belong to any of our categories</span> — for a real document that just isn't a Job Order, Purchase Requisition, etc. Skips category-specific validation; you'll pick who reviews it right after this uploads.</span>
+                        </label>
+                    </div>
+                </details>
+
                 <button type="submit"
                     class="mt-4 w-full bg-gradient-to-b from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 text-white text-sm font-medium py-2.5 rounded-lg shadow-sm transition-all">
                     Submit Document(s)

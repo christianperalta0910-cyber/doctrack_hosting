@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\DocumentAnnotation;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentReviewSession;
 use App\Models\SystemSetting;
@@ -367,6 +368,103 @@ class ApprovalController extends Controller
         // instead of relying on a redirect + session-flashed banner, which
         // is what was resetting scroll position to the top of the page on
         // every decision. Non-JS/no-JS clients still get the old redirect.
+        if ($request->wantsJson()) {
+            return response()->json(['status' => $status]);
+        }
+
+        return redirect()->route('approver.dashboard')->with('status', $status);
+    }
+
+    /**
+     * "Review & Comment" panel (Feature: the plain extracted text of the
+     * document, with every OPEN annotation on it already highlighted —
+     * from any approver on any stage, not just this one — see the
+     * "Request Revision" feature this supports). Fetched by the shared
+     * modal from the Approver Queue, kept separate from the raw-file
+     * "View original file" viewer, which is unaffected by any of this.
+     */
+    public function annotationsPanel(Request $request, DocumentAssignment $assignment)
+    {
+        $this->authorize('decide', $assignment);
+
+        $document = $assignment->document;
+
+        // Feature parity with "View original file": opening Review &
+        // Comment now also counts as reviewing the document — the same
+        // tracked session that drives the minimum-review-time gate and
+        // the "who's reviewing now" presence icon, since in practice this
+        // is the popup approvers actually use to make their decision.
+        // openForIfNotAlreadyOpen(), NOT openFor() — this same URL is also
+        // what the queue's own live-refresh re-fetches while the popup
+        // stays open, and openFor() unconditionally would reopen (and
+        // rebroadcast) on every one of those refetches — see that
+        // method's docblock for the self-sustaining loop that caused.
+        if (DocumentReviewSession::countsAsActiveReviewer($document, $request->user())) {
+            DocumentReviewSession::openForIfNotAlreadyOpen($document, $request->user());
+        }
+
+        $annotations = DocumentAnnotation::where('document_id', $document->document_id)
+            ->whereNull('resolved_at')
+            ->with('raisedBy')
+            ->orderBy('start_offset')
+            ->get();
+
+        return view('approver.partials.annotations-panel', compact('assignment', 'document', 'annotations'));
+    }
+
+    /**
+     * Request Revision (Feature: flag a specific passage of the
+     * document's text with a comment, instead of rejecting the whole
+     * document outright — see WorkflowService's majority-vote reject
+     * redesign, which this is the non-destructive alternative to).
+     * Deliberately does NOT touch individual_status or call decide() —
+     * this approver hasn't made their Approve/Reject decision yet, they
+     * can still do either later (or raise more than one revision
+     * request); the document and every other approver's own review
+     * continue completely unaffected.
+     */
+    public function requestRevision(Request $request, DocumentAssignment $assignment)
+    {
+        $this->authorize('decide', $assignment);
+
+        $validated = $request->validate([
+            'start_offset' => ['required', 'integer', 'min:0'],
+            'end_offset' => ['required', 'integer', 'gt:start_offset'],
+            'selected_text' => ['required', 'string', 'max:5000'],
+            'comment' => ['required', 'string', 'max:1000'],
+        ]);
+
+        abort_if($assignment->individual_status !== 'pending', 409, 'This assignment has already been actioned.');
+
+        $secondsReviewed = DocumentReviewSession::secondsSpentSoFar($assignment->document_id, $request->user()->user_id);
+        $minSeconds = config('review.min_review_seconds', 10);
+        abort_if($secondsReviewed < $minSeconds, 422,
+            "You need to view the document for at least {$minSeconds} seconds before flagging a revision — {$secondsReviewed}s recorded so far.");
+
+        $this->workflow->requestRevision($assignment, $request->user(), $validated);
+
+        $status = 'Revision request sent to the originator.';
+
+        if ($request->wantsJson()) {
+            return response()->json(['status' => $status]);
+        }
+
+        return redirect()->route('approver.dashboard')->with('status', $status);
+    }
+
+    /**
+     * Withdraw a flag this approver themselves raised, before the
+     * originator has addressed it (see DocumentAnnotationPolicy::withdraw()
+     * — someone else's flag, or one already resolved, is refused).
+     */
+    public function withdrawAnnotation(Request $request, DocumentAnnotation $annotation)
+    {
+        $this->authorize('withdraw', $annotation);
+
+        $this->workflow->withdrawAnnotation($annotation, $request->user());
+
+        $status = 'Revision request withdrawn.';
+
         if ($request->wantsJson()) {
             return response()->json(['status' => $status]);
         }

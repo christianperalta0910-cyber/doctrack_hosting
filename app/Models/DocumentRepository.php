@@ -40,6 +40,7 @@ class DocumentRepository extends Model
         'ml_review_status', 'ml_recheck_category', 'ml_recheck_confidence', 'ml_rechecked_at',
         'ml_recheck_dismissed_at', 'confirmed_at_model_id', 'requires_printing',
         'readability_score', 'readability_review_status', 'is_security_blocked',
+        'desired_routing', 'pending_custom_routing_at', 'custom_routed', 'ml_review_due_at',
     ];
 
     protected $casts = [
@@ -55,6 +56,9 @@ class DocumentRepository extends Model
         'ml_recheck_dismissed_at' => 'datetime',
         'requires_printing' => 'boolean',
         'is_security_blocked' => 'boolean',
+        'pending_custom_routing_at' => 'datetime',
+        'custom_routed' => 'boolean',
+        'ml_review_due_at' => 'datetime',
     ];
 
     // Every state a document can be in — mirrors Section 5 state machine.
@@ -67,6 +71,15 @@ class DocumentRepository extends Model
      * this just tells the UI not to say "Awaiting Approval" for one that
      * was never actually routed to an approver — see WorkflowService::
      * process() and AdminController::reviewFlaggedDocument()).
+     *
+     * Same reasoning for auto_approved: global_status stays 'auto_approved'
+     * forever (it's a permanent record of HOW the document got approved),
+     * but the BADGE should stop saying "Pending Review" once an Admin has
+     * actually reviewed every auto-approved stage — at that point it's
+     * genuinely settled, same as a real approval, so it displays exactly
+     * like one. See AdminController::awaitingAdminReview() for the
+     * identical "still owes a review" check the dashboard's Approved/In
+     * Progress KPI split uses, so this badge can never disagree with it.
      */
     public function getDisplayStatusAttribute(): string
     {
@@ -82,7 +95,36 @@ class DocumentRepository extends Model
         if ($this->readability_review_status === 'pending') {
             return 'pending_review';
         }
+        // Feature: originator-directed routing — validated and
+        // classified, but waiting on the originator's own approver pick
+        // rather than already routed (see WorkflowService::
+        // routeOrAwaitApproverSelection()). Checked after both review
+        // gates above since either can still apply first.
+        if ($this->pending_custom_routing_at) {
+            return 'awaiting_approver_selection';
+        }
+        if ($this->global_status === 'auto_approved'
+            && !$this->assignments->contains(fn ($a) => $a->auto_approved && !$a->admin_reviewed_at)) {
+            return 'approved';
+        }
+
         return $this->global_status;
+    }
+
+    /**
+     * What every category-facing label (upload confirmation, the
+     * Submissions table, the tracking page header) should show — plain
+     * "Unclassified" for a document the originator flagged as not
+     * belonging to any category (desired_routing 'unrelated'), never the
+     * classifier's raw guess. ml_category still HOLDS that guess
+     * underneath (kept for reference — see ValidationService::
+     * validateGeneric()'s docblock), but showing it back to an
+     * originator who already made that call themselves added confusion,
+     * not information, without this.
+     */
+    public function getDisplayCategoryAttribute(): ?string
+    {
+        return $this->desired_routing === 'unrelated' ? 'Unclassified' : $this->ml_category;
     }
 
     /**
@@ -157,6 +199,14 @@ class DocumentRepository extends Model
         return $this->hasOne(DocumentAssignment::class, 'document_id', 'document_id')
             ->where('individual_status', 'pending')
             ->orderBy('stage_id');
+    }
+
+    /** Still-outstanding Request Revision flags (see WorkflowService::requestRevision()) — resolved ones are historical, not shown here. */
+    public function openAnnotations()
+    {
+        return $this->hasMany(DocumentAnnotation::class, 'document_id', 'document_id')
+            ->whereNull('resolved_at')
+            ->orderBy('start_offset');
     }
 
     public function auditLogs()

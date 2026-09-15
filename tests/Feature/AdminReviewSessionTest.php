@@ -53,23 +53,6 @@ it('opens a review session for an admin viewing a document awaiting their own de
     expect(DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $admin->user_id)->exists())->toBeTrue();
 });
 
-it('opens a review session for an admin viewing a document awaiting SLA override', function () {
-    $admin = User::factory()->admin()->create();
-    $approver = User::factory()->approver('Job Order')->create();
-    $document = adminSessionDoc();
-    WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
-    DocumentAssignment::create([
-        'document_id' => $document->document_id, 'user_id' => $approver->user_id,
-        'stage_id' => WorkflowStage::first()->stage_id, 'due_date' => $document->due_date,
-        'priority_rank' => 2, 'individual_status' => 'pending', 'sla_expires_at' => now()->subHour(),
-        'escalated_to_admin' => true, 'escalated_at' => now()->subMinutes(30),
-    ]);
-
-    $this->actingAs($admin)->get(route('documents.file', $document))->assertOk();
-
-    expect(DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $admin->user_id)->exists())->toBeTrue();
-});
-
 it('opens a review session for an admin viewing a document pending ML classification review', function () {
     $admin = User::factory()->admin()->create();
     $document = adminSessionDoc(['ml_review_status' => 'pending', 'ml_confidence' => 30.0]);
@@ -114,28 +97,6 @@ it('closes the admin\'s session once they decide a needs_approver seat via Unass
     $this->actingAs($admin)->post(route('admin.unassigned.decide', $assignment), [
         'decision' => 'approved', 'comments' => 'Approved on the approver\'s behalf.',
     ]);
-
-    $session = DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $admin->user_id)->first();
-    expect($session->closed_at)->not->toBeNull();
-    expect($session->duration_seconds)->toBeGreaterThanOrEqual(5);
-});
-
-it('closes the admin\'s session once they override an SLA-escalated seat', function () {
-    $admin = User::factory()->admin()->create();
-    $approver = User::factory()->approver('Job Order')->create();
-    $document = adminSessionDoc();
-    WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
-    $assignment = DocumentAssignment::create([
-        'document_id' => $document->document_id, 'user_id' => $approver->user_id,
-        'stage_id' => WorkflowStage::first()->stage_id, 'due_date' => $document->due_date,
-        'priority_rank' => 2, 'individual_status' => 'pending', 'sla_expires_at' => now()->subHour(),
-        'escalated_to_admin' => true, 'escalated_at' => now()->subMinutes(30),
-    ]);
-
-    $this->actingAs($admin)->get(route('documents.file', $document));
-    $this->travel(15)->seconds();
-
-    app(SlaService::class)->adminOverride($assignment, $admin, 'approved', 'Resolved directly.');
 
     $session = DocumentReviewSession::where('document_id', $document->document_id)->where('user_id', $admin->user_id)->first();
     expect($session->closed_at)->not->toBeNull();

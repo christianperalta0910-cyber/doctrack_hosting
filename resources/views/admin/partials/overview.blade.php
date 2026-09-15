@@ -1,30 +1,26 @@
 {{--
-    KPI cards (now including Active ML Model as a 6th, clickable-to-drill-
-    down card, same as the other five) + a two-column row below: Recent
-    Activity/Analytics on the left, SLA Override Alerts/Category Volume on
-    the right — reorganized (Feature: fit the whole Control Center without
-    scrolling the page itself) so nothing sits in one long stacked column.
-    Split out from dashboard.blade.php so the same markup can be rendered
-    two ways: a normal full page load, and a fragment returned by
+    KPI cards (5 — Active ML Model removed; it's still front-and-center on
+    the ML Training page, one click away via the sidebar, so nothing here
+    was lost) + a two-column row below: Recent Activity/Analytics on the
+    left, Auto-Approval Alerts/Unassigned Documents on the right —
+    reorganized (Feature: fit the whole Control Center without scrolling
+    the page itself) so nothing sits in one long stacked column. Split out
+    from dashboard.blade.php so the same markup can be rendered two ways:
+    a normal full page load, and a fragment returned by
     AdminController::overviewRefresh() for the live-poll JS to swap in
     place (see dashboard.blade.php) without a full page reload.
 --}}
-<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
     @foreach([
-        ['Total Documents', $stats['total_documents'], 'text-surface-900', 'bg-surface-100 text-surface-600', 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z', 'total'],
-        ['In Progress', $stats['pending'], 'text-processing-700', 'bg-processing-50 text-processing-600', 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z', 'pending'],
-        ['Approved', $stats['approved'], 'text-approved-700', 'bg-approved-50 text-approved-600', 'M9 12.75 11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z', 'approved'],
-        ['Rejected', $stats['rejected'], 'text-rejected-700', 'bg-rejected-50 text-rejected-600', 'M6 18L18 6M6 6l12 12', 'rejected'],
-        ['Active Users', $stats['active_users'], 'text-primary-700', 'bg-primary-50 text-primary-600', 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-8a4 4 0 11-8 0 4 4 0 018 0zm6 3a4 4 0 11-8 0 4 4 0 018 0z', 'users'],
-        // Value is the active model's accuracy, not a count, like every
-        // other card here — the one field that answers "is it any good"
-        // at a glance; everything else (version, samples, history) lives
-        // one click away in the drilldown, same pattern as every other
-        // card.
-        ['Active ML Model', $activeModel ? $activeModel->accuracy_score . '%' : '—', 'text-indigo-700', 'bg-indigo-50 text-indigo-600', 'M9 3.75V6m6-2.25V6M9 18v2.25m6-2.25v2.25M4.5 9h2.25m10.5 0H19.5M4.5 15h2.25m10.5 0H19.5M8.25 6.75h7.5v10.5h-7.5V6.75z', 'ml_model'],
-    ] as [$label, $value, $color, $iconClasses, $iconPath, $type])
+        ['Total Documents', $stats['total_documents'], 'text-surface-900', 'bg-surface-100 text-surface-600', 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z', 'total', 'All documents ever submitted to the system, regardless of status.'],
+        ['In Progress', $stats['pending'], 'text-processing-700', 'bg-processing-50 text-processing-600', 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z', 'pending', 'Still being classified or validated, or auto-approved but still awaiting your review.'],
+        ['Approved', $stats['approved'], 'text-approved-700', 'bg-approved-50 text-approved-600', 'M9 12.75 11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z', 'approved', 'Fully settled — approved by a person, or auto-approved and already reviewed by you.'],
+        ['Rejected', $stats['rejected'], 'text-rejected-700', 'bg-rejected-50 text-rejected-600', 'M6 18L18 6M6 6l12 12', 'rejected', 'Rejected during validation or by an approver.'],
+        ['Active Users', $stats['active_users'], 'text-primary-700', 'bg-primary-50 text-primary-600', 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-8a4 4 0 11-8 0 4 4 0 018 0zm6 3a4 4 0 11-8 0 4 4 0 018 0z', 'users', 'User accounts that are currently active and able to log in.'],
+    ] as [$label, $value, $color, $iconClasses, $iconPath, $type, $description])
         <button type="button"
             onclick="openKpiDrilldown('{{ $type }}', '{{ $label }}', '{{ route('admin.dashboard.drilldown', $type) }}')"
+            data-kpi-tooltip="{{ $description }}"
             class="text-left w-full bg-white rounded-xl shadow-card hover:shadow-card-hover border border-surface-200 p-4 transition-shadow cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary-500">
             <div class="w-8 h-8 rounded-lg flex items-center justify-center mb-2 {{ $iconClasses }}">
                 <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="{{ $iconPath }}"/></svg>
@@ -60,7 +56,7 @@
             renders squashed) rather than clipped here — clipping a chart
             mid-plot would just hide data, not actually shrink it.
         --}}
-        <div class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
+        <div id="admin-analytics-card" class="bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
             <div class="px-5 py-3 border-b border-surface-200 flex items-center justify-between flex-wrap gap-3">
                 <h2 class="text-sm font-semibold text-surface-900 tracking-tight">Analytics</h2>
                 <div class="flex items-center gap-2 flex-wrap">
@@ -93,100 +89,97 @@
     </div>
 
     {{--
-        Right column (1/3 width) — the exact slot Active ML Model used to
-        occupy alone, now holding SLA Override Alerts above Category
-        Volume instead (ML Model moved up into the KPI row as its own
-        clickable card). This column is already stretched by the grid to
-        match the Analytics column's height (grid's default row-stretch
-        behavior) — flex-1/min-h-0 on both cards below is what makes them
-        actually GROW to fill that height evenly, sharing it 50/50,
-        instead of just sitting at their natural (shorter) size and
-        leaving dead space below. Each card's own list still scrolls
-        internally if it has more content than its share of the height
-        allows — same reasoning as Recent Activity above.
+        Right column (1/3 width) — Auto-Approval Alerts above Unassigned
+        Documents (ML Model moved up into the KPI row as its own clickable
+        card; Category Volume/Performance Insights removed from this
+        column entirely). Grid's default row-stretch equalizes the two
+        columns' heights ONLY up to whichever one naturally needs the
+        MOST room — with real per-document rows in both cards now, that
+        can be THIS column, not Analytics, at wider viewports, leaving
+        Analytics with dead space below it instead. So this column's
+        actual pixel height is explicitly measured off the Analytics card
+        and set via JS (sizeAlertColumn() in dashboard.blade.php, same
+        technique as sizeRecentActivity() below) rather than trusted to
+        pure CSS stretch. flex-1/min-h-0 on both cards below then split
+        that FIXED height evenly, each scrolling internally if it has more
+        rows than its share allows.
     --}}
-    <div class="flex flex-col gap-4">
+    <div id="admin-alerts-column" class="flex flex-col gap-4">
         <div class="flex-1 min-h-0 flex flex-col bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
             <div class="px-5 py-3 border-b border-surface-200 flex items-center justify-between gap-2 shrink-0">
-                <h2 class="text-sm font-semibold text-surface-900 tracking-tight flex items-center gap-2">
-                    <span class="relative flex w-2 h-2 shrink-0">
-                        <span class="absolute inline-flex h-full w-full rounded-full bg-rejected-400 opacity-75 animate-ping"></span>
-                        <span class="relative inline-flex rounded-full h-2 w-2 bg-rejected-500"></span>
-                    </span>
-                    SLA Override Alerts
-                </h2>
+                <div class="flex items-center gap-2 min-w-0">
+                    <h2 class="text-sm font-semibold text-surface-900 tracking-tight flex items-center gap-2 shrink-0">
+                        <span class="relative flex w-2 h-2 shrink-0">
+                            <span class="absolute inline-flex h-full w-full rounded-full bg-processing-400 opacity-75 animate-ping"></span>
+                            <span class="relative inline-flex rounded-full h-2 w-2 bg-processing-500"></span>
+                        </span>
+                        Auto-Approval Alerts
+                    </h2>
+                    @if($reviewCount > 0)
+                        <a href="{{ route('admin.sla.queue') }}" class="shrink-0 text-xs bg-processing-50 text-processing-700 px-2 py-0.5 rounded-full font-medium ring-1 ring-inset ring-processing-500/20 hover:bg-processing-100 transition-colors">{{ $reviewCount }} awaiting review</a>
+                    @endif
+                </div>
                 <a href="{{ route('admin.sla.queue') }}" class="shrink-0 text-xs text-primary-700 hover:underline font-medium">View all &rarr;</a>
             </div>
-            @if($reviewCount > 0)
-                <div class="px-5 pt-2 shrink-0">
-                    <a href="{{ route('admin.sla.queue') }}" class="inline-block text-xs bg-processing-50 text-processing-700 px-2 py-1 rounded-full font-medium ring-1 ring-inset ring-processing-500/20">{{ $reviewCount }} auto-approved awaiting review</a>
-                </div>
-            @endif
-            @php
-                // Nest by document — a single document can have more than
-                // one violated stage (e.g. Budget Check and Final Approval
-                // both pending on the same doc), which previously showed
-                // as separate flat rows repeating the same title.
-                $alertsByDocument = $slaAlerts->groupBy('document_id')->take(5);
-            @endphp
-            <ul class="flex-1 overflow-y-auto min-h-[80px] divide-y divide-surface-100">
-                @forelse($alertsByDocument as $violations)
-                    @php $doc = $violations->first()->document; @endphp
+            <ul class="flex-1 overflow-y-auto min-h-[80px] divide-y divide-surface-100 flex flex-col">
+                @forelse($autoApprovalAlerts as $row)
                     <li class="px-5 py-2.5 hover:bg-surface-50/60 transition-colors">
                         <div class="flex items-center justify-between gap-3">
-                            <p class="font-medium text-surface-800 truncate">{{ $doc->title }}</p>
-                            <a href="{{ route('admin.sla.queue') }}" class="shrink-0 text-xs bg-primary-700 text-white px-2.5 py-1 rounded-lg font-medium hover:bg-primary-800 shadow-sm transition-colors">Override</a>
+                            <p class="font-medium text-surface-800 truncate">{{ $row->document->title }}</p>
+                            <a href="{{ route('admin.sla.queue') }}" class="shrink-0 text-xs bg-primary-700 text-white px-2.5 py-1 rounded-lg font-medium hover:bg-primary-800 shadow-sm transition-colors">Review</a>
                         </div>
-                        <ul class="mt-1 space-y-0.5">
-                            @foreach($violations as $a)
-                                <li class="text-xs text-rejected-700 flex items-center gap-1.5">
-                                    <span class="w-1 h-1 rounded-full bg-rejected-500 shrink-0"></span>
-                                    <span>
-                                        "{{ $a->stage->stage_name }}" — expired <span data-live-time="{{ $a->sla_expires_at->timestamp }}">{{ $a->sla_expires_at->diffForHumans() }}</span>
-                                        @if($a->adminGraceExpiresAt())
-                                            &middot; <span data-live-time="{{ $a->adminGraceExpiresAt()->timestamp }}" data-live-urgent-under="7200">{{ $a->adminGraceExpiresAt()->diffForHumans() }}</span> to auto-approval
-                                        @endif
-                                    </span>
-                                </li>
-                            @endforeach
-                        </ul>
+                        <p class="text-xs text-surface-400 mt-0.5">
+                            {{ $row->stage_count }} stage{{ $row->stage_count === 1 ? '' : 's' }} auto-approved &middot;
+                            <span data-live-time="{{ optional($row->acted_at)->timestamp }}">{{ optional($row->acted_at)->diffForHumans() }}</span>
+                        </p>
                     </li>
                 @empty
-                    <li class="px-5 py-6 text-center text-sm text-surface-400">No SLA violations — everything is on schedule.</li>
+                    <li class="flex-1 flex items-center justify-center px-5 py-6 text-center text-sm text-surface-400">No documents are currently awaiting review — everything is on schedule.</li>
                 @endforelse
             </ul>
         </div>
 
         {{--
-            Category volume — all-time (not tab-scoped, see
-            AdminController::analyticsData()'s matching comment), a
-            separate card since it answers a different question ("what
-            kind of documents are busiest overall") than the time-series
-            panel ("how is the pipeline trending"). A plain ranked bar
-            list, not a pie/donut — reading exact proportions off a pie
-            chart is genuinely harder than reading bar lengths, and a
-            simple list doesn't need its own categorical color palette
-            when the labels already identify each row.
+            Unassigned Documents preview — replaces Category Volume/
+            Performance Insights. Mirrors AdminController::
+            unassignedDocumentsData()'s own query, capped to a top-5
+            preview; the full paginated list lives one click away via
+            "View all", same "taste, not the whole thing" pattern as
+            Recent Activity and Auto-Approval Alerts on this same
+            dashboard.
         --}}
         <div class="flex-1 min-h-0 flex flex-col bg-white rounded-xl shadow-card border border-surface-200 overflow-hidden">
-            <div class="px-5 py-3 border-b border-surface-200 shrink-0">
-                <h2 class="text-sm font-semibold text-surface-900 tracking-tight">Category Volume</h2>
-                <p class="text-xs text-surface-400 mt-0.5">All-time document volume per category.</p>
+            <div class="px-5 py-3 border-b border-surface-200 flex items-center justify-between gap-2 shrink-0">
+                <div class="flex items-center gap-2 min-w-0">
+                    <h2 class="text-sm font-semibold text-surface-900 tracking-tight flex items-center gap-2 shrink-0">
+                        <span class="relative flex w-2 h-2 shrink-0">
+                            <span class="absolute inline-flex h-full w-full rounded-full bg-rejected-400 opacity-75 animate-ping"></span>
+                            <span class="relative inline-flex rounded-full h-2 w-2 bg-rejected-500"></span>
+                        </span>
+                        Unassigned Documents
+                    </h2>
+                    @if($unassignedCount > 0)
+                        <a href="{{ route('admin.unassigned.index') }}" class="shrink-0 text-xs bg-rejected-50 text-rejected-700 px-2 py-0.5 rounded-full font-medium ring-1 ring-inset ring-rejected-500/20 hover:bg-rejected-100 transition-colors">{{ $unassignedCount }} unassigned</a>
+                    @endif
+                </div>
+                <a href="{{ route('admin.unassigned.index') }}" class="shrink-0 text-xs text-primary-700 hover:underline font-medium">View all &rarr;</a>
             </div>
-            <div class="flex-1 p-5 space-y-3 overflow-y-auto min-h-[80px]">
-                @php $maxCategoryCount = $analytics['category_volume']->max() ?: 1; @endphp
-                @forelse($analytics['category_volume'] as $category => $count)
-                    <div class="flex items-center gap-3 text-sm">
-                        <span class="w-24 shrink-0 text-surface-700 font-medium truncate" title="{{ $category }}">{{ $category }}</span>
-                        <div class="flex-1 h-2 bg-surface-100 rounded-full overflow-hidden">
-                            <div class="h-full bg-primary-500 rounded-full" style="width: {{ ($count / $maxCategoryCount) * 100 }}%"></div>
+            <ul class="flex-1 overflow-y-auto min-h-[80px] divide-y divide-surface-100 flex flex-col">
+                @forelse($unassignedAlerts as $row)
+                    <li class="px-5 py-2.5 hover:bg-surface-50/60 transition-colors">
+                        <div class="flex items-center justify-between gap-3">
+                            <p class="font-medium text-surface-800 truncate">{{ $row->document->title }}</p>
+                            <a href="{{ route('admin.unassigned.index') }}" class="shrink-0 text-xs bg-primary-700 text-white px-2.5 py-1 rounded-lg font-medium hover:bg-primary-800 shadow-sm transition-colors">Assign</a>
                         </div>
-                        <span class="w-8 text-right tabular-nums text-surface-500">{{ $count }}</span>
-                    </div>
+                        <p class="text-xs text-surface-400 mt-0.5">
+                            No eligible approver &middot;
+                            since <span data-live-time="{{ optional($row->needs_approver_at)->timestamp }}">{{ optional($row->needs_approver_at)->diffForHumans() }}</span>
+                        </p>
+                    </li>
                 @empty
-                    <p class="text-xs text-surface-400 text-center py-4">No classified documents yet.</p>
+                    <li class="flex-1 flex items-center justify-center px-5 py-6 text-center text-sm text-surface-400">No documents currently need an eligible approver — everything is on schedule.</li>
                 @endforelse
-            </div>
+            </ul>
         </div>
     </div>
 </div>

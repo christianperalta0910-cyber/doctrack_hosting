@@ -11,24 +11,29 @@ use Illuminate\Console\Command;
  * workflow:check-parallel-slas (see README.md for the cron entry needed
  * to drive Laravel's scheduler in production).
  *
- * This command only handles the SECOND half of the Section 5 safety net:
- * auto-approving a stage if an Admin doesn't act within the grace window
- * after escalation. The escalation itself (flagging an individual expired
- * assignment) is handled by workflow:check-parallel-slas.
+ * The actual auto-approval decision (a real approver's own miss, or a
+ * needs_approver seat's own fallback-to-Admin miss) is event-driven —
+ * see EscalateAssignmentJob and SlaService::escalate(). This command is
+ * the periodic backstop for the two things that genuinely need to run on
+ * a schedule: outage detection/compensation, and following up on
+ * auto-approvals that are sitting unreviewed (see trackLateReviews()).
  */
 class CheckSlaDeadlines extends Command
 {
     protected $signature = 'sla:check';
-    protected $description = 'Auto-approve stages whose escalated assignments have gone unresolved past the Admin grace window.';
+    protected $description = 'Detects/compensates for outages and follows up on auto-approvals sitting unreviewed past their window.';
 
     public function handle(SlaService $sla): int
     {
         $result = $sla->sweep();
 
-        $this->info("SLA sweep complete: {$result['auto_approved']} document(s) auto-approved after the Admin grace window elapsed, " .
-            "{$result['review_reminders_sent']} unreviewed auto-approval reminder(s) sent, " .
-            "{$result['urgent_approver_reminders_sent']} approver final-call reminder(s) sent, " .
-            "{$result['grace_reminders_sent']} Admin grace final-call reminder(s) sent.");
+        $outageNote = $result['outage_detected']
+            ? " Outage detected — {$result['deadlines_compensated']} deadline(s) compensated."
+            : '';
+
+        $this->info("SLA sweep complete: {$result['late_review_reminders_sent']} late-review reminder(s) sent, " .
+            "{$result['late_ml_review_reminders_sent']} late-classification-review reminder(s) sent, " .
+            "{$result['urgent_approver_reminders_sent']} approver final-call reminder(s) sent.{$outageNote}");
 
         return self::SUCCESS;
     }

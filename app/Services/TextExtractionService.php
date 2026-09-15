@@ -61,7 +61,7 @@ class TextExtractionService
         }
 
         return [
-            'text' => trim($text),
+            'text' => self::normalizeLineEndings(trim($text)),
             'used_ocr_fallback' => $usedOcr,
             // Specific, user-facing-safe reason extraction produced no
             // usable text — null when extraction actually succeeded.
@@ -69,6 +69,33 @@ class TextExtractionService
             // 'ocr_error', or null (generic/unknown).
             'failure_reason' => $failureReason,
         ];
+    }
+
+    /**
+     * Normalizes every line ending to a plain \n (LF). Extracted text can
+     * contain literal \r\n (CRLF) depending on the source file's own
+     * encoding — invisible to THIS string's PHP character count
+     * (mb_strlen/mb_substr count \r and \n as two separate characters),
+     * but NOT invisible once the text is rendered as part of an HTML page:
+     * a browser's own HTML parser collapses every \r\n pair down to a
+     * single \n character before it's ever part of the DOM (a spec-
+     * mandated step of HTML parsing, not something this app controls —
+     * see the HTML Living Standard's "preprocessing the input stream").
+     * Left unnormalized, any character offset computed client-side
+     * against the rendered DOM (see the "select a passage to flag" JS in
+     * approver/dashboard.blade.php) silently undercounts by one character
+     * for every \r\n pair that came before the selected point — this was
+     * the actual cause of a flagged passage's highlight landing on the
+     * wrong characters, reproduced and confirmed against a real document.
+     *
+     * Public — reused by WorkflowService::saveDocumentRevision() (an
+     * edited textarea's submitted value can reintroduce \r\n depending on
+     * the browser) and by the backfill migration that normalizes already-
+     * stored text (2026_09_15_000002_normalize_line_endings.php).
+     */
+    public static function normalizeLineEndings(string $text): string
+    {
+        return str_replace(["\r\n", "\r"], "\n", $text);
     }
 
     private function extractFromPdf(string $path): string
@@ -90,8 +117,14 @@ class TextExtractionService
      * .docx files are a zip archive containing XML. word/document.xml holds
      * the visible body text. This needs no external library — PHP's
      * bundled ZipArchive extension is enough.
+     *
+     * Public (not just called from extract() above) so the backfill
+     * migration that re-extracts already-uploaded .docx documents (see
+     * 2026_09_15_000001_backfill_docx_paragraph_breaks.php) can reuse this
+     * exact same logic against a locally-downloaded copy of the stored
+     * file, rather than duplicating it.
      */
-    private function extractFromDocx(string $path): string
+    public function extractFromDocx(string $path): string
     {
         try {
             if (!class_exists(\ZipArchive::class)) {
@@ -110,9 +143,15 @@ class TextExtractionService
                 return '';
             }
 
-            // Word inserts paragraph/break tags that should become spaces so
-            // words don't get glued together once tags are stripped.
-            $xml = preg_replace('/<\/w:p>|<w:br\/?>/', ' ', $xml);
+            // Word's paragraph/break tags become real newlines, not spaces —
+            // a space here used to just glue every paragraph into one run-on
+            // line once tags were stripped (fine for the ML classifier this
+            // was originally built for, unreadable for a human looking at it
+            // in the "editable document" view added later — see
+            // WorkflowService::requestRevision()'s docblock). PDF/OCR
+            // extraction already produce real line breaks; this just brings
+            // .docx in line with how those already behave.
+            $xml = preg_replace('/<\/w:p>|<w:br\/?>/', "\n", $xml);
             $text = strip_tags($xml);
 
             return html_entity_decode($text, ENT_QUOTES | ENT_XML1);

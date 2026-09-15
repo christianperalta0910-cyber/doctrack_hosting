@@ -26,7 +26,7 @@ function priorityQueueDoc(User $approver, string $title, array $overrides = []):
     ], $overrides));
 }
 
-it('lists Urgent, then Normal, then Low, then Expired — driven by real remaining business time, not due_date', function () {
+it('lists Urgent, then Normal, then Low — driven by real remaining business time, not due_date', function () {
     // Wednesday, mid-morning — safely inside a single working day so
     // small minute/hour offsets below don't accidentally cross into a
     // non-working period and skew the real-remaining math.
@@ -36,16 +36,23 @@ it('lists Urgent, then Normal, then Low, then Expired — driven by real remaini
     // Deliberately created out of urgency order. urgencyRank() no longer
     // reads priority_rank at all — it's driven entirely by real business
     // seconds left before sla_expires_at (Urgent <=30m, Normal <=2h, Low
-    // beyond that, Expired once passed).
+    // beyond that). No "Expired" case here anymore: the Approver
+    // dashboard already proactively escalates the VIEWING approver's own
+    // expired assignments on load (ApprovalController — so they can
+    // never act on a stale one), and a real approver miss now
+    // auto-approves immediately instead of just flagging it (see
+    // SlaService::escalate()) — so an item that's already past its own
+    // deadline can no longer sit visibly "Expired" in its own owner's
+    // queue; it resolves the moment they load the page. Covered instead
+    // in SlaEscalationTest.
     priorityQueueDoc($approver, 'low-doc.txt', ['sla_expires_at' => now()->addHours(4)]);
-    priorityQueueDoc($approver, 'expired-doc.txt', ['sla_expires_at' => now()->subMinutes(5)]);
     priorityQueueDoc($approver, 'normal-doc.txt', ['sla_expires_at' => now()->addHour()]);
     priorityQueueDoc($approver, 'urgent-doc.txt', ['sla_expires_at' => now()->addMinutes(20)]);
 
     $response = $this->actingAs($approver)->get(route('approver.dashboard'));
 
     $response->assertOk();
-    $response->assertSeeInOrder(['urgent-doc.txt', 'normal-doc.txt', 'low-doc.txt', 'expired-doc.txt']);
+    $response->assertSeeInOrder(['urgent-doc.txt', 'normal-doc.txt', 'low-doc.txt']);
 });
 
 it('sorts a container with nothing left to act on after every real priority', function () {

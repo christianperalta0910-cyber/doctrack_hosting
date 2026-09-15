@@ -134,11 +134,11 @@
     // means "no inherent good/bad direction" (e.g. auto-approval rate is
     // informative, not a target to chase up or down), so its arrow stays neutral.
     $tiles = [
-        ['label' => 'Uploaded', 'value' => $kpi['current']['uploaded'] ?? null, 'trend' => $kpi['trend']['uploaded'] ?? null, 'format' => 'count', 'good' => 'up'],
-        ['label' => 'Approval Rate', 'value' => $kpi['current']['approval_rate'] ?? null, 'trend' => $kpi['trend']['approval_rate'] ?? null, 'format' => 'percent', 'good' => 'up'],
-        ['label' => 'Auto-Approval Rate', 'value' => $kpi['current']['auto_approval_rate'] ?? null, 'trend' => $kpi['trend']['auto_approval_rate'] ?? null, 'format' => 'percent', 'good' => null],
-        ['label' => 'Avg. Time to Decide', 'value' => $kpi['current']['avg_minutes'] ?? null, 'trend' => $kpi['trend']['avg_minutes'] ?? null, 'format' => 'duration', 'good' => 'down'],
-        ['label' => 'SLA Violation Rate', 'value' => $kpi['current']['sla_violation_rate'] ?? null, 'trend' => $kpi['trend']['sla_violation_rate'] ?? null, 'format' => 'percent', 'good' => 'down'],
+        ['label' => 'Uploaded', 'value' => $kpi['current']['uploaded'] ?? null, 'trend' => $kpi['trend']['uploaded'] ?? null, 'format' => 'count', 'good' => 'up', 'description' => 'How many documents were submitted during this period.'],
+        ['label' => 'Approval Rate', 'value' => $kpi['current']['approval_rate'] ?? null, 'trend' => $kpi['trend']['approval_rate'] ?? null, 'format' => 'percent', 'good' => 'up', 'description' => 'Share of decided documents that were approved — by a person, or automatically.'],
+        ['label' => 'Auto-Approval Rate', 'value' => $kpi['current']['auto_approval_rate'] ?? null, 'trend' => $kpi['trend']['auto_approval_rate'] ?? null, 'format' => 'percent', 'good' => null, 'description' => 'Share of approvals the system made automatically because nobody acted in time.'],
+        ['label' => 'Avg. Time to Decide', 'value' => $kpi['current']['avg_minutes'] ?? null, 'trend' => $kpi['trend']['avg_minutes'] ?? null, 'format' => 'duration', 'good' => 'down', 'description' => 'Average time from upload to a final decision in this period.'],
+        ['label' => 'SLA Violation Rate', 'value' => $kpi['current']['sla_violation_rate'] ?? null, 'trend' => $kpi['trend']['sla_violation_rate'] ?? null, 'format' => 'percent', 'good' => 'down', 'description' => 'Share of decisions that missed their SLA deadline.'],
     ];
 @endphp
 {{-- No id here — the persistent id lives on the wrapper in overview.blade.php that never gets replaced; this root is the swap payload itself, identified instead by its data attributes so the dashboard script can read back the state it just rendered. --}}
@@ -159,7 +159,12 @@
                     default => $tile['value'] !== null ? number_format($tile['value']) : '—',
                 };
             @endphp
-            <div class="rounded-lg border border-surface-200 bg-surface-50/50 px-3 py-2">
+            {{-- data-kpi-tooltip reuses the exact same shared tooltip
+                 element/listener the Control Center's 5 KPI cards already
+                 use (see dashboard.blade.php) — no new JS needed, the
+                 delegated listener there just picks up any element with
+                 this attribute. --}}
+            <div class="rounded-lg border border-surface-200 bg-surface-50/50 px-3 py-2" data-kpi-tooltip="{{ $tile['description'] }}">
                 <p class="text-[11px] font-medium text-surface-500 uppercase tracking-wide truncate">{{ $tile['label'] }}</p>
                 <div class="flex items-baseline gap-1.5 mt-0.5 flex-wrap">
                     <span class="text-lg font-semibold text-surface-900 tabular-nums">{{ $displayValue }}</span>

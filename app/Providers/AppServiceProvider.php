@@ -2,9 +2,11 @@
 
 namespace App\Providers;
 
+use App\Models\DocumentAnnotation;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentRepository;
 use App\Models\NotificationRecord;
+use App\Policies\DocumentAnnotationPolicy;
 use App\Policies\DocumentAssignmentPolicy;
 use App\Policies\DocumentRepositoryPolicy;
 use App\Policies\NotificationRecordPolicy;
@@ -75,6 +77,7 @@ class AppServiceProvider extends ServiceProvider
         Gate::policy(DocumentRepository::class, DocumentRepositoryPolicy::class);
         Gate::policy(DocumentAssignment::class, DocumentAssignmentPolicy::class);
         Gate::policy(NotificationRecord::class, NotificationRecordPolicy::class);
+        Gate::policy(DocumentAnnotation::class, DocumentAnnotationPolicy::class);
     }
 
     /**

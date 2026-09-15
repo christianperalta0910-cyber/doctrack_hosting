@@ -5,12 +5,18 @@
         'processing' => ['bg-processing-50 text-processing-700 ring-processing-500/20', 'Processing'],
         'classified_validated' => ['bg-processing-50 text-processing-700 ring-processing-500/20', 'Awaiting Approval'],
         'approved' => ['bg-approved-50 text-approved-700 ring-approved-500/20', 'Approved'],
-        'auto_approved' => ['bg-approved-50 text-approved-700 ring-approved-500/20', 'Auto-Approved'],
+        // Deliberately NOT the same green as a real human 'approved' —
+        // this status means nobody actually reviewed it yet, only that
+        // the system approved it because no one acted in time. Amber
+        // (matching this app's other "not yet final" states) reads as
+        // provisional, not done, until an Admin actually confirms it.
+        'auto_approved' => ['bg-amber-50 text-amber-700 ring-amber-500/20', 'Auto-Approved — Pending Review'],
         'rejected' => ['bg-rejected-50 text-rejected-700 ring-rejected-500/20', 'Rejected'],
         'pending' => ['bg-processing-50 text-processing-700 ring-processing-500/20', 'Pending'],
         'escalated' => ['bg-rejected-50 text-rejected-700 ring-rejected-500/20', 'Escalated to Admin'],
         'disputed' => ['bg-processing-50 text-processing-700 ring-processing-500/20', 'Disputed (Auto-Approved)'],
         'pending_review' => ['bg-amber-50 text-amber-700 ring-amber-500/20', 'Pending Admin Review'],
+        'awaiting_approver_selection' => ['bg-amber-50 text-amber-700 ring-amber-500/20', 'Select Approver(s)'],
         'security_blocked' => ['bg-rejected-50 text-rejected-700 ring-rejected-500/20', '⚠ Blocked — Security Scan'],
     ];
     [$classes, $label] = $map[$status] ?? ['bg-surface-100 text-surface-600 ring-surface-300', ucfirst($status)];

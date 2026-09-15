@@ -57,6 +57,32 @@ class DocumentRepositoryPolicy
         return $document->originator_id === $user->user_id;
     }
 
+    /**
+     * Owner only, not even Admin — same reasoning as resubmit()/editText():
+     * this is the originator's own choice of who reviews THEIR document
+     * (Feature: originator-directed routing — see WorkflowService::
+     * routeToCustomApprovers()), not a general moderation action. Whether
+     * the document is actually in the right STATE for this (pending_custom_
+     * routing_at set) is a state guard, not an authorization question — see
+     * DocumentController::selectApprovers(), same split resubmit() already
+     * uses for its own state check.
+     */
+    public function routeCustom(User $user, DocumentRepository $document): bool
+    {
+        return $document->originator_id === $user->user_id;
+    }
+
+    /**
+     * Owner only, not even Admin — same reasoning as resubmit(): this is
+     * the originator directly editing their own document's plain text to
+     * address a Request Revision annotation (see WorkflowService::
+     * requestRevision()), not a general moderation action.
+     */
+    public function editText(User $user, DocumentRepository $document): bool
+    {
+        return $document->originator_id === $user->user_id;
+    }
+
     private function isAssignedApprover(User $user, DocumentRepository $document): bool
     {
         if (!$user->isApprover()) {

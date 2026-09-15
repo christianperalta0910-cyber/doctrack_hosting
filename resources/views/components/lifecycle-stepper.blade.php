@@ -16,10 +16,17 @@
     // gets its own caption below rather than the generic rejection one.
     $isSecurityBlocked = (bool) $document->is_security_blocked;
 
-    // Normalize auto_approved -> approved for stepper positioning.
+    // Normalize auto_approved -> approved for stepper POSITIONING only —
+    // it's still the last step either way. The color is a separate
+    // question, handled below: an auto-approved document hasn't actually
+    // been signed off by a person yet, so its final node shouldn't read
+    // as identically "done" as a real approval (matches the status badge
+    // and per-stage circles elsewhere, which already make this
+    // distinction).
     $effective = in_array($status, ['approved', 'auto_approved']) ? 'approved' : $status;
     $found = array_search($effective, $order);
     $currentIndex = $isSecurityBlocked ? 0 : ($isRejected ? 1 : ($found === false ? 0 : $found));
+    $isAutoApproved = $status === 'auto_approved';
 @endphp
 
 {{-- overflow-x-auto is the fallback for very narrow phones — the three
@@ -40,11 +47,16 @@
             // instead, to flag where things actually stopped rather than
             // implying it completed normally.
             $isComplete = $i < $currentIndex || ($isCurrent && !$isRejected);
+            // Only the FINAL node can ever be the auto-approved one —
+            // "Submitted"/"Classified & Validated" already happened for
+            // real either way, so they stay green regardless.
+            $isAutoApprovedNode = $isComplete && $isCurrent && $isAutoApproved;
         @endphp
         <div class="flex items-center {{ $i < count($order) - 1 ? 'flex-1' : '' }}">
             <div class="flex flex-col items-center gap-1.5">
                 <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ring-2 transition-shadow
-                    @if($isComplete) bg-gradient-to-br from-approved-500 to-approved-600 text-white ring-approved-500 shadow-sm shadow-approved-500/30
+                    @if($isAutoApprovedNode) bg-gradient-to-br from-amber-500 to-amber-600 text-white ring-amber-500 shadow-sm shadow-amber-500/30
+                    @elseif($isComplete) bg-gradient-to-br from-approved-500 to-approved-600 text-white ring-approved-500 shadow-sm shadow-approved-500/30
                     @elseif($isCurrent && $isRejected) bg-gradient-to-br from-rejected-500 to-rejected-600 text-white ring-rejected-500 shadow-sm shadow-rejected-500/30
                     @else bg-surface-100 text-surface-400 ring-surface-200 @endif">
                     @if($isComplete)
@@ -65,10 +77,15 @@
                     // pending while the genuinely pending part (what comes
                     // after it) does.
                     $isLineComplete = $i < $currentIndex;
+                    // The line leading INTO the final node matches that
+                    // node's own color — amber if what's at the end of it
+                    // is an auto-approval, not a real one.
+                    $isLineToAutoApproved = $isLineComplete && $isAutoApproved && ($i === $currentIndex - 1);
                     $isLineProcessing = $isCurrent && !$isRejected;
                 @endphp
                 <div class="flex-1 h-0.5 mx-2 rounded-full
-                    @if($isLineComplete) bg-approved-500
+                    @if($isLineToAutoApproved) bg-amber-500
+                    @elseif($isLineComplete) bg-approved-500
                     @elseif($isLineProcessing) bg-processing-500
                     @else bg-surface-200 @endif"></div>
             @endif

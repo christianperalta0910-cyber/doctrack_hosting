@@ -29,9 +29,56 @@
             </div>
         @endif
 
-        <div class="divide-y divide-surface-100">
+        {{-- divide-surface-200 (not the near-invisible -100 shade, which
+             was barely distinguishable from the white card behind it) so
+             each document in a batch reads as a clearly separated block —
+             see the "p-6" padding on each document's own wrapper below for
+             the breathing room around this line. --}}
+        <div class="divide-y-2 divide-surface-200">
             @foreach($container->documents as $documentId => $stageAssignments)
-                @php $doc = $stageAssignments->first()->document; @endphp
+                @php
+                    $doc = $stageAssignments->first()->document;
+
+                    // Computed early, before the title row (not down by the
+                    // action panel where this used to live) — the priority
+                    // badge now sits right on the title line, aligned to the
+                    // document name, so it's visible at a glance instead of
+                    // buried at the bottom of the card.
+                    //
+                    // Only a still-pending seat is actionable — a document
+                    // can also show up in this queue purely because it's
+                    // waiting on OTHER approvers after this one already
+                    // decided every seat they hold (see ApprovalController::
+                    // resolvedButInFlightQueryFor()), in which case there's
+                    // no priority to show at all.
+                    $activeAssignment = $stageAssignments->where('individual_status', 'pending')
+                        ->sortBy(fn ($a) => $a->stage->sequence_order)->first();
+
+                    // Urgent/Normal/Low/Expired — driven by real remaining
+                    // BUSINESS time before this seat's own SLA deadline
+                    // (DocumentAssignment::urgencyRank()), not the
+                    // document's overall due date, so the badge always
+                    // agrees with the countdown shown in the action panel
+                    // below.
+                    $urgencyStyles = [
+                        1 => ['Urgent', 'bg-rejected-50 text-rejected-700 ring-rejected-500/20'],
+                        2 => ['Normal', 'bg-processing-50 text-processing-700 ring-processing-500/20'],
+                        3 => ['Low', 'bg-surface-100 text-surface-600 ring-surface-300'],
+                        4 => ['Expired', 'bg-rejected-100 text-rejected-800 ring-rejected-500/40'],
+                    ];
+                    [$pLabel, $pClass] = $activeAssignment ? $urgencyStyles[$activeAssignment->urgencyRank()] : [null, null];
+
+                    // Majority-vote reject (Feature: one lone reject on a
+                    // multi-approver stage no longer kills the document —
+                    // see DocumentAssignment::stageRejectionStatus() and
+                    // WorkflowService::completeStage()). Once enough OTHER
+                    // seats on this stage have already approved that
+                    // reject can no longer mathematically reach the
+                    // threshold, Reject is taken off the table here
+                    // rather than offered as a choice that can't do
+                    // anything.
+                    $voteStatus = $activeAssignment?->stageRejectionStatus();
+                @endphp
                 <div class="p-6">
                     @if(!$container->is_batch)
                         <div class="flex items-center justify-between mb-2">
@@ -45,6 +92,9 @@
                     <div class="flex items-center gap-2 mb-1">
                         <h3 class="text-sm font-semibold text-surface-900">{{ $doc->title }}</h3>
                         <span class="text-xs text-surface-400">· {{ $doc->ml_category }}</span>
+                        @if($pLabel)
+                            <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ring-1 ring-inset {{ $pClass }}">{{ $pLabel }}</span>
+                        @endif
                     </div>
                     <p class="text-xs text-surface-500 mb-2">
                         Submitted by {{ $doc->originator->full_name }} ·
@@ -53,6 +103,14 @@
                            class="text-primary-700 hover:underline font-medium">
                             View original file
                         </button>
+                        @if($activeAssignment)
+                            ·
+                            <button type="button"
+                               onclick="openReviewAndComment({{ $doc->document_id }}, 'Review &amp; Comment — {{ addslashes($doc->title) }}', '{{ route('approver.assignments.annotations', $activeAssignment) }}')"
+                               class="text-primary-700 hover:underline font-medium">
+                                Review &amp; Comment
+                            </button>
+                        @endif
                     </p>
 
                     <div class="mb-3">
@@ -72,28 +130,9 @@
                          visible up there as "Up next" and becomes actionable here once this
                          one is resolved. --}}
                     @php
-                        // Only a still-pending seat is actionable here — a
-                        // document can also show up in this queue purely
-                        // because it's waiting on OTHER approvers after
-                        // this one already decided every seat they hold
-                        // (see ApprovalController::resolvedButInFlightQueryFor()),
-                        // in which case there's nothing left for THIS
-                        // approver to act on below.
-                        $activeAssignment = $stageAssignments->where('individual_status', 'pending')
-                            ->sortBy(fn ($a) => $a->stage->sequence_order)->first();
-
-                        // Urgent/Normal/Low/Expired — driven by real remaining
-                        // BUSINESS time before this seat's own SLA deadline
-                        // (DocumentAssignment::urgencyRank()), not the
-                        // document's overall due date, so the badge always
-                        // agrees with the countdown shown right below it.
-                        $urgencyStyles = [
-                            1 => ['Urgent', 'bg-rejected-50 text-rejected-700 ring-rejected-500/20'],
-                            2 => ['Normal', 'bg-processing-50 text-processing-700 ring-processing-500/20'],
-                            3 => ['Low', 'bg-surface-100 text-surface-600 ring-surface-300'],
-                            4 => ['Expired', 'bg-rejected-100 text-rejected-800 ring-rejected-500/40'],
-                        ];
-                        [$pLabel, $pClass] = $activeAssignment ? $urgencyStyles[$activeAssignment->urgencyRank()] : [null, null];
+                        // $activeAssignment/$pLabel/$pClass are already
+                        // computed above (see the title row's priority
+                        // badge) — nothing further to do for those here.
 
                         // Real (business-hours-aware) countdown, not a raw
                         // wall-clock diff — see realSecondsRemaining()'s
@@ -146,8 +185,10 @@
                     @else
                     <div class="flex flex-col sm:flex-row sm:items-center gap-4 rounded-xl border {{ $activeAssignment->escalated_to_admin ? 'border-rejected-200 bg-rejected-50/40' : 'border-primary-200 bg-primary-50/40' }} p-4 shadow-sm">
                         <div class="flex-1 min-w-0">
+                            {{-- Priority badge now lives up on the title row
+                                 (aligned to the document name), not repeated
+                                 here. --}}
                             <div class="flex items-center gap-2 mb-1">
-                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ring-1 ring-inset {{ $pClass }}">{{ $pLabel }}</span>
                                 <span class="text-xs text-surface-500 font-medium">Stage: {{ $activeAssignment->stage->stage_name }}</span>
                             </div>
                             <p class="text-xs text-surface-400">
@@ -176,6 +217,10 @@
                             @elseif($outsideBusinessHoursBlocked)
                                 <p class="text-xs text-processing-700 font-medium mt-1">
                                     Decisions are currently restricted to business hours (9 AM–5 PM, Mon–Sat) — Approve/Reject will unlock when the next working window opens.
+                                </p>
+                            @elseif($voteStatus && !$voteStatus['rejectStillPossible'])
+                                <p class="text-xs text-processing-700 font-medium mt-1">
+                                    This stage already has majority approval ({{ $voteStatus['approved'] }} of {{ $voteStatus['total'] }}) — it can no longer be rejected. You can still approve it, or flag a specific concern with Request Revision.
                                 </p>
                             @endif
                         </div>
@@ -223,7 +268,11 @@
                                         Approve
                                     </button>
                                     <button type="submit" name="decision" value="rejected"
-                                        {{ ($reviewSecondsRemaining > 0 || $outsideBusinessHoursBlocked) ? 'disabled' : '' }}
+                                        {{ ($reviewSecondsRemaining > 0 || $outsideBusinessHoursBlocked || ($voteStatus && !$voteStatus['rejectStillPossible'])) ? 'disabled' : '' }}
+                                        @if($voteStatus && !$voteStatus['rejectStillPossible'])
+                                            title="This stage already has majority approval — it can no longer be rejected."
+                                            data-permanently-disabled="1"
+                                        @endif
                                         onclick="this.form.querySelector('textarea[name=comments]').required = true"
                                         class="review-decide-btn flex-1 bg-gradient-to-b from-rejected-500 to-rejected-600 hover:from-rejected-600 hover:to-rejected-700 text-white text-xs font-semibold py-2 rounded-lg shadow-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:from-rejected-500 disabled:hover:to-rejected-600">
                                         Reject

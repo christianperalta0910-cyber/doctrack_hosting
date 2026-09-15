@@ -162,27 +162,6 @@ it('blocks an admin from deciding an Unassigned Documents seat with no review ti
     expect($assignment->fresh()->individual_status)->toBe('pending');
 });
 
-it('blocks an admin SLA override with no review time', function () {
-    $admin = User::factory()->admin()->create();
-    $originator = User::factory()->originator()->create();
-    $approver = User::factory()->approver('Job Order')->create();
-    $stage = WorkflowStage::create(['document_category' => 'Job Order', 'stage_name' => 'Review', 'sequence_order' => 1]);
-    $document = minReviewDoc($originator);
-    $assignment = DocumentAssignment::create([
-        'document_id' => $document->document_id, 'user_id' => $approver->user_id,
-        'stage_id' => $stage->stage_id, 'due_date' => $document->due_date,
-        'priority_rank' => 2, 'individual_status' => 'pending', 'sla_expires_at' => now()->subHour(),
-        'escalated_to_admin' => true, 'escalated_at' => now()->subMinutes(30),
-    ]);
-
-    $response = $this->actingAs($admin)->post(route('admin.sla.override', $assignment), [
-        'decision' => 'approved',
-    ]);
-
-    $response->assertStatus(422);
-    expect($assignment->fresh()->individual_status)->toBe('pending');
-});
-
 it('blocks confirming an ML review document with no review time', function () {
     $admin = User::factory()->admin()->create();
     $originator = User::factory()->originator()->create();

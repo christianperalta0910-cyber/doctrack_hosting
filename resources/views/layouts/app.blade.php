@@ -124,6 +124,42 @@
             </div>
         </header>
 
+        @auth
+            {{-- Connection & responsiveness indicator — shown for two
+                 different reasons (see app.js): Reverb's WebSocket isn't
+                 connected, OR a click/form-submit/pagination action is
+                 taking noticeably long to respond on a weak connection
+                 (the WebSocket alone can't catch that second case — a
+                 plain page navigation never touches Reverb). Centered,
+                 fixed over the page — no pointer-events-none, so it also
+                 blocks interaction with the rest of the page while shown
+                 (acting on something that's about to fail anyway is more
+                 confusing than a brief block). No card, no background
+                 color on the text/spinner themselves — they stand out via
+                 a drop-shadow and bold dark color instead of a solid box.
+                 One shared instance covers every page, so this needs no
+                 per-page wiring.
+
+                 Deliberately a flat semi-transparent tint (bg-surface-900
+                 at low opacity), NOT backdrop-blur — blur was tried twice
+                 (full-screen, then a separate static layer to stop it
+                 re-rendering every animation frame) and still caused
+                 real, measured system-wide lag on weaker/older graphics
+                 hardware. A flat tint is just alpha blending — no
+                 continuous filter recalculation — so it costs
+                 essentially nothing to render regardless of hardware,
+                 while still visibly dimming the page underneath. --}}
+            <div id="connection-status" class="hidden fixed inset-0 z-40 bg-surface-900/20" role="status" aria-label="Reconnecting">
+                <div class="relative h-full flex flex-col items-center justify-center gap-3 drop-shadow-[0_4px_12px_rgba(15,23,42,0.35)]">
+                    <svg class="w-8 h-8 animate-spin text-primary-700" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    <p class="text-sm font-semibold text-surface-900">Reconnecting</p>
+                </div>
+            </div>
+        @endauth
+
         <main class="flex-1 overflow-y-auto p-4 sm:p-8 space-y-6">
             @if(session('status'))
                 <div class="rounded-xl bg-approved-50 border border-approved-500/25 text-approved-700 px-4 py-3 text-sm font-medium shadow-sm flex items-center gap-2.5 transition-opacity duration-300" role="status">
@@ -152,28 +188,16 @@
 </div>
 @auth
     <x-document-viewer-modal />
-    <x-backup-codes-modal />
-    @if(auth()->user()->isAdmin())
+    <x-confirm-modal />
+    {{-- Was admin-only (the dashboard's clickable KPI cards) until the
+         Approver Queue's "Review & Comment" feature, and now the
+         Originator's "Select Approver(s)" step (Feature: originator-
+         directed routing), reused this same shared fetch-and-show modal —
+         it has no role-specific logic inside it, just a generic pattern,
+         so widening this each time rather than building a near-identical
+         modal per role. --}}
+    @if(auth()->user()->isAdmin() || auth()->user()->isApprover() || auth()->user()->isOriginator())
         <x-kpi-drilldown-modal />
-    @endif
-
-    @if(session('new_backup_codes'))
-        {{-- application/json, not a data-attribute — codes never
-             round-trip through HTML attribute encoding this way, and
-             the value can't terminate early on a stray quote. Shown
-             once, on the account holder's own first successful login —
-             see AuthController::login()'s new_backup_codes flash. --}}
-        <script type="application/json" id="new-backup-codes-data">@json(session('new_backup_codes'))</script>
-        <script>
-            document.addEventListener('DOMContentLoaded', function () {
-                const codes = JSON.parse(document.getElementById('new-backup-codes-data').textContent);
-                openBackupCodesModalWithCodes(
-                    'Your Sign In Backup Codes',
-                    codes,
-                    "Save these now — if you ever lose access, your Administrator can look them up for you, but they'll need your current password to do it."
-                );
-            });
-        </script>
     @endif
 @endauth
 <script>

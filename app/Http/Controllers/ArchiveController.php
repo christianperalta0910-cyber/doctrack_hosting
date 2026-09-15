@@ -35,6 +35,19 @@ use Illuminate\Support\Facades\Storage;
  */
 class ArchiveController extends Controller
 {
+    /**
+     * A pseudo-category, not a real trained one — the folder/filter value
+     * for a document the originator flagged as not belonging to any
+     * current category (Feature: originator-directed routing — see
+     * DocumentRepository::desired_routing). The ML classifier is closed-
+     * set, so ml_category is ALWAYS one of the real known categories even
+     * for one of these (the classifier's best guess is kept for
+     * reference — see ValidationService::validateGeneric()'s docblock),
+     * which is why this folder has to be identified via desired_routing
+     * rather than filtered by ml_category's actual value.
+     */
+    private const UNCLASSIFIED_FOLDER = 'Unclassified';
+
     public function __construct(private TextExtractionService $extractor)
     {
     }
@@ -72,7 +85,7 @@ class ArchiveController extends Controller
             return view('archive.index', [
                 'showFolders' => true,
                 'folders' => $this->folderStats($user),
-                'categories' => ValidationService::knownCategories(),
+                'categories' => [...ValidationService::knownCategories(), self::UNCLASSIFIED_FOLDER],
                 'restrictedCategory' => null,
                 'noCategoryAssigned' => false,
                 'isOwnSubmissionsView' => !$user->isAdmin(),
@@ -84,7 +97,7 @@ class ArchiveController extends Controller
         return view('archive.index', [
             'showFolders' => false,
             'documents' => $documents,
-            'categories' => ValidationService::knownCategories(),
+            'categories' => [...ValidationService::knownCategories(), self::UNCLASSIFIED_FOLDER],
             'restrictedCategory' => $user->isApprover() ? $user->assigned_category : null,
             'noCategoryAssigned' => false,
             'isOwnSubmissionsView' => $isOwnSubmissionsView,
@@ -131,9 +144,17 @@ class ArchiveController extends Controller
 
         // Category filter is available to Admin (any category) and
         // Originator (within their own submissions); Approver's category is
-        // fixed above and not user-selectable.
+        // fixed above and not user-selectable. self::UNCLASSIFIED_FOLDER is
+        // a pseudo-category, not a real one the classifier ever assigns —
+        // see folderStats()'s docblock for why it has to be checked via
+        // desired_routing rather than ml_category (the classifier is
+        // closed-set, so ml_category is ALWAYS one of the real known
+        // categories even for a document flagged this way).
         if (!$user->isApprover() && $request->filled('category')) {
-            $query->where('ml_category', $request->string('category'));
+            $category = $request->string('category');
+            $category->toString() === self::UNCLASSIFIED_FOLDER
+                ? $query->where('desired_routing', 'unrelated')
+                : $query->where('ml_category', $category);
         }
 
         if ($request->filled('keyword')) {
@@ -200,7 +221,7 @@ class ArchiveController extends Controller
             $base->where('originator_id', $user->user_id);
         }
 
-        return collect(ValidationService::knownCategories())->map(function ($category) use ($base) {
+        $folders = collect(ValidationService::knownCategories())->map(function ($category) use ($base) {
             $categoryQuery = (clone $base)->where('ml_category', $category);
 
             return (object) [
@@ -210,6 +231,23 @@ class ArchiveController extends Controller
                 'auto_approved' => (clone $categoryQuery)->where('global_status', 'auto_approved')->whereNull('disputed_at')->count(),
             ];
         });
+
+        // Only shown at all once there's something in it — unlike the real
+        // categories above (always shown, even empty, since they're the
+        // fixed set an admin configured), this one only exists because a
+        // document actually landed here.
+        $unclassifiedQuery = (clone $base)->where('desired_routing', 'unrelated');
+        $unclassifiedTotal = (clone $unclassifiedQuery)->count();
+        if ($unclassifiedTotal > 0) {
+            $folders->push((object) [
+                'category' => self::UNCLASSIFIED_FOLDER,
+                'total' => $unclassifiedTotal,
+                'disputed' => (clone $unclassifiedQuery)->whereNotNull('disputed_at')->count(),
+                'auto_approved' => (clone $unclassifiedQuery)->where('global_status', 'auto_approved')->whereNull('disputed_at')->count(),
+            ]);
+        }
+
+        return $folders;
     }
 
     public function download(Request $request, DocumentRepository $document)

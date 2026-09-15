@@ -22,32 +22,38 @@
      phones. At sm and up there's enough room to anchor to the trigger like
      a normal dropdown. --}}
 <div class="fixed inset-x-4 top-16 sm:absolute sm:inset-x-auto sm:top-auto sm:right-0 sm:mt-2 w-auto sm:w-[30rem] sm:max-w-[94vw] bg-white rounded-xl shadow-elevated border border-surface-200/80 z-30">
-    <div class="px-5 py-4 border-b border-surface-200 flex items-center justify-between">
+    <div class="px-5 py-4 border-b border-surface-200">
         <h3 class="text-sm font-semibold text-surface-900 tracking-tight">Notifications</h3>
-        @if($unreadCount > 0)
-            <form method="POST" action="{{ route('notifications.readAll') }}">
-                @csrf
-                <button class="text-xs text-primary-700 hover:underline font-medium">Mark all read</button>
-            </form>
-        @endif
     </div>
+    {{-- Recent notifications regardless of read status — opening the bell
+         (see the 'toggle' listener in app.js) marks them all read without
+         removing them from here, and clicking one marks just that one
+         read and navigates to what it's about (NotificationRecord::
+         targetUrl()). Previously this only showed unread ones, so marking
+         read made everything vanish from the dropdown until you visited
+         the full notifications page. --}}
     <ul class="divide-y divide-surface-100 max-h-[28rem] overflow-y-auto">
-        @forelse($unread as $n)
-            <li class="flex items-start gap-3 px-5 py-4 hover:bg-surface-50 transition-colors {{ $n->is_read ? '' : 'bg-primary-50/40' }}">
-                @unless($n->is_read)
-                    <span class="mt-1.5 w-2 h-2 rounded-full bg-primary-500 flex-shrink-0 shadow-[0_0_0_3px] shadow-primary-500/15"></span>
-                @else
-                    <span class="mt-1.5 w-2 h-2 flex-shrink-0"></span>
-                @endunless
-                <div class="min-w-0 flex-1">
-                    @if($n->priority === 'high')
-                        <span class="inline-flex items-center gap-1 mb-1 text-[10px] font-semibold text-rejected-700 uppercase tracking-wide">
-                            <span class="w-1.5 h-1.5 rounded-full bg-rejected-500"></span> High priority
+        @forelse($recent as $n)
+            <li class="{{ $n->is_read ? '' : 'bg-primary-50/40' }}">
+                <form method="POST" action="{{ route('notifications.read', $n) }}">
+                    @csrf
+                    <button type="submit" class="w-full text-left flex items-start gap-3 px-5 py-4 hover:bg-surface-100 transition-colors">
+                        @unless($n->is_read)
+                            <span class="mt-1.5 w-2 h-2 rounded-full bg-primary-500 flex-shrink-0 shadow-[0_0_0_3px] shadow-primary-500/15"></span>
+                        @else
+                            <span class="mt-1.5 w-2 h-2 flex-shrink-0"></span>
+                        @endunless
+                        <span class="min-w-0 flex-1">
+                            @if($n->priority === 'high')
+                                <span class="inline-flex items-center gap-1 mb-1 text-[10px] font-semibold text-rejected-700 uppercase tracking-wide">
+                                    <span class="w-1.5 h-1.5 rounded-full bg-rejected-500"></span> High priority
+                                </span>
+                            @endif
+                            <span class="block text-sm text-surface-700 leading-relaxed break-words">{{ $n->message_body }}</span>
+                            <span class="block text-xs text-surface-400 mt-1.5">{{ $n->created_at->diffForHumans() }}</span>
                         </span>
-                    @endif
-                    <p class="text-sm text-surface-700 leading-relaxed break-words">{{ $n->message_body }}</p>
-                    <p class="text-xs text-surface-400 mt-1.5">{{ $n->created_at->diffForHumans() }}</p>
-                </div>
+                    </button>
+                </form>
             </li>
         @empty
             <li class="px-5 py-8 text-center text-sm text-surface-400">You're all caught up.</li>

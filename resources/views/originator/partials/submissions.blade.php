@@ -32,18 +32,31 @@
                 </td>
                 <td class="px-6 py-4 text-surface-500">
                     @if($doc->batch)
-                        <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-primary-50 text-primary-700 ring-1 ring-inset ring-primary-500/20">
+                        <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-primary-50 text-primary-700 ring-1 ring-inset ring-primary-500/20 whitespace-nowrap">
                             Batch #{{ $doc->batch_id }}
                         </span>
                     @else
                         <span class="text-surface-300">—</span>
                     @endif
                 </td>
-                <td class="px-6 py-4 text-surface-600">{{ $doc->ml_category ?? '—' }}</td>
+                <td class="px-6 py-4 text-surface-600">{{ $doc->display_category ?? '—' }}</td>
                 <td class="px-6 py-4"><x-status-badge :status="$doc->display_status" /></td>
                 <td class="px-6 py-4 text-surface-500 whitespace-nowrap">{{ $doc->upload_date->format('M j, Y, g:i A') }}</td>
                 <td class="px-6 py-4 text-right">
-                    <a href="{{ route('originator.documents.show', $doc) }}" class="text-primary-700 hover:text-primary-900 font-medium text-xs">Track &rarr;</a>
+                    {{-- No whitespace-nowrap here (unlike the Batch badge
+                         above) — "Select Approver(s) →" is long enough
+                         that forcing it onto one line pushed this column
+                         wider than the table's own scroll container,
+                         scrolling the buttons out of view entirely on a
+                         normal-width screen. Letting it wrap back onto
+                         two lines when needed keeps the column narrow. --}}
+                    @if($doc->pending_custom_routing_at)
+                        <button type="button"
+                            onclick="openKpiDrilldown('select-approvers', 'Select Approver(s) — {{ addslashes($doc->title) }}', '{{ route('originator.documents.selectApprovers', $doc) }}')"
+                            class="inline-flex items-center px-2 py-1 rounded-full bg-amber-50 hover:bg-amber-100 text-amber-700 hover:text-amber-900 font-semibold text-xs transition-colors">Select Approver(s) &rarr;</button>
+                    @else
+                        <a href="{{ route('originator.documents.show', $doc) }}" class="inline-flex items-center px-2 py-1 rounded-full bg-primary-50 hover:bg-primary-100 text-primary-700 hover:text-primary-900 font-medium text-xs transition-colors">Track &rarr;</a>
+                    @endif
                 </td>
             </tr>
             @if(!$doc->is_validated && $doc->global_status === 'processing')

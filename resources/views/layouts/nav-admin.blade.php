@@ -19,7 +19,7 @@
 </a>
 <a href="{{ route('admin.sla.queue') }}" class="{{ $link('admin.sla.queue') }}">
     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-    SLA Overrides
+    Auto-Approval Review
 </a>
 <a href="{{ route('admin.unassigned.index') }}" class="{{ $link('admin.unassigned') }}">
     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/><path stroke-linecap="round" stroke-linejoin="round" d="M19 8l2 2m0-2l-2 2"/></svg>
@@ -32,6 +32,10 @@
 <a href="{{ route('admin.calendar') }}" class="{{ $link('admin.calendar') }}">
     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
     Calendar
+</a>
+<a href="{{ route('admin.performance.insights') }}" class="{{ $link('admin.performance.insights') }}">
+    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 13.5V21h4.5v-7.5H3zM9.75 8.25V21h4.5V8.25h-4.5zM16.5 3v18H21V3h-4.5z"/></svg>
+    Performance Insights
 </a>
 <a href="{{ route('admin.sla.violations') }}" class="{{ $link('admin.sla.violations') }}">
     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>

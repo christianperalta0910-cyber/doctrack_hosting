@@ -50,12 +50,6 @@ Route::middleware('guest')->group(function () {
     // which the per-email limiter alone wouldn't trip.
     Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:auth')->name('login.attempt');
 
-    // AJAX action behind the login page's "Get Code"/"Resend Code" button
-    // — email/password/code all live on the one login page now (see
-    // auth/login.blade.php), so there's no separate two-factor page to
-    // route to. See AuthController::requestCode()'s docblock.
-    Route::post('/login/request-code', [AuthController::class, 'requestCode'])->middleware('throttle:auth-sensitive')->name('login.request-code');
-
     // Self-service password reset — reachable by a guest by definition
     // (that's the whole point: they can't log in to reach anything else).
     Route::get('/forgot-password', [AuthController::class, 'showForgotPassword'])->name('password.request');
@@ -108,6 +102,17 @@ Route::middleware('auth')->group(function () {
         Route::get('/documents/{document}/poll', [DocumentController::class, 'trackingPoll'])->middleware('throttle:polling')->name('documents.trackingPoll');
         Route::get('/documents/{document}/refresh', [DocumentController::class, 'trackingRefresh'])->middleware('throttle:polling')->name('documents.trackingRefresh');
         Route::post('/documents/{document}/resubmit', [DocumentController::class, 'resubmit'])->middleware('throttle:mutations')->name('documents.resubmit');
+        // "Editable document" (Feature: fix a flagged passage directly in
+        // the app instead of re-uploading a whole new file — see
+        // WorkflowService::saveDocumentRevision()).
+        Route::post('/documents/{document}/revision', [DocumentController::class, 'saveRevision'])->middleware('throttle:mutations')->name('documents.saveRevision');
+        // Originator-directed routing (Feature: bypass the standard
+        // pipeline and hand-pick the approver(s) — see WorkflowService::
+        // routeToCustomApprovers()). GET shows the picker once a document
+        // uploaded with routing_mode custom/unrelated is ready
+        // (pending_custom_routing_at set); POST actually routes it.
+        Route::get('/documents/{document}/select-approvers', [DocumentController::class, 'selectApprovers'])->name('documents.selectApprovers');
+        Route::post('/documents/{document}/route-custom', [DocumentController::class, 'routeCustom'])->middleware('throttle:mutations')->name('documents.routeCustom');
         Route::get('/archive', [ArchiveController::class, 'index'])->name('archive');
     });
 
@@ -124,6 +129,17 @@ Route::middleware('auth')->group(function () {
         Route::get('/assignments/refresh', [ApprovalController::class, 'refresh'])->middleware('throttle:polling')->name('assignments.refresh');
         Route::post('/assignments/{assignment}/decide', [ApprovalController::class, 'decide'])->name('assignments.decide');
         Route::post('/assignments/decide-batch', [ApprovalController::class, 'decideBatch'])->name('assignments.decideBatch');
+        // Request Revision (Feature: highlight a passage + comment,
+        // instead of rejecting outright — see WorkflowService's
+        // majority-vote reject redesign). The GET fetches the document's
+        // plain text + existing annotations for the "Review & Comment"
+        // modal; the POST creates a new one.
+        Route::get('/assignments/{assignment}/annotations', [ApprovalController::class, 'annotationsPanel'])->name('assignments.annotations');
+        Route::post('/assignments/{assignment}/request-revision', [ApprovalController::class, 'requestRevision'])->name('assignments.requestRevision');
+        // Withdraw a flag this approver themselves raised (Feature: "I
+        // flagged the wrong thing" / "never mind" — see
+        // WorkflowService::withdrawAnnotation()).
+        Route::post('/annotations/{annotation}/withdraw', [ApprovalController::class, 'withdrawAnnotation'])->middleware('throttle:mutations')->name('annotations.withdraw');
         Route::post('/availability/toggle', [ApprovalController::class, 'toggleAvailability'])->name('availability.toggle');
         Route::get('/archive', [ArchiveController::class, 'index'])->name('archive');
 
@@ -153,10 +169,6 @@ Route::middleware('auth')->group(function () {
         Route::post('/users/{user}/resend-verification', [AdminController::class, 'resendVerification'])->name('users.resend-verification');
         Route::get('/users/{user}/stages', [AdminController::class, 'editApproverStages'])->name('users.stages.edit');
         Route::post('/users/{user}/stages', [AdminController::class, 'updateApproverStages'])->name('users.stages.update');
-        // Password-gated (the target user's own current password, not
-        // the admin's) — see AdminController::backupCodes() docblock.
-        // Same lockout behavior as login itself (Concerns\ThrottlesAttempts).
-        Route::post('/users/{user}/backup-codes', [AdminController::class, 'backupCodes'])->middleware('throttle:auth-sensitive')->name('users.backup-codes');
 
         Route::get('/ml-training', [AdminController::class, 'mlTraining'])->name('ml.training');
         Route::post('/ml-training', [AdminController::class, 'trainModel'])->name('ml.train');
@@ -173,17 +185,22 @@ Route::middleware('auth')->group(function () {
         Route::get('/sla-queue', [AdminController::class, 'slaQueue'])->name('sla.queue');
         Route::get('/sla-queue/refresh', [AdminController::class, 'slaQueueRefresh'])->middleware('throttle:polling')->name('sla.queue.refresh');
         Route::get('/sla-queue/poll', [AdminController::class, 'slaQueuePoll'])->middleware('throttle:polling')->name('sla.queue.poll');
-        Route::post('/sla-queue/{assignment}/override', [AdminController::class, 'override'])->name('sla.override');
-        Route::post('/sla-queue/override-batch', [AdminController::class, 'overrideBatch'])->name('sla.overrideBatch');
         Route::post('/sla-queue/document/{document}/review', [AdminController::class, 'reviewAutoApproval'])->name('sla.review');
 
-        // Unassigned Documents: seats deactivation left with genuinely no
-        // eligible approver — kept separate from the SLA Override Queue
-        // above on purpose (see AdminController::markNeedsApprover doc).
+        // Unassigned Documents: seats left with genuinely no eligible
+        // approver — Admin is the fallback approver here up until the
+        // deadline passes, at which point it auto-approves the same way
+        // a missed approver assignment would (see SlaService::
+        // escalateNeedsApprover()).
         Route::get('/unassigned-documents', [AdminController::class, 'unassignedDocuments'])->name('unassigned.index');
         Route::get('/unassigned-documents/refresh', [AdminController::class, 'unassignedDocumentsRefresh'])->middleware('throttle:polling')->name('unassigned.refresh');
         Route::get('/unassigned-documents/poll', [AdminController::class, 'unassignedDocumentsPoll'])->middleware('throttle:polling')->name('unassigned.poll');
         Route::post('/unassigned-documents/{assignment}/decide', [AdminController::class, 'decideUnassigned'])->name('unassigned.decide');
+
+        // Workflow Config's own "decide this pending assignment directly"
+        // action — see AdminController::overrideAssignment()'s docblock
+        // for how this differs from unassigned.decide just above.
+        Route::post('/sla-override/{assignment}', [AdminController::class, 'overrideAssignment'])->middleware('throttle:mutations')->name('sla.override');
 
         Route::post('/system-settings/business-hours-toggle', [AdminController::class, 'updateBusinessHoursEnforcement'])->name('systemSettings.businessHoursToggle');
 
@@ -210,16 +227,29 @@ Route::middleware('auth')->group(function () {
             ->name('calendar.documentsOnDate');
 
         Route::get('/sla-violations', [AdminController::class, 'violationsReport'])->name('sla.violations');
-        // Live search (Feature: instant results as you type) — returns just
-        // the results fragment, same pattern as archive.refresh.
-        Route::get('/sla-violations/refresh', [AdminController::class, 'violationsRefresh'])
-            ->middleware('throttle:polling')->name('sla.violations.refresh');
-        Route::get('/sla-violations/poll', [AdminController::class, 'violationsPoll'])
-            ->middleware('throttle:polling')->name('sla.violations.poll');
+        Route::get('/sla-violations/admin/refresh', [AdminController::class, 'adminViolationsRefresh'])
+            ->middleware('throttle:polling')->name('sla.violations.admin.refresh');
+        Route::get('/sla-violations/admin/poll', [AdminController::class, 'adminViolationsPoll'])
+            ->middleware('throttle:polling')->name('sla.violations.admin.poll');
+        // Popup fragment (Feature: click an approver's row, see every
+        // document/stage they have a violation on) — fetched by the shared
+        // openKpiDrilldown() modal, same pattern as the Admin dashboard's
+        // clickable KPI cards.
+        Route::get('/sla-violations/approver/{approver}', [AdminController::class, 'approverViolationDocuments'])
+            ->middleware('throttle:polling')->name('sla.violations.approver');
+        // Stat-card data for one approver (Feature: clicking their row also
+        // swaps the top cards to their own numbers) — fetched separately
+        // from the popup fragment above, in parallel.
+        Route::get('/sla-violations/approver/{approver}/stats', [AdminController::class, 'approverStats'])
+            ->middleware('throttle:polling')->name('sla.violations.approver.stats');
 
         Route::get('/audit-logs', [AdminController::class, 'auditLogs'])->name('audit.logs');
         Route::get('/audit-logs/refresh', [AdminController::class, 'auditLogsRefresh'])->middleware('throttle:polling')->name('audit.logs.refresh');
         Route::get('/audit-logs/poll', [AdminController::class, 'auditLogsPoll'])->middleware('throttle:polling')->name('audit.logs.poll');
+
+        Route::get('/performance-insights', [AdminController::class, 'performanceInsights'])->name('performance.insights');
+        Route::get('/performance-insights/refresh', [AdminController::class, 'performanceInsightsRefresh'])->middleware('throttle:polling')->name('performance.insights.refresh');
+        Route::get('/performance-insights/poll', [AdminController::class, 'performanceInsightsPoll'])->middleware('throttle:polling')->name('performance.insights.poll');
 
         // Document Tracking module: every document ever submitted, in one
         // place, permanently — unlike Archive (approved only) or the SLA

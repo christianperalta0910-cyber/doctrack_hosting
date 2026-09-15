@@ -31,7 +31,7 @@
                     </div>
                 </div>
                 <div class="flex items-center gap-3 flex-shrink-0">
-                    <x-status-badge :status="$doc->global_status" />
+                    <x-status-badge :status="$doc->display_status" />
                     <span class="text-xs font-medium text-primary-700">Track &rarr;</span>
                 </div>
             </div>

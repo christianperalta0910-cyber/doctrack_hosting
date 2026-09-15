@@ -72,28 +72,7 @@ it('allows an approver to reject once a comment is provided', function () {
     expect($assignment->fresh()->individual_status)->toBe('rejected');
 });
 
-it('rejects an admin SLA override with no comment', function () {
-    $admin = User::factory()->admin()->create();
-    $approver = User::factory()->approver()->create();
-    $assignment = pendingAssignmentForRejectionTest($approver);
-    $assignment->update(['escalated_to_admin' => true, 'escalation_reason' => 'sla_violation']);
-
-    $response = $this->actingAs($admin)->post(route('admin.sla.override', $assignment), [
-        'decision' => 'rejected',
-    ]);
-
-    $response->assertSessionHasErrors('comments');
-});
-
-it('allows an admin SLA override to approve with no comment', function () {
-    $admin = User::factory()->admin()->create();
-    $approver = User::factory()->approver()->create();
-    $assignment = pendingAssignmentForRejectionTest($approver);
-    $assignment->update(['escalated_to_admin' => true, 'escalation_reason' => 'sla_violation']);
-
-    $response = $this->actingAs($admin)->post(route('admin.sla.override', $assignment), [
-        'decision' => 'approved',
-    ]);
-
-    $response->assertSessionDoesntHaveErrors('comments');
-});
+// Coverage for the admin-decides-directly mandatory-rejection-comment
+// rule now lives in UnassignedDocumentsTest.php (admin.unassigned.decide)
+// — the SLA Override Queue this used to test was removed (see
+// SlaService::escalateNeedsApprover()).

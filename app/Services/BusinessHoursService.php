@@ -217,6 +217,20 @@ class BusinessHoursService
         );
     }
 
+    /**
+     * How many working minutes actually fell inside [$outageStart,
+     * $outageEnd] — e.g. an outage from 4:56pm to 5:16pm only "costs" 4
+     * minutes if the working day ends at 5pm, since the other 16 weren't
+     * going to be worked anyway. Reuses businessSecondsRemaining() (the
+     * same "sum only real working seconds between two points" logic
+     * already used for the live SLA countdown) rather than a separate
+     * calculation, so this can never disagree with it.
+     */
+    public function businessMinutesLostToOutage(Carbon $outageStart, Carbon $outageEnd): int
+    {
+        return (int) ceil($this->businessSecondsRemaining($outageStart, $outageEnd) / 60);
+    }
+
     private function startOfWindow(Carbon $date): Carbon
     {
         $this->ensureLoaded();

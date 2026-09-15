@@ -84,7 +84,7 @@ class DocumentAssignment extends Model
         'admin_reviewed_at', 'admin_reviewed_by', 'admin_review_note', 'admin_review_outcome',
         'review_reminder_sent_at', 'urgent_reminder_sent_at', 'grace_reminder_sent_at',
         'reassigned_at', 'reassigned_from', 'reassignment_reason', 'needs_approver', 'needs_approver_at',
-        'cascade_closed_by',
+        'cascade_closed_by', 'review_due_at',
     ];
 
     protected $casts = [
@@ -102,6 +102,7 @@ class DocumentAssignment extends Model
         'reassigned_at' => 'datetime',
         'needs_approver' => 'boolean',
         'needs_approver_at' => 'datetime',
+        'review_due_at' => 'datetime',
     ];
 
     public function document()
@@ -143,6 +144,42 @@ class DocumentAssignment extends Model
     public function cascadeClosedBy()
     {
         return $this->belongsTo(User::class, 'cascade_closed_by', 'user_id');
+    }
+
+    /**
+     * Reject-vote status for THIS seat's stage (Feature: rejecting a
+     * multi-approver stage now needs a strict majority — more than half —
+     * instead of any single reject terminating the document; see
+     * WorkflowService::completeStage()). A single-approver stage is
+     * unaffected: threshold works out to 1, so that one decision is
+     * already the whole vote, same as before this feature existed.
+     *
+     * rejectStillPossible goes false once enough OTHER seats on this
+     * stage have already approved that no combination of the remaining
+     * undecided seats could still reach the reject threshold — at that
+     * point Reject is taken off the table for whoever's left (see
+     * queue.blade.php) rather than offering a choice that can no longer
+     * do anything.
+     */
+    public function stageRejectionStatus(): array
+    {
+        $seats = static::where('document_id', $this->document_id)
+            ->where('stage_id', $this->stage_id)
+            ->get();
+
+        $total = $seats->count();
+        $approved = $seats->whereIn('individual_status', ['approved', 'auto_approved'])->count();
+        $rejected = $seats->where('individual_status', 'rejected')->count();
+        $threshold = intdiv($total, 2) + 1;
+
+        return [
+            'total' => $total,
+            'approved' => $approved,
+            'rejected' => $rejected,
+            'threshold' => $threshold,
+            'majorityReached' => $rejected >= $threshold,
+            'rejectStillPossible' => ($total - $approved) >= $threshold,
+        ];
     }
 
     /** Seconds remaining before SLA violation — used for the countdown UI. */
@@ -207,49 +244,6 @@ class DocumentAssignment extends Model
     public function urgencyLabel(): string
     {
         return [1 => 'Urgent', 2 => 'Normal', 3 => 'Low', 4 => 'Expired'][$this->urgencyRank()];
-    }
-
-    /**
-     * When the system will auto-approve this assignment if no Admin acts —
-     * escalated_at + config('sla.admin_grace_hours') when that comfortably
-     * fits before the document's own due_date. When it doesn't (a
-     * short-due-date document), using ALL the remaining time as grace would
-     * mean auto-approval lands exactly AT due_date — leaving zero room for
-     * the post-auto-approval admin review (see AdminController::
-     * reviewAutoApproval()) to actually happen before the originator sees
-     * "Approved" and assumes it's final. So instead, only HALF of the
-     * remaining time gets used as grace, deliberately reserving the other
-     * half as a real window for that review to happen before due_date
-     * arrives. This is the single source of truth for the grace deadline —
-     * SlaService::escalate() (which schedules the real auto-approval job)
-     * and autoApproveUnresolved() (the periodic backstop) both call this
-     * method rather than recomputing the formula themselves, so all three
-     * can never drift out of sync.
-     *
-     * If escalation itself happened after due_date already passed (e.g. a
-     * late sweep), the halved remainder is negative, meaning this clamps to
-     * a moment already in the past — the next sweep auto-approves it
-     * immediately. Correct for that edge case, not a bug. Null once the
-     * window no longer applies (already resolved, or never escalated).
-     */
-    public function adminGraceExpiresAt(): ?\Carbon\Carbon
-    {
-        if (!$this->escalated_at || $this->individual_status !== 'pending') {
-            return null;
-        }
-
-        $flatGrace = $this->escalated_at->copy()->addHours(config('sla.admin_grace_hours', 12));
-
-        if (!$this->document?->due_date || $flatGrace->lessThanOrEqualTo($this->document->due_date)) {
-            return $flatGrace;
-        }
-
-        // The flat grace window would exceed due_date — use half of
-        // whatever time is actually left instead of all of it.
-        $remainingSeconds = max(0, $this->escalated_at->diffInSeconds($this->document->due_date, false));
-        $graceExpiresAt = $this->escalated_at->copy()->addSeconds((int) round($remainingSeconds / 2));
-
-        return $graceExpiresAt;
     }
 
     /**

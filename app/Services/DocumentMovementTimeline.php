@@ -28,6 +28,8 @@ class DocumentMovementTimeline
         'admin_override' => 'Admin Override', 'admin_review' => 'Admin Review', 'admin_dispute' => 'Admin Dispute',
         'auto_approve' => 'Auto-Approved', 'sla_escalation' => 'SLA Escalation',
         'assignment_reassigned' => 'Reassigned', 'assignment_withdrawn' => 'Seat Withdrawn', 'needs_approver' => 'Needs Approver', 'due_date_adjusted' => 'Due Date Adjusted',
+        'reject_stranded' => 'Rejection Overturned', 'revision_requested' => 'Revision Requested', 'revision_saved' => 'Revision Saved',
+        'revision_withdrawn' => 'Revision Request Withdrawn',
         'sla_recalculated' => 'SLA Recalculated',
         'finalize' => 'Finalized', 'resubmit' => 'Resubmitted',
         'archive_download' => 'Downloaded', 'legacy_import' => 'Legacy Import',
@@ -37,7 +39,6 @@ class DocumentMovementTimeline
         'workflow_config' => 'Workflow Config Changed', 'sla_settings_update' => 'SLA Settings Updated',
         'sla_holiday_add' => 'Holiday Added', 'sla_holiday_remove' => 'Holiday Removed', 'extraction_failed' => 'Extraction Failed',
         'security_blocked' => 'Blocked — Security Scan',
-        'view_backup_codes' => 'Viewed Backup Codes', 'view_backup_codes_denied' => 'Backup Codes Access Denied',
     ];
 
     /**
@@ -56,6 +57,8 @@ class DocumentMovementTimeline
         'approve' => 'approved', 'approved' => 'approved',
         'reject' => 'rejected', 'rejected' => 'rejected',
         'admin_override' => 'escalation', 'auto_approve' => 'escalation', 'sla_escalation' => 'escalation', 'needs_approver' => 'escalation',
+        'reject_stranded' => 'escalation', 'revision_requested' => 'escalation', 'revision_saved' => 'lifecycle',
+        'revision_withdrawn' => 'escalation',
         'security_blocked' => 'rejected',
     ];
 

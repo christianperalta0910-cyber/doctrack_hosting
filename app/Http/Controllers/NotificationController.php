@@ -62,25 +62,44 @@ class NotificationController extends Controller
      */
     public function refresh(Request $request)
     {
-        $unread = $request->user()->notifications()->where('is_read', false)->limit(6)->get();
+        // Recent, regardless of read status — read notifications used to
+        // be filtered out here entirely, so marking them read (via the
+        // bell opening, or clicking one) made them vanish from the
+        // dropdown instead of just losing their unread styling.
+        $recent = $request->user()->notifications()->limit(6)->get();
         $unreadCount = $request->user()->notifications()->where('is_read', false)->count();
 
-        return view('notifications.partials.bell', compact('unread', 'unreadCount'));
+        return view('notifications.partials.bell', compact('recent', 'unreadCount'));
     }
 
+    /**
+     * Marks just this one notification read and sends the user to
+     * whatever it's about (NotificationRecord::targetUrl()) — the bell
+     * dropdown and the full notifications list both submit here as a
+     * plain form post, so clicking a notification IS how it gets marked
+     * read, not a separate "Mark read" control next to it.
+     */
     public function markRead(Request $request, NotificationRecord $notification)
     {
         $this->authorize('markRead', $notification);
 
         $notification->update(['is_read' => true]);
 
-        return back();
+        return redirect($notification->targetUrl($request->user()) ?? route('notifications.index'));
     }
 
+    /**
+     * Fired automatically when the bell dropdown is opened (see the
+     * 'toggle' listener in app.js), not from a visible button — reading
+     * the dropdown IS the read receipt. Deliberately does not hide
+     * anything; refresh()/index() already show recent notifications
+     * regardless of read status, so this only clears their unread
+     * styling/badge count.
+     */
     public function markAllRead(Request $request)
     {
         $request->user()->notifications()->where('is_read', false)->update(['is_read' => true]);
 
-        return back();
+        return response()->noContent();
     }
 }

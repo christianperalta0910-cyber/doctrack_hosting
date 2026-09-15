@@ -119,6 +119,118 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
+// --- Connection & responsiveness banner (#connection-status — see
+// layouts/app.blade.php) — module-scoped, not nested in one closure,
+// so __refreshAjaxPaginationContainer() further down this file can hook
+// into it directly. Two independent signals share this one banner, since
+// they're both "the system might feel broken right now" from the user's
+// point of view, just for different reasons:
+//   1. Reverb's WebSocket isn't connected — the background live-update
+//      channel is down (see the state_change binding below).
+//   2. A user-initiated action (clicking a module link, submitting a
+//      form, a pagination click) is taking noticeably long to respond —
+//      tracked via trackSlowOp() below. This catches "the page loaded
+//      fine and the background connection is fine, but THIS specific
+//      click is just hanging" on a weak connection, which a WebSocket-
+//      only check can't see at all (a plain page navigation never
+//      touches Reverb).
+// The banner shows if EITHER signal is bad, and only hides once BOTH are
+// clear — __renderConnectionBanner() is the one place that decides
+// visibility, so the two signals can never fight over the same toggle.
+let __connectionBanner = null;
+let __echoConnected = true;
+let __activeSlowOps = 0;
+
+function __renderConnectionBanner() {
+    if (!__connectionBanner) return;
+    __connectionBanner.classList.toggle('hidden', __echoConnected && __activeSlowOps === 0);
+}
+
+const SLOW_OP_THRESHOLD_MS = 800;
+
+/**
+ * Starts a slow-operation timer; call the returned function once that
+ * operation actually finishes. Only counted — and only shows the banner
+ * — if it's still running past SLOW_OP_THRESHOLD_MS, so a normal fast
+ * click or fetch never triggers anything.
+ */
+function trackSlowOp() {
+    let counted = false;
+    const timer = setTimeout(() => {
+        counted = true;
+        __activeSlowOps += 1;
+        __renderConnectionBanner();
+    }, SLOW_OP_THRESHOLD_MS);
+
+    return function stop() {
+        clearTimeout(timer);
+        if (counted) {
+            __activeSlowOps = Math.max(0, __activeSlowOps - 1);
+            __renderConnectionBanner();
+        }
+    };
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    __connectionBanner = document.getElementById('connection-status');
+    if (!__connectionBanner) return;
+
+    const connection = window.Echo?.connector?.pusher?.connection;
+    if (connection) {
+        connection.bind('state_change', (states) => {
+            __echoConnected = states.current === 'connected';
+            __renderConnectionBanner();
+        });
+    }
+
+    // Same-origin navigation (link clicks and form submits) — only one
+    // navigation is ever really "in flight" from the user's perspective,
+    // so a single shared stop() reference is enough; beforeunload firing
+    // means the browser is genuinely leaving, so whatever was pending
+    // gets stopped either way.
+    let stopNavOp = null;
+
+    function isSameOrigin(rawUrl) {
+        try {
+            return new URL(rawUrl, window.location.href).origin === window.location.origin;
+        } catch {
+            return false;
+        }
+    }
+
+    document.addEventListener('click', (e) => {
+        if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        const link = e.target.closest('a[href]');
+        if (!link || link.target === '_blank' || link.hasAttribute('download') || !isSameOrigin(link.href)) return;
+
+        stopNavOp?.();
+        stopNavOp = trackSlowOp();
+    });
+
+    document.addEventListener('submit', (e) => {
+        // Unlike the click listener above, this used to skip the
+        // e.defaultPrevented check — so any AJAX-intercepted form
+        // (e.preventDefault() + fetch(), no real navigation) still
+        // started a nav-tracking timer that only beforeunload ever
+        // stops. Since those forms never navigate, beforeunload never
+        // fires, and the "Reconnecting" banner got stuck on until the
+        // user genuinely left the page (e.g. Approve/Reject and Request
+        // Revision on the approver dashboard).
+        if (e.defaultPrevented) return;
+        const form = e.target;
+        if (!(form instanceof HTMLFormElement) || form.target === '_blank') return;
+        if (!isSameOrigin(form.getAttribute('action') || window.location.href)) return;
+
+        stopNavOp?.();
+        stopNavOp = trackSlowOp();
+    });
+
+    window.addEventListener('beforeunload', () => {
+        stopNavOp?.();
+        stopNavOp = null;
+    });
+});
+
 // Browsers that support the View Transitions API also honor the
 // @view-transition CSS rule (see app.css) and handle the entire old-page
 // -> new-page crossfade natively on every navigation — no JS needed, and
@@ -265,6 +377,25 @@ document.addEventListener('DOMContentLoaded', () => {
         startLiveChannel(`user.${bell.dataset.userId}`, '.notification.created', bellOpts);
         startLivePoll({ ...bellOpts, pollUrl: bell.dataset.pollUrl, minDelay: 45, maxDelay: 75 });
 
+        // Opening the bell IS the read receipt (Feature: no more separate
+        // "Mark all read" button, which used to hide everything it
+        // touched since the dropdown only ever showed unread ones — see
+        // refresh() in NotificationController, which now shows recent
+        // notifications regardless of read status). Forces the refresh
+        // past isBusy's normal "don't reshuffle while open" guard, since
+        // this swap is only replacing dot/tint styling on content the
+        // user is already looking at, not reordering it.
+        bell.addEventListener('toggle', () => {
+            if (!bell.open) return;
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+            fetch(bell.dataset.markAllReadUrl, {
+                method: 'POST',
+                headers: { 'X-CSRF-TOKEN': csrfToken, Accept: 'application/json' },
+            })
+                .then(() => applyLiveRefresh({ ...bellOpts, isBusy: () => false }))
+                .catch(() => {});
+        });
+
         // Account deactivation — same already-open per-user channel as the
         // bell above, just a second event on it. Logs the session out
         // server-side (not just a client-side redirect) so it can't be
@@ -291,7 +422,10 @@ document.addEventListener('DOMContentLoaded', () => {
  * live update behaves identically no matter which one triggered it.
  *
  * @param {Object} opts
- * @param {string} opts.refreshUrl - returns an HTML fragment to swap into `target`
+ * @param {string|Function} opts.refreshUrl - HTML-fragment URL to swap into `target` — a
+ *   plain string for a fixed target, or a function returning one (or a falsy
+ *   value to skip this refresh) for a target that moves around, like a
+ *   shared popup whose content depends on whatever's currently open in it.
  * @param {Element} opts.target - element whose innerHTML gets replaced
  * @param {Function} [opts.isBusy] - return true to skip this update (e.g. user mid-input); caller decides whether to retry
  * @param {Function} [opts.onSwap] - called after a successful swap, e.g. to re-apply a client-side filter
@@ -301,7 +435,10 @@ document.addEventListener('DOMContentLoaded', () => {
 function applyLiveRefresh(opts, signalData) {
     if (opts.isBusy && opts.isBusy()) return;
 
-    const url = opts.preserveQueryString ? opts.refreshUrl + window.location.search : opts.refreshUrl;
+    const refreshUrl = typeof opts.refreshUrl === 'function' ? opts.refreshUrl() : opts.refreshUrl;
+    if (!refreshUrl) return;
+
+    const url = opts.preserveQueryString ? refreshUrl + window.location.search : refreshUrl;
 
     fetch(url, { headers: { Accept: 'text/html' } })
         .then((res) => (res.ok ? res.text() : Promise.reject(res)))
@@ -413,13 +550,20 @@ window.startLivePoll = startLivePoll;
 const __ajaxPaginationContainers = [];
 
 function __refreshAjaxPaginationContainer(container, opts, search) {
+    // A page-number click is exactly the "clicked something, now
+    // waiting" case trackSlowOp() exists for — a plain fetch, no
+    // WebSocket involved, so the connection banner's Echo check alone
+    // would never catch a slow one.
+    const stopSlowOp = trackSlowOp();
+
     fetch(opts.refreshUrl + search, { headers: { Accept: 'text/html' } })
         .then((res) => (res.ok ? res.text() : Promise.reject(res)))
         .then((html) => {
             container.innerHTML = html;
             if (opts.onSwap) opts.onSwap();
         })
-        .catch(() => { window.location.reload(); }); // fetch failed — fall back to a real navigation rather than leave stale content up
+        .catch(() => { window.location.reload(); }) // fetch failed — fall back to a real navigation rather than leave stale content up
+        .finally(stopSlowOp);
 }
 
 function enableAjaxPagination(container, opts) {

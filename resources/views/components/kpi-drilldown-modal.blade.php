@@ -5,7 +5,10 @@
     — mirrors the fetch-and-inject pattern already used by
     document-viewer-modal.blade.php.
 --}}
-<div id="kpi-drilldown-overlay" class="hidden fixed inset-0 z-50 bg-surface-900/60 backdrop-blur-sm flex items-center justify-center p-4" onclick="if(event.target === this) closeKpiDrilldown()">
+{{-- Flat tint, NOT backdrop-blur — see layouts/app.blade.php's
+     #connection-status comment for why: blur measurably lags on weaker
+     graphics hardware, a flat semi-transparent tint doesn't. --}}
+<div id="kpi-drilldown-overlay" class="hidden fixed inset-0 z-50 bg-surface-900/70 flex items-center justify-center p-4" onclick="if(event.target === this) closeKpiDrilldown()">
     <div class="bg-white rounded-xl shadow-2xl w-[90vw] max-w-6xl h-[85vh] flex flex-col overflow-hidden" onclick="event.stopPropagation()">
         <div class="flex items-center justify-between px-6 py-4 border-b border-surface-200 flex-shrink-0">
             <h3 id="kpi-drilldown-title" class="text-sm font-semibold text-surface-900"></h3>
@@ -23,6 +26,15 @@
     function closeKpiDrilldown() {
         document.getElementById('kpi-drilldown-overlay').classList.add('hidden');
         document.getElementById('kpi-drilldown-body').innerHTML = '';
+
+        // This modal is shared by every KPI drilldown in the app (Admin
+        // dashboard cards, SLA popups, etc.), but one of its uses —
+        // "Review & Comment" on the Approver Queue — also needs to stop
+        // its own presence poll on close (see approver/dashboard.blade.php's
+        // openReviewAndComment()). Guarded since that function only exists
+        // on pages that actually load approver/dashboard.blade.php's script,
+        // and is itself a no-op unless that popup was the one open.
+        if (typeof __annotationStopPresencePoll === 'function') __annotationStopPresencePoll();
     }
 
     async function openKpiDrilldown(type, label, url) {

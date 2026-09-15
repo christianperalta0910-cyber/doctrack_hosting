@@ -144,7 +144,7 @@ test('the safety-net stage-assignment path waits for every sibling on the CURREN
         ->toBeTrue();
 });
 
-test('a single rejection kills the whole document even while sibling seats on the same stage are still pending', function () {
+test('a lone reject on a multi-approver stage does not terminate the document — majority is required', function () {
     $originator = User::factory()->originator()->create();
     $approverA = User::factory()->approver('Job Order')->create();
     $approverB = User::factory()->approver('Job Order')->create();
@@ -158,16 +158,71 @@ test('a single rejection kills the whole document even while sibling seats on th
     $seats = DocumentAssignment::where('document_id', $document->document_id)
         ->where('stage_id', $stage->stage_id)->orderBy('user_id')->get();
 
-    // A approves, B rejects — C never gets to weigh in, and B's sibling
-    // stage-mate A (who already approved) still ends up rejected too, since
-    // any single rejection kills the whole document regardless of what
-    // already happened on other seats.
+    // A approves, B rejects — 3 seats need 2 rejects to reach majority
+    // (see DocumentAssignment::stageRejectionStatus()), so B's lone reject
+    // does nothing: A's approval stands, C is still free to decide either
+    // way, and the document itself is untouched.
     $workflow->decide($seats[0], $approverA, 'approved');
+    $workflow->decide($seats[1], $approverB, 'rejected');
+
+    expect($document->fresh()->global_status)->toBe('classified_validated')
+        ->and($seats[0]->fresh()->individual_status)->toBe('approved')
+        ->and($seats[1]->fresh()->individual_status)->toBe('rejected')
+        ->and($seats[2]->fresh()->individual_status)->toBe('pending');
+});
+
+test('reaching majority reject on a multi-approver stage terminates the document', function () {
+    $originator = User::factory()->originator()->create();
+    $approverA = User::factory()->approver('Job Order')->create();
+    $approverB = User::factory()->approver('Job Order')->create();
+    $approverC = User::factory()->approver('Job Order')->create();
+    $workflow = app(WorkflowService::class);
+
+    $document = classifiedJobOrder($originator);
+    $workflow->routeToWorkflow($document);
+
+    $stage = WorkflowStage::where('stage_name', 'Technical Review')->first();
+    $seats = DocumentAssignment::where('document_id', $document->document_id)
+        ->where('stage_id', $stage->stage_id)->orderBy('user_id')->get();
+
+    // 2 of 3 rejecting reaches majority — now it cascades exactly like the
+    // old any-single-reject behavior did, closing every other pending seat
+    // (including C, who never got to weigh in) across every stage.
+    $workflow->decide($seats[0], $approverA, 'rejected');
     $workflow->decide($seats[1], $approverB, 'rejected');
 
     expect($document->fresh()->global_status)->toBe('rejected')
         ->and($seats[2]->fresh()->individual_status)->toBe('rejected')
         ->and($seats[2]->fresh()->cascade_closed_by)->toBe($approverB->user_id);
+});
+
+test('a stranded minority reject resets to pending once majority approval makes it impossible', function () {
+    $originator = User::factory()->originator()->create();
+    $approverA = User::factory()->approver('Job Order')->create();
+    $approverB = User::factory()->approver('Job Order')->create();
+    $approverC = User::factory()->approver('Job Order')->create();
+    $workflow = app(WorkflowService::class);
+
+    $document = classifiedJobOrder($originator);
+    $workflow->routeToWorkflow($document);
+
+    $stage = WorkflowStage::where('stage_name', 'Technical Review')->first();
+    $seats = DocumentAssignment::where('document_id', $document->document_id)
+        ->where('stage_id', $stage->stage_id)->orderBy('user_id')->get();
+
+    // A rejects first (1 of 3 — not enough, stays alive). B then approves,
+    // then C approves too — 2 of 3 approved means reject can never reach
+    // majority (2) anymore, no matter what. A's stranded reject must reset
+    // to pending rather than sit there blocking unanimous approval forever.
+    $workflow->decide($seats[0], $approverA, 'rejected');
+    $workflow->decide($seats[1], $approverB, 'approved');
+    expect($seats[0]->fresh()->individual_status)->toBe('rejected'); // not yet stranded — only 1 of 3 approved so far
+
+    $workflow->decide($seats[2], $approverC, 'approved');
+
+    expect($seats[0]->fresh()->individual_status)->toBe('pending')
+        ->and($seats[0]->fresh()->comments)->toBeNull()
+        ->and($document->fresh()->global_status)->toBe('classified_validated');
 });
 
 test('approving every stage finalizes the document as approved', function () {

@@ -16,6 +16,18 @@ use Tests\TestCase;
 
 pest()->extend(TestCase::class)
     ->use(RefreshDatabase::class)
+    ->beforeEach(function () {
+        // The 'array' cache driver (phpunit.xml) lives in memory for the
+        // whole PHP process, unlike the database — RefreshDatabase resets
+        // that between every test, but NOT the cache. Without this, a
+        // heartbeat timestamp left behind by one test (possibly under a
+        // completely different Carbon::setTestNow()/travelTo() "now")
+        // would leak into the next test's first authenticated request —
+        // see App\Http\Middleware\CheckForSlaOutage — and could trigger a
+        // spurious "outage" purely from cross-test cache pollution, not
+        // anything the test itself set up.
+        \Illuminate\Support\Facades\Cache::forget('sla_heartbeat_last_seen');
+    })
     ->in('Feature', 'Unit');
 
 /*

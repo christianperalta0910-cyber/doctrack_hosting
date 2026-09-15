@@ -5,6 +5,8 @@ namespace App\Http\Controllers;
 use App\Models\DocumentRepository;
 use App\Models\DocumentReviewSession;
 use App\Models\SubmissionBatch;
+use App\Models\User;
+use App\Models\WorkflowStage;
 use App\Rules\ReliableMimeType;
 use App\Services\ValidationService;
 use App\Services\WorkflowService;
@@ -12,6 +14,7 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\Rule;
 use Throwable;
 
 class DocumentController extends Controller
@@ -150,6 +153,10 @@ class DocumentController extends Controller
                 }
             }],
             'requires_printing' => ['sometimes', 'boolean'],
+            // Feature: originator-directed routing — see WorkflowService::
+            // ingest()'s $routingMode docblock. Applies to every file in
+            // this batch alike, same as due_date/requires_printing above.
+            'routing_mode' => ['sometimes', 'in:auto,custom,unrelated'],
         ], [], $fileAttributeNames);
 
         $effectiveDueDate = Carbon::parse($validated['due_date']);
@@ -158,6 +165,7 @@ class DocumentController extends Controller
         // determines it, this only ever adds the requirement, never
         // removes one the category itself calls for.
         $requiresPrinting = $request->boolean('requires_printing');
+        $routingMode = $validated['routing_mode'] ?? 'auto';
 
         $batch = SubmissionBatch::create([
             'originator_id' => $request->user()->user_id,
@@ -177,7 +185,7 @@ class DocumentController extends Controller
         foreach ($validated['files'] as $file) {
             try {
                 $documents->push($this->workflow->ingest(
-                    $file, $request->user(), $effectiveDueDate->toDateTimeString(), $batch->batch_id, null, $requiresPrinting
+                    $file, $request->user(), $effectiveDueDate->toDateTimeString(), $batch->batch_id, null, $requiresPrinting, $routingMode
                 ));
             } catch (Throwable $e) {
                 Log::error('Unexpected failure ingesting an uploaded document', [
@@ -209,14 +217,33 @@ class DocumentController extends Controller
 
         if ($documents->count() === 1) {
             $document = $documents->first();
-            return ($document->is_validated
-                ? "'{$document->title}' uploaded, classified as '{$document->ml_category}', and routed for approval."
-                : "'{$document->title}' uploaded but failed validation — see details below.") . $failureNote;
+            if (!$document->is_validated) {
+                return "'{$document->title}' uploaded but failed validation — see details below." . $failureNote;
+            }
+            // "classified as X" reads fine for a real category, but odd
+            // for a document marked Unclassified ("classified as
+            // Unclassified") — see DocumentRepository::display_category's
+            // docblock for why the category label itself already differs
+            // by desired_routing; the verb needs to follow suit too.
+            $categoryPhrase = $document->desired_routing === 'unrelated'
+                ? 'marked as Unclassified'
+                : "classified as '{$document->display_category}'";
+
+            // Awaiting the originator's own approver pick (Feature:
+            // originator-directed routing) rather than already routed —
+            // pending_custom_routing_at is only ever set once validation/
+            // classification actually cleared, so is_validated is already
+            // known true here.
+            return ($document->pending_custom_routing_at
+                ? "'{$document->title}' uploaded and {$categoryPhrase} — select the approver(s) you'd like to route it to."
+                : "'{$document->title}' uploaded, {$categoryPhrase}, and routed for approval.") . $failureNote;
         }
 
         $failedValidation = $documents->reject(fn ($d) => $d->is_validated)->count();
+        $awaitingSelection = $documents->filter(fn ($d) => $d->pending_custom_routing_at)->count();
 
-        return "{$documents->count()} documents uploaded together and routed as one approval request." .
+        return "{$documents->count()} documents uploaded together." .
+            ($awaitingSelection > 0 ? " {$awaitingSelection} need you to select approver(s) before routing." : ' Routed as one approval request.') .
             ($failedValidation > 0 ? " {$failedValidation} failed validation — see details below." : '') . $failureNote;
     }
 
@@ -224,9 +251,118 @@ class DocumentController extends Controller
     {
         $this->authorize('viewTracking', $document);
 
-        $document->load(['assignments.stage', 'assignments.approver', 'auditLogs.user', 'previousVersion', 'nextVersion']);
+        $document->load(['assignments.stage', 'assignments.approver', 'auditLogs.user', 'previousVersion', 'nextVersion', 'openAnnotations.raisedBy']);
 
         return view('originator.tracking', compact('document'));
+    }
+
+    /**
+     * Feature: originator-directed routing — the "pick approver(s)"
+     * follow-up step for a document uploaded with routing_mode 'custom'
+     * or 'unrelated' (see WorkflowService::ingest()), shown once
+     * classification/validation have actually cleared and
+     * pending_custom_routing_at is set. The eligible pool differs by
+     * which mode was chosen: a known-category document offers only
+     * approvers actually eligible for that category (WorkflowService::
+     * eligibleApproversForCategory()); a document flagged as not
+     * belonging to any category has no real category to scope by, so
+     * every active approver is offered instead.
+     *
+     * Renders a fragment, not a full page — fetched into the shared
+     * openKpiDrilldown() modal (see components/kpi-drilldown-modal.
+     * blade.php) from the "Select Approver(s)" link on both the
+     * submissions table and the tracking page, same pattern the Approver
+     * Queue's "Review & Comment" panel already uses.
+     */
+    public function selectApprovers(Request $request, DocumentRepository $document)
+    {
+        $this->authorize('routeCustom', $document);
+
+        abort_unless($document->pending_custom_routing_at !== null, 404);
+
+        $approvers = $document->desired_routing === 'unrelated'
+            ? User::where('role', 'approver')->where('is_active', true)->orderBy('full_name')->get()
+            : $this->workflow->eligibleApproversForCategory($document->ml_category)->sortBy('full_name')->values();
+
+        // Which specific stage(s) each approver is tied to (Feature:
+        // originator can route to the right person for the right stage,
+        // not just the right department/level) — a non-persisted
+        // attribute set here, once per approver, rather than a query per
+        // row in the view.
+        $approvers->each(fn (User $approver) => $approver->stages_label = $this->stagesLabelFor($approver));
+
+        // Grouped by department, head(s) sorted before staff within each
+        // (Feature: originator can tell at a glance who to route a "just
+        // needs the head's sign-off" document to — see User::LEVELS'
+        // docblock: 'head' specifically means "sits on this category's
+        // Final Approval stage," exactly that person). A flat,
+        // alphabetical-only list buried the one distinction this
+        // grouping exists to surface.
+        $groupedApprovers = $approvers
+            ->groupBy(fn (User $approver) => $approver->department ?: 'No Department')
+            ->map(fn ($group) => $group->sortBy(fn (User $a) => ($a->level === 'head' ? '0_' : '1_') . $a->full_name)->values())
+            ->sortKeys();
+
+        return view('originator.partials.select-approvers-panel', compact('document', 'approvers', 'groupedApprovers'));
+    }
+
+    /**
+     * "Job Order — Technical Review, Final Approval" — or, for an
+     * approver with no explicit stage picks at all, every configured
+     * stage in their own category, since that's exactly what "no picks"
+     * already means for real routing eligibility (see WorkflowService::
+     * eligibleApproversForStage()'s docblock: "no explicit stage picks
+     * -> eligible for every stage in their category"). Showing nothing
+     * for that case would misleadingly read as "handles no stages"
+     * instead of "handles all of them."
+     *
+     * The category prefix matters most for an 'unrelated' document's
+     * picker, which offers every active approver rather than ones
+     * scoped to one category (see selectApprovers() above) — without
+     * it, two approvers from different categories who happen to hold a
+     * similarly-named stage ("Final Approval") were indistinguishable.
+     */
+    private function stagesLabelFor(User $approver): string
+    {
+        if (!$approver->assigned_category) {
+            return 'No category assigned';
+        }
+
+        $picked = $approver->workflowStages()->orderBy('sequence_order')->pluck('stage_name');
+
+        if ($picked->isNotEmpty()) {
+            return "{$approver->assigned_category} — {$picked->implode(', ')}";
+        }
+
+        $allInCategory = WorkflowStage::configured()
+            ->forCategory($approver->assigned_category)
+            ->where('is_archived', false)
+            ->pluck('stage_name');
+
+        return $allInCategory->isNotEmpty()
+            ? "{$approver->assigned_category} — {$allInCategory->implode(', ')} (all stages)"
+            : "{$approver->assigned_category} — no stages configured yet";
+    }
+
+    public function routeCustom(Request $request, DocumentRepository $document)
+    {
+        $this->authorize('routeCustom', $document);
+
+        abort_unless($document->pending_custom_routing_at !== null, 409, 'This document is not awaiting an approver selection.');
+
+        $eligibleIds = $document->desired_routing === 'unrelated'
+            ? User::where('role', 'approver')->where('is_active', true)->pluck('user_id')->all()
+            : $this->workflow->eligibleApproversForCategory($document->ml_category)->pluck('user_id')->all();
+
+        $validated = $request->validate([
+            'approver_ids' => ['required', 'array', 'min:1'],
+            'approver_ids.*' => ['integer', Rule::in($eligibleIds)],
+        ]);
+
+        $this->workflow->routeToCustomApprovers($document, $validated['approver_ids'], $request->user());
+
+        return redirect()->route('originator.documents.show', $document)
+            ->with('status', "'{$document->title}' routed to your selected approver(s).");
     }
 
     /**
@@ -241,7 +377,7 @@ class DocumentController extends Controller
     {
         $this->authorize('viewTracking', $document);
 
-        $document->load(['assignments.stage', 'assignments.approver', 'auditLogs.user', 'previousVersion', 'nextVersion']);
+        $document->load(['assignments.stage', 'assignments.approver', 'auditLogs.user', 'previousVersion', 'nextVersion', 'openAnnotations.raisedBy']);
 
         return view('originator.partials.tracking-content', compact('document'));
     }
@@ -319,6 +455,30 @@ class DocumentController extends Controller
             : "Resubmitted as version {$newDocument->version_number}, but failed validation — see details below.";
 
         return redirect()->route('originator.documents.show', $newDocument)->with('status', $status);
+    }
+
+    /**
+     * The originator edits the document's plain extracted text directly
+     * (Feature: "editable document" — see WorkflowService::
+     * requestRevision()'s docblock) and, in the same save, marks which
+     * open Request Revision annotations this edit addresses. Only the
+     * approver(s) behind THOSE specific annotations get notified to
+     * re-review — anyone whose flag isn't checked stays open, and the
+     * originator can save again later once it is.
+     */
+    public function saveRevision(Request $request, DocumentRepository $document)
+    {
+        $this->authorize('editText', $document);
+
+        $validated = $request->validate([
+            'text' => ['required', 'string', 'max:100000'],
+            'resolved_annotation_ids' => ['nullable', 'array'],
+            'resolved_annotation_ids.*' => ['integer'],
+        ]);
+
+        $this->workflow->saveDocumentRevision($document, $request->user(), $validated['text'], $validated['resolved_annotation_ids'] ?? []);
+
+        return back()->with('status', 'Revision saved.');
     }
 
     /**
@@ -449,26 +609,13 @@ class DocumentController extends Controller
     /**
      * Whether $user opening $document right now counts as an active
      * review session (drives DocumentReviewSession::openFor()/heartbeat()/
-     * closeFor() in viewFile()/presence()/presenceLeave() above) —
-     * anyone with a genuine reviewing stake (any approver, or an admin)
-     * while the document as a whole hasn't been judged yet. Deliberately
-     * NOT narrowed to "is it specifically this person's seat pending
-     * right now" — that used to mean a second approver whose seat wasn't
-     * the currently-active one, or an admin looking at a document that
-     * hadn't happened to escalate to them, never got tracked at all, so
-     * the "currently reviewing" presence cluster only ever showed one of
-     * several simultaneous viewers. An Originator (never true for either
-     * isApprover() or isAdmin()) never counts here — the presence
-     * cluster is about who's reviewing it, not who owns it. Once the
-     * document IS judged (approved/rejected/auto_approved), nobody
-     * accumulates a fresh session just from revisiting it afterward.
+     * closeFor() in viewFile()/presence()/presenceLeave() above). Moved
+     * onto DocumentReviewSession itself so ApprovalController::
+     * annotationsPanel() (the "Review & Comment" popup) can share the
+     * exact same rule instead of drifting from a second copy.
      */
     private function countsAsActiveReviewer(DocumentRepository $document, $user): bool
     {
-        if (!$user->isApprover() && !$user->isAdmin()) {
-            return false;
-        }
-
-        return !in_array($document->global_status, ['approved', 'rejected', 'auto_approved'], true);
+        return DocumentReviewSession::countsAsActiveReviewer($document, $user);
     }
 }

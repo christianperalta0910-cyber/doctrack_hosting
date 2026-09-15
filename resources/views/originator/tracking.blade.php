@@ -49,12 +49,35 @@
         scrollEl.style.maxHeight = Math.max(available - 8, 200) + 'px';
     }
 
+    // Same technique as sizeDocumentTracker() just above, pointed at the
+    // RIGHT column instead (Approval Stages, plus Revision Requests once
+    // there's anything open). That column used to have no height cap at
+    // all — fine while it only ever held Approval Stages, but adding a
+    // whole extra Revision Requests card underneath it (Feature: editable
+    // document) could make it tall enough to outgrow the viewport, and
+    // with no cap of its own <main> — the real page scroll container —
+    // was the thing that ended up scrolling instead of just this column.
+    function sizeTrackingRightColumn() {
+        const columnEl = document.getElementById('tracking-right-column');
+        const mainEl = document.querySelector('main');
+        if (!columnEl || !mainEl) return;
+
+        const mainPaddingBottom = parseFloat(getComputedStyle(mainEl).paddingBottom) || 0;
+        const available = mainEl.getBoundingClientRect().bottom - mainPaddingBottom - columnEl.getBoundingClientRect().top;
+        columnEl.style.maxHeight = Math.max(available, 200) + 'px';
+    }
+
+    function sizeTrackingLayout() {
+        sizeDocumentTracker();
+        sizeTrackingRightColumn();
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         const contentEl = document.getElementById('tracking-content');
         if (!contentEl) return;
 
-        sizeDocumentTracker();
-        window.addEventListener('resize', sizeDocumentTracker);
+        sizeTrackingLayout();
+        window.addEventListener('resize', sizeTrackingLayout);
 
         const thisDocumentId = parseInt(contentEl.dataset.documentId, 10);
 
@@ -66,9 +89,10 @@
             // actually about the document this page is showing.
             filter: (data) => data.document_id === thisDocumentId,
             // The live swap replaces #tracking-content's whole innerHTML
-            // (new header card content, new tracker rows) — re-measure
-            // afterward, not just once on initial load.
-            onSwap: sizeDocumentTracker,
+            // (new header card content, new tracker rows, and possibly a
+            // Revision Requests card appearing/disappearing) — re-measure
+            // both columns afterward, not just once on initial load.
+            onSwap: sizeTrackingLayout,
         };
 
         // Subscribed to the document's actual owner's channel, not the
@@ -111,6 +135,40 @@
             if (!warning) return;
             const valid = !input.value || isWithinWorkingHours(new Date(input.value));
             warning.classList.toggle('hidden', valid);
+        });
+
+        // Checking a "Revision Requests" flag (Feature: jump straight to
+        // the exact flagged passage in the text below, instead of the
+        // originator having to hunt for it themselves — a real problem
+        // once the same short phrase appears more than once in a
+        // document). Delegated on #tracking-content, not bound to the
+        // checkboxes directly, for the same reason as every other
+        // listener in this block — they get replaced wholesale on every
+        // live swap. tracking-content.blade.php itself can't carry this
+        // as an inline <script> for that same reason: a script tag inside
+        // markup that later gets swapped in via innerHTML never runs.
+        contentEl.addEventListener('change', function (e) {
+            const checkbox = e.target.closest('input[name="resolved_annotation_ids[]"]');
+            if (!checkbox || !checkbox.checked) return;
+
+            const textarea = document.getElementById('revision-text-editor');
+            const start = Number(checkbox.dataset.start);
+            const end = Number(checkbox.dataset.end);
+            if (!textarea || Number.isNaN(start) || Number.isNaN(end)) return;
+
+            // Approximate scroll position — counts newlines before the
+            // flagged passage to estimate a line number. This textarea
+            // wraps long lines rather than using white-space: pre, so a
+            // very long unbroken line can throw the estimate off by a
+            // little; setSelectionRange just below is what actually has
+            // to be exact (a native character-offset selection, unaffected
+            // by wrapping), this is only getting it roughly into view.
+            const linesBefore = textarea.value.slice(0, start).split('\n').length - 1;
+            const lineHeight = parseFloat(getComputedStyle(textarea).lineHeight) || 20;
+            textarea.scrollTop = Math.max(0, lineHeight * linesBefore - textarea.clientHeight / 2);
+
+            textarea.focus();
+            textarea.setSelectionRange(start, end);
         });
     });
 </script>

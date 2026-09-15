@@ -3,92 +3,205 @@
 namespace App\Services;
 
 use App\Events\DocumentStatusChanged;
-use App\Jobs\AutoApproveAssignmentJob;
+use App\Models\AdminViolation;
 use App\Models\AuditLog;
 use App\Models\DocumentAssignment;
+use App\Models\DocumentRepository;
 use App\Models\DocumentReviewSession;
 use App\Models\NotificationRecord;
+use App\Models\SlaOutageWindow;
 use App\Models\SlaViolation;
 use App\Models\User;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 /**
  * SlaService
  * -----------
- * The second half of the Section 5 safety net (the first half — flagging
- * an individual expired assignment as escalated_to_admin — is handled by
- * the `workflow:check-parallel-slas` command). A stage can have more than
- * one seat (see WorkflowService — every eligible approver is assigned at
- * once), but every method here still operates strictly per-assignment-row
- * — each seat escalates/auto-approves/gets overridden completely
- * independently of any sibling seats on the same stage, which is exactly
- * the "each approver keeps their own independent SLA window" behavior the
- * multi-approver model requires. No cross-row coordination happens here;
- * WorkflowService::completeStage() is what decides whether an entire
- * stage is actually done once a given row resolves.
+ * A missed deadline always resolves the same way now, regardless of WHO
+ * was responsible for it — auto-approve immediately, log the violation
+ * against whoever actually held the seat, let Admin review it afterward
+ * rather than before:
  *
- *   escalated_to_admin = true (set by workflow:check-parallel-slas)
- *     -> Admin may override: approve/reject on the approver's behalf
- *     -> if Admin is ALSO unresponsive for a grace window
- *        -> System Auto-Approval, with a high-priority notification sent
- *           to both Admin and Approver roles.
+ *   - a real approver missed their own window -> escalateApproverMiss()
+ *     -> SlaViolation logged against them.
+ *   - a stage had no eligible approver, so Admin was the fallback, and
+ *     Admin's own window (shown on the Unassigned Documents page) also
+ *     passed -> escalateNeedsApprover() -> AdminViolation (missed_approval)
+ *     logged against the Admin role.
  *
- * Intended to run every few minutes via the scheduler alongside
- * workflow:check-parallel-slas (see bootstrap/app.php and README.md).
+ * Either way, the resulting auto-approval still owes Admin a review
+ * within ADMIN_REVIEW_WINDOW_HOURS — trackLateReviews() below is what
+ * follows up on THAT, independent of which path produced the
+ * auto-approval in the first place.
+ *
+ * Intended to run every few minutes via the scheduler (see bootstrap/app.php).
  */
 class SlaService
 {
-    /**
-     * Reuses the exact threshold the grace-period countdown already turns
-     * red at (see admin/partials/sla-queue-results.blade.php's
-     * data-live-urgent-under="7200") — the extra urgent notification fires
-     * exactly when an admin would already see this flagged urgent on the
-     * page, not a separately-invented number.
-     */
-    private const SHORT_GRACE_URGENT_SECONDS = 7200; // 2 hours
+    /** Below this many minutes, a gap in the heartbeat is treated as ordinary scheduler jitter, not a real outage. */
+    private const OUTAGE_DETECTION_FLOOR_MINUTES = 5;
 
-    public function __construct(private WorkflowService $workflow)
+    private const HEARTBEAT_CACHE_KEY = 'sla_heartbeat_last_seen';
+
+    public function __construct(private WorkflowService $workflow, private BusinessHoursService $businessHours)
     {
     }
 
     /**
-     * Reuses the same "Urgent" threshold (30 minutes or less of real
-     * remaining time — see DocumentAssignment::URGENT_THRESHOLD_SECONDS)
-     * already used everywhere else in this app, rather than a separately
-     * invented number, for when the unreviewed-auto-approval reminder
-     * escalates.
+     * Called from sla:check, which already runs every 5 minutes — stamps
+     * "the scheduler ran, as of now" every time, and compares against the
+     * PREVIOUS stamp. If that previous stamp is more than
+     * OUTAGE_DETECTION_FLOOR_MINUTES old, the system (or the scheduler
+     * driving it) wasn't running for that whole gap — inferred proof of
+     * an outage, not a guess. Cache, not a DB column, since this is pure
+     * liveness bookkeeping with no need to survive a cache flush; a lost
+     * heartbeat just means the next tick establishes a fresh baseline
+     * instead of (wrongly) reporting years of "downtime".
      */
-    private const REVIEW_REMINDER_DUE_SOON_SECONDS = 1800; // 30 minutes
+    public function detectOutage(): ?SlaOutageWindow
+    {
+        $now = now();
+        $lastSeen = Cache::get(self::HEARTBEAT_CACHE_KEY);
+        Cache::forever(self::HEARTBEAT_CACHE_KEY, $now->toIso8601String());
+
+        if (!$lastSeen) {
+            return null; // first tick ever (or cache was cleared) — nothing to compare against yet
+        }
+
+        $lastSeen = \Carbon\Carbon::parse($lastSeen);
+        if ($lastSeen->diffInMinutes($now) < self::OUTAGE_DETECTION_FLOOR_MINUTES) {
+            return null;
+        }
+
+        $minutesLost = $this->businessHours->businessMinutesLostToOutage($lastSeen, $now);
+        if ($minutesLost <= 0) {
+            return null; // the whole gap fell outside working hours — nobody actually lost review time
+        }
+
+        return SlaOutageWindow::create([
+            'started_at' => $lastSeen,
+            'ended_at' => $now,
+            'business_minutes_lost' => $minutesLost,
+        ]);
+    }
+
+    /** Fairness floor (see compensateForOutage()) — never less than this much usable time after recovery, no matter how small the strict calculation comes out to. */
+    private const OUTAGE_COMPENSATION_FLOOR_MINUTES = 30;
 
     /**
-     * Same 30-minute "Urgent" threshold as above, reused (not a separately
-     * invented number) as the final-call point for the two one-shot urgent
-     * notifications below — each fires exactly once when its situation
-     * first becomes urgent (see WorkflowService::assignStage() and
-     * escalate()'s SHORT_GRACE_URGENT_SECONDS check), with no follow-up if
-     * that first ping goes unseen. This is the ONE additional nudge, right
-     * before the thing actually happens (SLA breach/escalation, or
-     * auto-approval), guarded by its own *_reminder_sent_at column so it
-     * can never repeat.
+     * The detect+compensate pair, as one step — called from two places:
+     * the periodic sweep() below (a backstop), and CheckForSlaOutage
+     * middleware (the real, fast path — see that class' docblock for why
+     * "the first thing that runs after recovery" beats waiting on any
+     * schedule). Both call sites get identical behavior for free, since
+     * this is the one place the pairing is defined.
+     *
+     * @return array{outage: ?SlaOutageWindow, compensated: int}
      */
-    private const URGENT_FOLLOWUP_SECONDS = 1800; // 30 minutes
+    public function checkForOutageRecovery(): array
+    {
+        $outage = $this->detectOutage();
+        $compensated = $outage ? $this->compensateForOutage($outage) : 0;
+
+        return ['outage' => $outage, 'compensated' => $compensated];
+    }
 
     public function sweep(): array
     {
+        $outageCheck = $this->checkForOutageRecovery();
+
         return [
-            'auto_approved' => $this->autoApproveUnresolved(),
-            'review_reminders_sent' => $this->remindUnreviewedAutoApprovals(),
+            'outage_detected' => $outageCheck['outage'] !== null,
+            'deadlines_compensated' => $outageCheck['compensated'],
+            'late_review_reminders_sent' => $this->trackLateReviews(),
+            'late_ml_review_reminders_sent' => $this->trackLateMlReviews(),
             'urgent_approver_reminders_sent' => $this->remindStillUrgentApprovers(),
-            'grace_reminders_sent' => $this->remindShortGraceWindows(),
         ];
+    }
+
+    /**
+     * Only touches assignments that were actually AT RISK when the outage
+     * hit — Urgent, Normal, or already Expired (urgencyRank() 1, 2, or 4)
+     * — a document with days of slack left (rank 3, "Low") was never
+     * going to be affected by a short outage, so leaving it alone avoids
+     * both pointless deadline churn and a notification nobody needed.
+     * Expired is deliberately included, not just Urgent/Normal: this
+     * sweep runs AFTER the outage has already ended, so an assignment
+     * that was Urgent right as the outage hit will usually have already
+     * ticked over to "Expired" (0 seconds remaining) by the time this
+     * runs — excluding Expired would miss exactly the case this feature
+     * exists for, and let it fall through to an uncompensated auto-
+     * approval instead.
+     *
+     * The new deadline is whichever is LATER: the strict business-hours-
+     * aware calculation (push the current deadline forward by exactly how
+     * many working minutes the outage cost, via addBusinessMinutes — see
+     * its docblock for why this isn't a naive "add the raw outage
+     * length"), or a flat OUTAGE_COMPENSATION_FLOOR_MINUTES after the
+     * outage actually ended. Without the floor, a short overlap right at
+     * the edge of closing time could compensate someone with a window so
+     * thin (a few minutes at the start of the next working day) that it's
+     * not a fair chance to act, even though it's technically accurate.
+     * Either way, never pushed past the assignment's own due date — an
+     * outage extends the approver's working budget, not what the
+     * Originator was promised.
+     */
+    private function compensateForOutage(SlaOutageWindow $outage): int
+    {
+        $count = 0;
+
+        DocumentAssignment::query()
+            ->where('individual_status', 'pending')
+            ->where('escalated_to_admin', false)
+            ->whereNotNull('sla_expires_at')
+            ->with(['document', 'stage'])
+            ->get()
+            ->each(function (DocumentAssignment $assignment) use (&$count, $outage) {
+                if (!in_array($assignment->urgencyRank(), [1, 2, 4], true)) {
+                    return;
+                }
+
+                $strict = $this->businessHours->addBusinessMinutes($assignment->sla_expires_at, $outage->business_minutes_lost);
+                $floor = $this->businessHours->addBusinessMinutes($outage->ended_at, self::OUTAGE_COMPENSATION_FLOOR_MINUTES);
+                $newExpiry = $strict->greaterThan($floor) ? $strict : $floor;
+
+                if ($assignment->due_date && $newExpiry->greaterThan($assignment->due_date)) {
+                    $newExpiry = $assignment->due_date->copy();
+                }
+
+                if ($newExpiry->lessThanOrEqualTo($assignment->sla_expires_at)) {
+                    return; // due-date clamp already left nothing to compensate
+                }
+
+                $assignment->sla_expires_at = $newExpiry;
+                $assignment->save();
+
+                NotificationRecord::send($assignment->user_id, $assignment->document_id,
+                    "Your review deadline for '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') was extended " .
+                    'to account for a recent system outage — you were not penalized for time the system itself was unreachable.');
+
+                $count++;
+            });
+
+        if ($count > 0) {
+            AuditLog::record(null, null, 'sla_outage_compensation',
+                "Detected a system outage from {$outage->started_at->toDayDateTimeString()} to {$outage->ended_at->toDayDateTimeString()} " .
+                "({$outage->business_minutes_lost} working minute(s) lost) — {$count} approver deadline(s) extended to compensate.");
+        }
+
+        $outage->compensated_at = now();
+        $outage->save();
+
+        return $count;
     }
 
     /**
      * The "born urgent" notification (WorkflowService::assignStage()) fires
      * exactly once, the instant an assignment is created with an already-
      * short window. If the approver isn't looking right then, nothing
-     * nudges them again before it actually escalates to Admin — this sends
-     * ONE follow-up, right as the same Urgent window is about to run out,
+     * nudges them again before it actually auto-approves — this sends ONE
+     * follow-up, right as the same Urgent window is about to run out,
      * guarded by urgent_reminder_sent_at.
      */
     private function remindStillUrgentApprovers(): int
@@ -112,7 +225,7 @@ class SlaService
 
                 NotificationRecord::send($assignment->user_id, $assignment->document_id,
                     "FINAL CALL: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') is about to breach its SLA window " .
-                    '— please act now before it escalates to Admin.',
+                    '— please act now before it auto-approves.',
                     'high');
 
                 $count++;
@@ -121,79 +234,69 @@ class SlaService
         return $count;
     }
 
-    /**
-     * The "grace window is already short" notification (escalate()) fires
-     * exactly once, at the moment of escalation itself. If it isn't seen,
-     * nothing nudges Admins again as auto-approval gets closer — this
-     * sends ONE follow-up right before the system actually auto-approves,
-     * guarded by grace_reminder_sent_at. Reuses adminGraceExpiresAt() (the
-     * same single source of truth escalate() and autoApproveUnresolved()
-     * both use), so this can never disagree with when auto-approval will
-     * actually happen.
-     */
-    private function remindShortGraceWindows(): int
-    {
-        $count = 0;
-
-        DocumentAssignment::query()
-            ->where('individual_status', 'pending')
-            ->where('escalated_to_admin', true)
-            ->whereNull('admin_override_at')
-            ->whereNull('grace_reminder_sent_at')
-            ->with(['document', 'stage'])
-            ->get()
-            ->each(function (DocumentAssignment $assignment) use (&$count) {
-                $graceExpiresAt = $assignment->adminGraceExpiresAt();
-                if (!$graceExpiresAt || now()->diffInSeconds($graceExpiresAt, false) > self::URGENT_FOLLOWUP_SECONDS) {
-                    return;
-                }
-
-                $assignment->grace_reminder_sent_at = now();
-                $assignment->save();
-
-                foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
-                    NotificationRecord::send($admin->user_id, $assignment->document_id,
-                        "FINAL CALL: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') will be auto-approved by the system " .
-                        'very soon unless an Admin acts now.',
-                        'high');
-                }
-
-                $count++;
-            });
-
-        return $count;
-    }
+    /** How often a follow-up fires while an auto-approval sits unreviewed past its window, and how many times total before it stops nudging (the violation itself keeps accruing silently after that — see AdminViolation::hoursOverdue()). */
+    private const LATE_REVIEW_NOTIFICATION_INTERVAL_HOURS = 1;
+    private const LATE_REVIEW_NOTIFICATION_CAP = 24;
 
     /**
      * Closes the gap between "the system auto-approved this" and "an admin
      * actually looked at it" — autoApproveOne() already sends an immediate
      * in-app notification the moment auto-approval happens, but nothing
-     * previously followed up if that sat unreviewed. If a stage is still
-     * auto_approved, still unreviewed, and its document's due date is now
-     * within the same "Urgent" window used everywhere else in this app,
-     * every admin gets ONE escalated reminder (review_reminder_sent_at
-     * guards against re-sending it every sweep cycle for as long as it
-     * stays unreviewed).
+     * previously followed up if that sat unreviewed. Triggered off each
+     * assignment's own review_due_at (set at auto-approval time), NOT the
+     * document's due date: a document can have days of runway left while
+     * still needing a prompt review.
+     *
+     * ONE AdminViolation row per incident (not one per hour) — created the
+     * moment the review window first lapses, updated in place as
+     * notifications go out, resolved once AdminController::
+     * reviewAutoApproval() actually happens. Notifications repeat hourly,
+     * capped at LATE_REVIEW_NOTIFICATION_CAP total, so an admin away for a
+     * week doesn't come back to hundreds of identical pings — the
+     * violation itself keeps accruing (see hoursOverdue()) even after the
+     * nudging stops.
      */
-    private function remindUnreviewedAutoApprovals(): int
+    private function trackLateReviews(): int
     {
         $count = 0;
 
         DocumentAssignment::query()
             ->where('auto_approved', true)
             ->whereNull('admin_reviewed_at')
-            ->whereNull('review_reminder_sent_at')
-            ->whereHas('document', fn ($q) => $q->where('due_date', '<=', now()->addSeconds(self::REVIEW_REMINDER_DUE_SOON_SECONDS)))
+            ->whereNotNull('review_due_at')
+            ->where('review_due_at', '<=', now())
             ->with(['document', 'stage'])
             ->get()
             ->each(function (DocumentAssignment $assignment) use (&$count) {
-                $assignment->review_reminder_sent_at = now();
-                $assignment->save();
+                $violation = AdminViolation::firstOrCreate(
+                    ['assignment_id' => $assignment->assignment_id, 'violation_type' => 'late_review', 'resolved_at' => null],
+                    [
+                        'document_id' => $assignment->document_id,
+                        'stage_name' => $assignment->stage->stage_name,
+                        'first_violated_at' => $assignment->review_due_at,
+                        'notification_count' => 0,
+                    ]
+                );
+
+                if ($violation->notification_count >= self::LATE_REVIEW_NOTIFICATION_CAP) {
+                    return;
+                }
+                // abs(): Carbon 3's diffInHours() returns a signed float
+                // depending on direction, not always positive even though
+                // $now is always later here — same gotcha as
+                // escalateApproverMiss()'s duration_overdue calculation.
+                if ($violation->last_notified_at && abs(now()->diffInHours($violation->last_notified_at)) < self::LATE_REVIEW_NOTIFICATION_INTERVAL_HOURS) {
+                    return;
+                }
+
+                $violation->last_notified_at = now();
+                $violation->notification_count++;
+                $violation->save();
 
                 foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
                     NotificationRecord::send($admin->user_id, $assignment->document_id,
                         "URGENT: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') was auto-approved " .
-                        "and still hasn't been reviewed — its due date is approaching. Please confirm or dispute it now.",
+                        "and still hasn't been reviewed — it's now {$violation->hoursOverdue()}h past its review window. Please confirm or dispute it now.",
                         'high');
                 }
 
@@ -204,157 +307,142 @@ class SlaService
     }
 
     /**
-     * Flags a single expired-but-not-yet-escalated assignment: sets
-     * escalated_to_admin, logs the violation to sla_violations, and notifies
-     * Admins (in-app + email). This is the same logic the scheduled
-     * `workflow:check-parallel-slas` command runs in bulk — factored out
-     * here so it can ALSO be triggered on-demand (see ApprovalController)
-     * the moment someone touches a since-expired assignment, rather than
-     * depending entirely on the next cron tick. Without this, an approver
-     * could still approve/reject an assignment whose SLA had already
-     * lapsed, simply because the periodic sweep hadn't run yet.
+     * The classification-review counterpart to trackLateReviews() above —
+     * same "log it, keep nudging, never auto-decide" shape, just for a
+     * low-confidence classification sitting unconfirmed (DocumentRepository::
+     * ml_review_due_at, set in WorkflowService::ingest()) instead of an
+     * auto-approved assignment sitting unreviewed. Deliberately does NOT
+     * auto-accept the classifier's guess once the window passes — that
+     * would defeat the entire reason this review step exists (the guess
+     * was already flagged as too uncertain to trust unsupervised); this
+     * only ever escalates visibility, never the decision itself.
      *
-     * Also the entry point for a needs_approver seat's OWN deadline lapsing
-     * (see WorkflowService::markNeedsApprover()) — same escalation, grace
-     * period, and eventual auto-approval as a normal approver miss, but
-     * $assignment->needs_approver branches the wording/record below: there's
-     * no approver to blame here (that's the whole reason it's stuck), so
-     * this must never read as "the approver missed it" or count against
-     * whoever used to hold the seat.
+     * No assignment_id (a late_ml_review violation predates any stage/
+     * seat existing for this document at all — see admin_violations'
+     * migration docblock) and no stage_name (same reason).
      */
-    public function escalate(DocumentAssignment $assignment): void
-    {
-        DB::transaction(function () use ($assignment) {
-            $escalatedAt = now();
-            $assignment->escalated_to_admin = true;
-            $assignment->escalated_at = $escalatedAt;
-            $assignment->save();
-
-            if ($assignment->needs_approver) {
-                AuditLog::record(null, $assignment->document_id, 'sla_escalation',
-                    "Stage '{$assignment->stage->stage_name}' on '{$assignment->document->title}' has had no eligible " .
-                    'approver for too long and was flagged for Admin escalation.');
-            } else {
-                AuditLog::record(null, $assignment->document_id, 'sla_escalation',
-                    "Approver assignment #{$assignment->assignment_id} (stage '{$assignment->stage->stage_name}') " .
-                    'exceeded its SLA window and was flagged for Admin escalation.');
-            }
-
-            // Event-driven auto-approval (mirrors EscalateAssignmentJob): fires
-            // exactly when the Admin grace window lapses, instead of waiting
-            // for the next 5-minute sla:check poll. sla:check stays wired into
-            // the scheduler as a backstop only (see bootstrap/app.php).
-            //
-            // Reuses DocumentAssignment::adminGraceExpiresAt() — the single
-            // source of truth for the grace deadline (due_date clamp AND the
-            // short-due-date halving rule both live there) — instead of
-            // recomputing the formula here, so this can never drift from
-            // what the displayed countdown or the backstop sweep compute.
-            $graceExpiresAt = $assignment->adminGraceExpiresAt();
-            AutoApproveAssignmentJob::dispatch($assignment->assignment_id, $graceExpiresAt)->delay($graceExpiresAt);
-
-            // No SlaViolation for a needs_approver seat — that table feeds
-            // the approver leaderboard/roster on the Violations page, and
-            // whoever used to hold this seat didn't fail anything; they
-            // were deactivated with nobody else eligible. Logging one here
-            // would unfairly count against their record for something that
-            // isn't theirs.
-            if (!$assignment->needs_approver) {
-                // abs()+round(): Carbon 3's diffInMinutes() returns a signed
-                // float even with the default $absolute param, so the sign
-                // and fractional part both need normalizing before this
-                // hits an unsignedInteger column.
-                SlaViolation::create([
-                    'document_id' => $assignment->document_id,
-                    'assignment_id' => $assignment->assignment_id,
-                    'approver_id' => $assignment->user_id,
-                    'violation_timestamp' => now(),
-                    'duration_overdue' => (int) round(abs(now()->diffInMinutes($assignment->sla_expires_at))),
-                    'stage_name' => $assignment->stage->stage_name,
-                ]);
-            }
-
-            $admins = User::where('role', 'admin')->where('is_active', true)->get();
-            foreach ($admins as $admin) {
-                $message = $assignment->needs_approver
-                    ? "'{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') still has no eligible " .
-                        'approver and its own deadline has now passed — needs Admin attention.'
-                    : "SLA violation: '{$assignment->document->title}' at stage '{$assignment->stage->stage_name}' " .
-                        '(approver: ' . ($assignment->approver->full_name ?? 'unassigned') . ') needs Admin attention.';
-
-                NotificationRecord::send($admin->user_id, $assignment->document_id, $message, 'high');
-            }
-
-            // A SEPARATE, extra-urgent notification — not a duplicate of
-            // the one above — for the specific case where the grace window
-            // just computed is already short (reusing the same 2-hour mark
-            // the grace countdown itself turns red at, so this fires
-            // exactly when an admin would already see it flagged urgent on
-            // the page). Escalation alone doesn't tell an admin whether
-            // they have 6 hours or 20 minutes to act; this does.
-            if (now()->diffInSeconds($graceExpiresAt, false) <= self::SHORT_GRACE_URGENT_SECONDS) {
-                foreach ($admins as $admin) {
-                    NotificationRecord::send($admin->user_id, $assignment->document_id,
-                        "URGENT: '{$assignment->document->title}' (stage '{$assignment->stage->stage_name}') has a very short " .
-                        'grace window before the system auto-approves it — please review now.',
-                        'high');
-                }
-            }
-
-            // DocumentAssignment::booted() only broadcasts on an
-            // individual_status change — escalating to Admin never touches
-            // that column, so without this the Admin dashboard's SLA alert
-            // widget would only learn about the violation via a bell
-            // notification, never a live list refresh. Reuses the same
-            // event/channel the dashboard already listens on.
-            event(new DocumentStatusChanged($assignment->document));
-        });
-    }
-
-    /**
-     * Escalated + Admin grace window also elapsed -> system resolves the
-     * stage automatically via WorkflowService::completeStage(), which
-     * advances/finalizes the document exactly as a human approval would.
-     */
-    private function autoApproveUnresolved(): int
+    private function trackLateMlReviews(): int
     {
         $count = 0;
 
-        // No ->unique('document_id') — a stage can now have more than one
-        // eligible-approver seat (see WorkflowService::assignStage()), so
-        // more than one row on the SAME document (even the same stage) can
-        // legitimately qualify for auto-approval in the same sweep; each
-        // needs its own independent auto-approval, not just the first one
-        // found per document.
-        //
-        // Fetches every still-escalated, still-pending, not-yet-overridden
-        // row (there's normally very few of these at once) and checks each
-        // one's real grace deadline in PHP via adminGraceExpiresAt() —
-        // the same single source of truth escalate() uses to schedule the
-        // actual auto-approval job. A flat SQL cutoff can't express the
-        // due-date clamp or the short-due-date halving rule that method
-        // applies, so this is precise rather than an approximation of it.
-        DocumentAssignment::query()
-            ->where('individual_status', 'pending')
-            ->where('escalated_to_admin', true)
-            ->whereNull('admin_override_at')
-            ->with(['document', 'stage'])
+        DocumentRepository::query()
+            ->where('ml_review_status', 'pending')
+            ->whereNotNull('ml_review_due_at')
+            ->where('ml_review_due_at', '<=', now())
             ->get()
-            ->each(function (DocumentAssignment $assignment) use (&$count) {
-                $graceExpiresAt = $assignment->adminGraceExpiresAt();
-                if ($graceExpiresAt && now()->greaterThanOrEqualTo($graceExpiresAt)) {
-                    $this->autoApproveOne($assignment);
-                    $count++;
+            ->each(function (DocumentRepository $document) use (&$count) {
+                $violation = AdminViolation::firstOrCreate(
+                    ['document_id' => $document->document_id, 'violation_type' => 'late_ml_review', 'resolved_at' => null],
+                    [
+                        'first_violated_at' => $document->ml_review_due_at,
+                        'notification_count' => 0,
+                    ]
+                );
+
+                if ($violation->notification_count >= self::LATE_REVIEW_NOTIFICATION_CAP) {
+                    return;
                 }
+                if ($violation->last_notified_at && abs(now()->diffInHours($violation->last_notified_at)) < self::LATE_REVIEW_NOTIFICATION_INTERVAL_HOURS) {
+                    return;
+                }
+
+                $violation->last_notified_at = now();
+                $violation->notification_count++;
+                $violation->save();
+
+                foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
+                    NotificationRecord::send($admin->user_id, $document->document_id,
+                        "URGENT: '{$document->title}' has been awaiting classification review for " .
+                        "{$violation->hoursOverdue()}h past its window — please confirm or correct its category now.",
+                        'high');
+                }
+
+                $count++;
             });
 
         return $count;
     }
 
     /**
-     * Shared by the sla:check polling backstop and AutoApproveAssignmentJob
-     * (event-driven, fires exactly when the grace window lapses) — same
-     * outcome either way, just triggered differently.
+     * Dispatches to whichever violation type applies — a real approver
+     * missing their own window (escalateApproverMiss()) and a stage with
+     * no eligible approver missing Admin's fallback window
+     * (escalateNeedsApprover()) both end the same way (auto-approved
+     * immediately, Admin reviews after), just logged against different
+     * responsible parties.
+     */
+    public function escalate(DocumentAssignment $assignment): void
+    {
+        if ($assignment->needs_approver) {
+            $this->escalateNeedsApprover($assignment);
+
+            return;
+        }
+
+        $this->escalateApproverMiss($assignment);
+    }
+
+    /**
+     * A real approver had their own fair window and missed it. Auto-
+     * approves right away (see autoApproveOne(), which sets a
+     * review_due_at so Admin still reviews it afterward, just not
+     * before). The SLA violation itself is still logged — the approver
+     * genuinely did miss their window, and that stays a real,
+     * accountable fact regardless of what happens next.
+     */
+    private function escalateApproverMiss(DocumentAssignment $assignment): void
+    {
+        // abs()+round(): Carbon 3's diffInMinutes() returns a signed float
+        // even with the default $absolute param, so the sign and
+        // fractional part both need normalizing before this hits an
+        // unsignedInteger column.
+        SlaViolation::create([
+            'document_id' => $assignment->document_id,
+            'assignment_id' => $assignment->assignment_id,
+            'approver_id' => $assignment->user_id,
+            'violation_timestamp' => now(),
+            'duration_overdue' => (int) round(abs(now()->diffInMinutes($assignment->sla_expires_at))),
+            'stage_name' => $assignment->stage->stage_name,
+        ]);
+
+        $this->autoApproveOne($assignment);
+    }
+
+    /**
+     * A stage had no eligible approver — Admin is the fallback approver
+     * for it (see the Unassigned Documents page, where Admin can decide
+     * it directly at any point before this deadline) — and that fallback
+     * window also passed with nobody having acted. Auto-approves
+     * immediately, same as an approver's own miss, and logs an
+     * AdminViolation against the Admin role rather than a real approver
+     * (there isn't one — that's exactly why Admin was the fallback).
+     * Always created already resolved: the auto-approval happens in the
+     * same instant as the violation, so there's nothing left to wait on
+     * for THIS violation (contrast trackLateReviews()'s late_review
+     * violations, which stay open until actually reviewed).
+     */
+    private function escalateNeedsApprover(DocumentAssignment $assignment): void
+    {
+        $now = now();
+
+        AdminViolation::create([
+            'document_id' => $assignment->document_id,
+            'assignment_id' => $assignment->assignment_id,
+            'violation_type' => 'missed_approval',
+            'stage_name' => $assignment->stage->stage_name,
+            'first_violated_at' => $now,
+            'resolved_at' => $now,
+        ]);
+
+        $this->autoApproveOne($assignment);
+    }
+
+    /** How long Admin has to review an auto-approved stage before a late review gets logged (see reviewDueAt() below) — matches the old admin_grace_hours default, not a separately invented number. */
+    private const ADMIN_REVIEW_WINDOW_HOURS = 6;
+
+    /**
+     * Shared by both auto-approval paths above — same outcome either way,
+     * just triggered by a different missed deadline.
      */
     public function autoApproveOne(DocumentAssignment $assignment): void
     {
@@ -362,10 +450,16 @@ class SlaService
             $document = $assignment->document;
 
             AuditLog::record(null, $document->document_id, 'auto_approve',
-                "System auto-approved stage '{$assignment->stage->stage_name}' after Admin grace window elapsed with no response.");
+                "System auto-approved stage '{$assignment->stage->stage_name}' — no human decision was made in time.");
 
+            // Deliberately NOT phrased as final/done — the Originator
+            // needs to understand this hasn't actually been reviewed by
+            // a person yet, only auto-approved because nobody acted in
+            // time. See status-badge.blade.php for the matching visual
+            // treatment (not the same green as a real approval).
             NotificationRecord::send($document->originator_id, $document->document_id,
-                "Your document '{$document->title}' had a stage auto-approved by the system after an unresolved SLA violation.", 'high');
+                "Your document '{$document->title}' (stage '{$assignment->stage->stage_name}') was auto-approved because nobody " .
+                'acted on it in time — an Admin will still give it a final check, and you\'ll be notified if anything changes.', 'high');
 
             foreach (User::whereIn('role', ['admin', 'approver'])->where('is_active', true)->get() as $u) {
                 NotificationRecord::send($u->user_id, $document->document_id,
@@ -376,44 +470,26 @@ class SlaService
             // individual_status and auto_approved must be set here —
             // completeStage() only finalizes the DOCUMENT's
             // global_status; it never touches the assignment's own
-            // status (that's the caller's job, same as decide() and
-            // adminOverride() already do). Without this, the
-            // assignment stays 'pending' forever and would get
-            // caught — and re-notified on — every subsequent sweep.
+            // status (that's the caller's job, same as decide() already
+            // does). Without this, the assignment stays 'pending'
+            // forever and would get caught — and re-notified on — every
+            // subsequent sweep.
             $assignment->individual_status = 'approved';
             $assignment->auto_approved = true;
             $assignment->acted_at = now();
+            // Admin's own soft review deadline — a flat window capped so
+            // it never runs past the document's due date, checked by
+            // trackLateReviews() above and AdminController::
+            // reviewAutoApproval() to decide whether a review was late —
+            // crossing it doesn't block or auto-trigger anything by
+            // itself.
+            $flatReviewDeadline = now()->addHours(self::ADMIN_REVIEW_WINDOW_HOURS);
+            $assignment->review_due_at = ($assignment->due_date && $flatReviewDeadline->greaterThan($assignment->due_date))
+                ? $assignment->due_date->copy()
+                : $flatReviewDeadline;
             $assignment->save();
 
             $this->workflow->completeStage($assignment, 'approved', true);
-        });
-    }
-
-    /**
-     * Admin manually overrides a stuck assignment (approve or reject).
-     * Routed through WorkflowService::completeStage() so the document
-     * advances/finalizes exactly as it would from a normal approver decision.
-     */
-    public function adminOverride(DocumentAssignment $assignment, User $admin, string $decision, ?string $comments = null): void
-    {
-        DB::transaction(function () use ($assignment, $admin, $decision, $comments) {
-            $assignment->admin_override_at = now();
-            $assignment->admin_override_by = $admin->user_id;
-            $assignment->individual_status = $decision;
-            $assignment->comments = $comments;
-            $assignment->acted_at = now();
-            $assignment->save();
-
-            $document = $assignment->document;
-            DocumentReviewSession::closeFor($document, $admin);
-            AuditLog::record($admin->user_id, $document->document_id, 'admin_override',
-                "Admin {$admin->full_name} overrode stage '{$assignment->stage->stage_name}' -> {$decision}." . ($comments ? " Notes: {$comments}" : ''));
-
-            $this->workflow->completeStage($assignment, $decision);
-
-            NotificationRecord::send($document->originator_id, $document->document_id,
-                "An Admin override was applied to your document '{$document->title}' ({$decision})." .
-                ($comments ? " Notes: \"{$comments}\"" : ''));
         });
     }
 }

@@ -55,4 +55,28 @@ return [
 
     'min_real_word_ratio' => 0.7,
 
+    /*
+    |--------------------------------------------------------------------------
+    | Originator-directed routing (Feature: bypass the automatic pipeline)
+    |--------------------------------------------------------------------------
+    |
+    | generic_min_word_count: the bare sanity check ValidationService::
+    | validateGeneric() applies to a document the originator flagged as not
+    | belonging to any of the trained categories — no required sections, no
+    | vocabulary-based readability score (both are defined per category, and
+    | there's no real category to check against here), just "is there
+    | actually meaningful content" so an obviously blank/garbage upload
+    | still doesn't reach a human approver.
+    |
+    | ml_review_window_hours: how long Admin has to confirm/correct a low-
+    | confidence classification before SlaService::trackLateMlReviews()
+    | logs it as a late review — matches SlaService::ADMIN_REVIEW_WINDOW_HOURS,
+    | the same 6-hour window already used for late auto-approval reviews,
+    | not a separately invented number.
+    |
+    */
+
+    'generic_min_word_count' => 20,
+    'ml_review_window_hours' => 6,
+
 ];

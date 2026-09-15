@@ -28,14 +28,28 @@
     scoped, not stage-scoped, since a stage can now have some escalated
     seats and some non-escalated seats at once) — labeled "Escalated"
     rather than "Your turn" since it isn't the viewer's own assignment.
+
+    Originator-directed routing (Feature: bypass the standard pipeline —
+    see WorkflowService::routeToCustomApprovers()): a custom-routed
+    document never touches the category's configured pipeline at all, so
+    showing it here would list stages that will never actually happen as
+    if they're still coming ("Not yet reached" forever). Below, this
+    shows ONLY the document's own one-off stage(s) in that case instead
+    of the category-wide list — see desired_routing's branch.
 --}}
 @php
     // A document with no ml_category yet (still processing, or extraction/
     // classification never completed) has no workflow pipeline to show —
     // WorkflowStage::forCategory() requires a non-null category string.
-    $allStages = $document->ml_category
-        ? \App\Models\WorkflowStage::forCategory($document->ml_category)->get()
-        : collect();
+    // Checked against the two explicit opt-out values, not "!== 'auto'"
+    // — see ApprovalForecastService::estimateFor()'s identical comment
+    // for why: desired_routing defaults to 'auto' at the DB level, but an
+    // unrefreshed in-memory model reads it as null until reloaded.
+    $allStages = match(true) {
+        !$document->ml_category => collect(),
+        in_array($document->desired_routing, ['custom', 'unrelated'], true) => \App\Models\WorkflowStage::where('document_id', $document->document_id)->orderBy('sequence_order')->get(),
+        default => \App\Models\WorkflowStage::configured()->forCategory($document->ml_category)->get(),
+    };
     $assignmentsByStage = $document->assignments->groupBy('stage_id');
     $currentUserId = auth()->id();
 
@@ -83,11 +97,18 @@
 @endphp
 
 @if(!$document->ml_category)
-    <div class="rounded-lg border border-surface-200 bg-surface-50 p-3 text-xs text-surface-500">
+    <div class="rounded-lg border border-surface-200 bg-surface-50 p-3 text-sm text-surface-500">
         This document hasn't been classified yet, so it has no workflow stages to show.
         @if($document->validation_errors)
             See the validation issue below for why.
         @endif
+    </div>
+@elseif($allStages->isEmpty() && $document->pending_custom_routing_at)
+    {{-- Originator-directed routing, awaiting the pick — no one-off
+         stage exists yet at all (routeToCustomApprovers() creates it),
+         so there's genuinely nothing to list here yet. --}}
+    <div class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700">
+        Awaiting the originator's approver selection — this document's approval process hasn't been set up yet.
     </div>
 @else
 @php
@@ -120,8 +141,11 @@
             $estApprovalBy = \Carbon\Carbon::parse($document->due_date);
         }
     @endphp
-    <p class="text-[11px] text-surface-500 mb-2">
-        <span class="font-medium text-surface-600">Est. Approval by:</span> {{ $estApprovalBy->format('M j, Y, g:i A') }}
+    <p class="text-sm text-surface-500 mb-2 flex items-center justify-between gap-3">
+        <span><span class="font-medium text-surface-600">Est. Approval by:</span> {{ $estApprovalBy->format('M j, Y, g:i A') }}</span>
+        @if($document->due_date)
+            <span><span class="font-medium text-surface-600">Due:</span> {{ $document->due_date->format('M j, Y, g:i A') }}</span>
+        @endif
     </p>
 @endif
 <div class="space-y-2">
@@ -163,8 +187,14 @@
             @elseif($isMine) border-primary-200 bg-primary-50/40
             @elseif($state === 'pending') border-processing-500/30 bg-processing-50/40
             @else border-surface-200 @endif">
-            <div class="w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold flex-shrink-0 shadow-sm mt-0.5
-                @if(in_array($state, ['approved', 'auto_approved'])) bg-gradient-to-br from-approved-500 to-approved-600 text-white
+            {{-- auto_approved gets its own amber gradient, not the same
+                 green as a real human approval — a document that was
+                 only auto-approved because nobody acted in time hasn't
+                 actually been signed off by a person yet, and shouldn't
+                 look identical to one that has. --}}
+            <div class="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 shadow-sm mt-0.5
+                @if($state === 'approved') bg-gradient-to-br from-approved-500 to-approved-600 text-white
+                @elseif($state === 'auto_approved') bg-gradient-to-br from-amber-500 to-amber-600 text-white
                 @elseif($state === 'rejected') bg-gradient-to-br from-rejected-500 to-rejected-600 text-white
                 @elseif($isMyActive) bg-gradient-to-br from-primary-500 to-primary-700 text-white
                 @elseif($state === 'pending') bg-gradient-to-br from-processing-500 to-processing-600 text-white
@@ -178,29 +208,29 @@
                 @endif
             </div>
             <div class="flex-1 min-w-0">
-                <p class="text-xs font-medium text-surface-800 flex items-center gap-1.5 flex-wrap">
+                <p class="text-sm font-medium text-surface-800 flex items-center gap-1.5 flex-wrap">
                     {{ $stage->stage_name }}
                     @if($isForcedHighlight)
-                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rejected-100 text-rejected-700">Escalated</span>
+                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold bg-rejected-100 text-rejected-700">Escalated</span>
                     @elseif($isMyActive)
-                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold text-gray-600">Your turn</span>
+                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold text-gray-600">Your turn</span>
                     @elseif($isMine)
-                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-primary-100 text-primary-700">Up next</span>
+                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold bg-primary-100 text-primary-700">Up next</span>
                     @endif
                     @if($totalSeats > 1 && $state === 'pending')
-                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-surface-100 text-surface-600">{{ $approvedSeats->count() }} of {{ $totalSeats }} approved</span>
+                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold bg-surface-100 text-surface-600">{{ $approvedSeats->count() }} of {{ $totalSeats }} approved</span>
                     @endif
                     @if($stageAssignments->contains(fn ($a) => $a->reassigned_from))
-                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-processing-100 text-processing-700">Reassigned</span>
+                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold bg-processing-100 text-processing-700">Reassigned</span>
                     @endif
                 </p>
 
                 @if($state === 'upcoming')
-                    <p class="text-[11px] text-surface-400">Not yet reached</p>
+                    <p class="text-sm text-surface-400">Not yet reached</p>
                 @elseif($totalSeats <= 1)
                     {{-- Single-seat stage: identical wording to before the
                          multi-approver redesign. --}}
-                    <p class="text-[11px] text-surface-400">
+                    <p class="text-sm text-surface-400">
                         @if($state === 'pending' && $soleAssignment->needs_approver)
                             Awaiting decision &middot; <span class="text-processing-700 font-medium">Admin</span> (no approver eligible for this category/stage)
                         @elseif($state === 'pending' && $soleAssignment->reassigned_from)
@@ -224,19 +254,19 @@
                         @endif
                     </p>
                     @if($soleAssignment && $soleAssignment->comments)
-                        <div class="mt-1 rounded-md bg-surface-50 border border-surface-100 px-2 py-1 text-[11px]">
+                        <div class="mt-1 rounded-md bg-surface-50 border border-surface-100 px-2 py-1 text-sm">
                             <span class="font-semibold text-surface-600">{{ $soleAssignment->individual_status === 'rejected' ? 'Rejected Due To:' : 'Comments:' }}</span>
                             <span class="text-surface-600">{{ $soleAssignment->comments }}</span>
                         </div>
                     @endif
                     @if($soleAssignment && $soleAssignment->reassignment_reason)
-                        <p class="text-[11px] text-surface-500 mt-0.5 italic">Reassignment reason: "{{ $soleAssignment->reassignment_reason }}"</p>
+                        <p class="text-sm text-surface-500 mt-0.5 italic">Reassignment reason: "{{ $soleAssignment->reassignment_reason }}"</p>
                     @endif
                     @if($soleAssignment && in_array($state, ['approved', 'auto_approved', 'rejected']) && $soleAssignment->approver)
                         @php $reviewSummary = $reviewSummaryFor($soleAssignment->user_id); @endphp
                         @if($reviewSummary)
-                            <p class="text-[11px] text-surface-500 mt-0.5">Opened {{ $reviewSummary['opened']->format('M j, Y, g:i A') }}</p>
-                            <p class="text-[11px] text-surface-500">
+                            <p class="text-sm text-surface-500 mt-0.5">Opened {{ $reviewSummary['opened']->format('M j, Y, g:i A') }}</p>
+                            <p class="text-sm text-surface-500">
                                 Reviewed {{ $reviewSummary['segments'] }} &mdash; {{ $reviewSummary['total'] }} total
                             </p>
                         @endif
@@ -247,7 +277,7 @@
                          — with several approvers, whose decision/comment is
                          whose is no longer implicit from context. --}}
                     @if($state === 'pending')
-                        <p class="text-[11px] text-surface-400">
+                        <p class="text-sm text-surface-400">
                             Awaiting decision from
                             @foreach($pendingSeats as $seat)
                                 @if($seat->needs_approver)
@@ -259,20 +289,20 @@
                             @endforeach
                         </p>
                     @elseif($state === 'rejected')
-                        <p class="text-[11px] text-surface-400">Rejected</p>
+                        <p class="text-sm text-surface-400">Rejected</p>
                     @else
-                        <p class="text-[11px] text-surface-400">
+                        <p class="text-sm text-surface-400">
                             {{ ucfirst($state) === 'Auto_approved' ? 'Auto-approved by the system' : 'Approved' }} — all {{ $totalSeats }} approvers signed off
                         </p>
                     @endif
                     @foreach($stageAssignments->whereIn('individual_status', ['approved', 'rejected', 'auto_approved']) as $seat)
-                        <p class="text-[11px] text-surface-500 mt-0.5">
+                        <p class="text-sm text-surface-500 mt-0.5">
                             <span class="font-medium">{{ $seat->approver->full_name ?? 'a deactivated account' }}</span>:
                             {{ $seat->auto_approved ? 'auto-approved' : ucfirst($seat->individual_status) }}
                             @if($seat->acted_at) &middot; {{ $seat->acted_at->format('M j, Y, g:i A') }} @endif
                         </p>
                         @if($seat->comments)
-                            <div class="mt-1 rounded-md bg-surface-50 border border-surface-100 px-2 py-1 text-[11px]">
+                            <div class="mt-1 rounded-md bg-surface-50 border border-surface-100 px-2 py-1 text-sm">
                                 <span class="font-semibold text-surface-600">{{ $seat->individual_status === 'rejected' ? 'Rejected Due To:' : 'Comments:' }}</span>
                                 <span class="text-surface-600">{{ $seat->comments }}</span>
                             </div>
@@ -280,15 +310,15 @@
                         @if($seat->approver)
                             @php $reviewSummary = $reviewSummaryFor($seat->user_id); @endphp
                             @if($reviewSummary)
-                                <p class="text-[11px] text-surface-500">Opened {{ $reviewSummary['opened']->format('M j, Y, g:i A') }}</p>
-                                <p class="text-[11px] text-surface-500">
+                                <p class="text-sm text-surface-500">Opened {{ $reviewSummary['opened']->format('M j, Y, g:i A') }}</p>
+                                <p class="text-sm text-surface-500">
                                     Reviewed {{ $reviewSummary['segments'] }} &mdash; {{ $reviewSummary['total'] }} total
                                 </p>
                             @endif
                         @endif
                     @endforeach
                     @foreach($stageAssignments->filter(fn ($a) => $a->reassignment_reason) as $seat)
-                        <p class="text-[11px] text-surface-500 mt-0.5 italic">
+                        <p class="text-sm text-surface-500 mt-0.5 italic">
                             {{ $seat->approver->full_name ?? 'Unknown' }} reassignment reason: "{{ $seat->reassignment_reason }}"
                         </p>
                     @endforeach

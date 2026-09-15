@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Middleware\CheckForSlaOutage;
 use App\Http\Middleware\RoleMiddleware;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -30,6 +31,12 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'role' => RoleMiddleware::class,
         ]);
+
+        // The fast path for outage detection (see CheckForSlaOutage's
+        // docblock) — appended to the 'web' group so it runs on every
+        // request, not just scheduler ticks. Cheap no-op for the normal
+        // case; only does real work the first time it notices a gap.
+        $middleware->appendToGroup('web', CheckForSlaOutage::class);
 
         // Trust every proxy in front of this app (Railway, or any other
         // platform that terminates TLS at its own edge and forwards
@@ -85,6 +92,13 @@ return Application::configure(basePath: dirname(__DIR__))
         // old documents' Document Tracker history. Runs after the
         // nightly backup, same low-traffic window.
         $schedule->command('records:archive')->dailyAt('02:30')->withoutOverlapping();
+
+        // Fully automatic — no admin "train now" button by design (see
+        // ApprovalTimeMlService). Hourly is frequent enough to pick up a
+        // newly-eligible (category, department) combo without being
+        // wasteful; trainFor() itself is cheap to skip when nothing's
+        // actually changed enough to beat the currently active model.
+        $schedule->command('ml:train-time-estimator')->hourly()->withoutOverlapping();
     })
     ->withExceptions(function (Exceptions $exceptions) {
         // Sends every unhandled exception to Sentry (config/sentry.php,

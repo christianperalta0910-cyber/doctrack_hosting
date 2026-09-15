@@ -149,61 +149,8 @@ test('the approver final-call reminder only fires once — a second sweep does n
     expect($first)->toBe(1)->and($second)->toBe(0);
 });
 
-// --- Gap 2b: SlaService::remindShortGraceWindows() ---
-
-function escalatedSeatDueIn(User $originator, int $minutesUntilDue, int $escalatedMinutesAgo): DocumentAssignment
-{
-    $approver = User::factory()->approver('Job Order')->create();
-    $stage = WorkflowStage::where('stage_name', 'Technical Review')->first();
-    $document = DocumentRepository::create([
-        'originator_id' => $originator->user_id, 'title' => 'grace-followup-test.txt', 'file_path' => 'documents/grace-followup-test.txt',
-        'mime_type' => 'text/plain', 'due_date' => now()->addMinutes($minutesUntilDue),
-        'global_status' => 'classified_validated', 'ml_category' => 'Job Order',
-    ]);
-
-    return DocumentAssignment::create([
-        'document_id' => $document->document_id, 'user_id' => $approver->user_id, 'stage_id' => $stage->stage_id,
-        'due_date' => $document->due_date, 'priority_rank' => 2, 'individual_status' => 'pending',
-        'sla_expires_at' => now()->subMinutes(5),
-        'escalated_to_admin' => true, 'escalated_at' => now()->subMinutes($escalatedMinutesAgo),
-    ]);
-}
-
-test('an escalated assignment about to be auto-approved gets exactly one grace final-call reminder', function () {
-    $admin = User::factory()->admin()->create();
-    $originator = User::factory()->originator()->create();
-    // due_date only 20 minutes out -> the flat 6h grace would blow past
-    // it, so adminGraceExpiresAt() halves the remainder to ~10 minutes —
-    // well under the 30-minute follow-up threshold.
-    $assignment = escalatedSeatDueIn($originator, 20, 1);
-
-    $sent = app(SlaService::class)->sweep()['grace_reminders_sent'];
-
-    expect($sent)->toBe(1)
-        ->and($assignment->fresh()->grace_reminder_sent_at)->not->toBeNull()
-        ->and(NotificationRecord::where('recipient_id', $admin->user_id)
-            ->where('priority', 'high')
-            ->where('message_body', 'like', '%FINAL CALL%auto-approved by the system very soon%')
-            ->exists())->toBeTrue();
-});
-
-test('an escalated assignment with a distant grace deadline gets no grace final-call reminder', function () {
-    User::factory()->admin()->create();
-    $originator = User::factory()->originator()->create();
-    escalatedSeatDueIn($originator, 60 * 24 * 3, 5); // 3 days out -> flat 6h grace applies, well beyond 30 min
-
-    $sent = app(SlaService::class)->sweep()['grace_reminders_sent'];
-
-    expect($sent)->toBe(0);
-});
-
-test('the grace final-call reminder only fires once — a second sweep does not re-notify', function () {
-    User::factory()->admin()->create();
-    $originator = User::factory()->originator()->create();
-    escalatedSeatDueIn($originator, 20, 1);
-
-    $first = app(SlaService::class)->sweep()['grace_reminders_sent'];
-    $second = app(SlaService::class)->sweep()['grace_reminders_sent'];
-
-    expect($first)->toBe(1)->and($second)->toBe(0);
-});
+// Gap 2b (SlaService::remindShortGraceWindows()) is gone — there's no
+// more Admin grace window to send a final-call reminder about, now that
+// a needs_approver seat auto-approves the instant its own deadline
+// passes instead of waiting on a second one (see SlaService::
+// escalateNeedsApprover()).

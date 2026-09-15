@@ -81,12 +81,22 @@
                                                     </button>
                                                 @endif
                                             </div>
-                                            <form method="POST" action="{{ route('admin.sla.override', $assignment) }}" class="flex items-center gap-1.5 shrink-0">
+                                            {{-- Same shared-textarea + required-toggle pattern as
+                                                 Unassigned Documents' identical Approve/Reject form —
+                                                 a rejection needs a real reason on file, same as every
+                                                 other reject anywhere in this app; approving needs none. --}}
+                                            <form method="POST" action="{{ route('admin.sla.override', $assignment) }}" class="flex flex-col gap-1.5 shrink-0 w-full sm:w-64">
                                                 @csrf
-                                                <button type="submit" name="decision" value="approved"
-                                                    class="text-xs font-medium bg-approved-500 hover:bg-approved-700 text-white px-2.5 py-1 rounded-lg">Approve</button>
-                                                <button type="submit" name="decision" value="rejected"
-                                                    class="text-xs font-medium bg-rejected-500 hover:bg-rejected-700 text-white px-2.5 py-1 rounded-lg">Reject</button>
+                                                <textarea name="comments" rows="1" placeholder="Notes (required if rejecting)…"
+                                                    class="w-full rounded-lg border-surface-300 text-xs focus:border-primary-500 focus:ring-primary-500 px-2 py-1 resize-none"></textarea>
+                                                <div class="flex items-center gap-1.5">
+                                                    <button type="submit" name="decision" value="approved"
+                                                        onclick="this.form.querySelector('textarea[name=comments]').required = false"
+                                                        class="flex-1 text-xs font-medium bg-approved-500 hover:bg-approved-700 text-white px-2.5 py-1 rounded-lg">Approve</button>
+                                                    <button type="submit" name="decision" value="rejected"
+                                                        onclick="this.form.querySelector('textarea[name=comments]').required = true"
+                                                        class="flex-1 text-xs font-medium bg-rejected-500 hover:bg-rejected-700 text-white px-2.5 py-1 rounded-lg">Reject</button>
+                                                </div>
                                             </form>
                                         </li>
                                     @endforeach

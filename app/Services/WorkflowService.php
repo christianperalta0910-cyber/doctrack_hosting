@@ -6,6 +6,7 @@ use App\Events\AssignmentRouted;
 use App\Events\DocumentStatusChanged;
 use App\Jobs\EscalateAssignmentJob;
 use App\Models\AuditLog;
+use App\Models\DocumentAnnotation;
 use App\Models\DocumentAssignment;
 use App\Models\DocumentRepository;
 use App\Models\DocumentReviewSession;
@@ -191,10 +192,22 @@ class WorkflowService
      *         DocumentController::resubmit()) rather than a brand new,
      *         unrelated submission — links the two into a version chain
      *         instead of leaving the rejection as a dead end.
+     * @param  string  $routingMode  Feature: originator-directed routing —
+     *         'auto' (default, unchanged): the automatic, ML-category-
+     *         driven pipeline. 'custom': a real, known category, but the
+     *         originator wants to hand-pick the approver(s) instead of the
+     *         full pipeline — classification and validation still run and
+     *         matter exactly as for 'auto', only ROUTING changes (see
+     *         routeOrAwaitApproverSelection()). 'unrelated': the
+     *         originator says this document doesn't belong to any of the
+     *         trained categories — classification still runs (ml_category
+     *         keeps the classifier's best guess, for reference only), but
+     *         it stops gating validation (validateGeneric() applies
+     *         instead of the category template) or driving routing.
      */
-    public function ingest(UploadedFile $file, User $originator, string $dueDate, ?int $batchId = null, ?DocumentRepository $revisionOf = null, bool $requiresPrinting = false): DocumentRepository
+    public function ingest(UploadedFile $file, User $originator, string $dueDate, ?int $batchId = null, ?DocumentRepository $revisionOf = null, bool $requiresPrinting = false, string $routingMode = 'auto'): DocumentRepository
     {
-        return DB::transaction(function () use ($file, $originator, $dueDate, $batchId, $revisionOf, $requiresPrinting) {
+        return DB::transaction(function () use ($file, $originator, $dueDate, $batchId, $revisionOf, $requiresPrinting, $routingMode) {
             // Default disk (config('filesystems.default')), not hardcoded
             // 'local' — respects FILESYSTEM_DISK, so uploads actually land
             // wherever that's configured (S3-compatible object storage in
@@ -213,6 +226,7 @@ class WorkflowService
                 'mime_type' => $file->getMimeType(),
                 'due_date' => $dueDate,
                 'global_status' => 'processing',
+                'desired_routing' => $routingMode,
                 'previous_version_id' => $revisionOf?->document_id,
                 'version_number' => $revisionOf ? $revisionOf->version_number + 1 : 1,
                 // Purely the originator's own explicit checkbox at upload
@@ -304,17 +318,31 @@ class WorkflowService
             // document (no assignments created, nothing appears on any
             // approver's dashboard) until an admin confirms or corrects the
             // category — see AdminController::reviewFlaggedDocument().
-            $needsClassificationReview = $result['confidence'] < config('ml.review_confidence_threshold', 70);
+            //
+            // Never applies to an 'unrelated' document (Feature:
+            // originator-directed routing) — ml_category there is only
+            // ever the classifier's best guess for reference, never
+            // authoritative, so there's nothing meaningful for an admin
+            // to confirm/correct it INTO.
+            $needsClassificationReview = $routingMode !== 'unrelated'
+                && $result['confidence'] < config('ml.review_confidence_threshold', 70);
             if ($needsClassificationReview) {
                 $document->ml_review_status = 'pending';
+                $document->ml_review_due_at = now()->addHours(config('ml.ml_review_window_hours', 6));
             }
 
             AuditLog::record(null, $document->document_id, 'classify',
                 "Classified as '{$result['category']}' (confidence {$result['confidence']}%)" .
                 ($extraction['used_ocr_fallback'] ? ' [OCR fallback used]' : ''));
 
-            // 3.4 — validation
-            $validation = $this->validator->validate($result['category'], $extraction['text']);
+            // 3.4 — validation. An 'unrelated' document has no real
+            // category to validate against (required_sections/readability
+            // are both defined per category) — see ValidationService::
+            // validateGeneric()'s docblock for the bare sanity check that
+            // applies instead.
+            $validation = $routingMode === 'unrelated'
+                ? $this->validator->validateGeneric($extraction['text'])
+                : $this->validator->validate($result['category'], $extraction['text']);
             $document->is_validated = $validation['is_valid'];
             $document->validation_errors = $validation['errors'];
             $document->readability_score = $validation['readability_score'];
@@ -345,7 +373,7 @@ class WorkflowService
                 $validation['is_valid'] ? 'Validation passed.' : 'Validation failed: ' . implode('; ', $validation['errors']));
 
             if ($readyToRoute) {
-                $this->routeToWorkflow($document);
+                $this->routeOrAwaitApproverSelection($document);
             } elseif ($needsClassificationReview && $needsReadabilityReview) {
                 NotificationRecord::send($originator->user_id, $document->document_id,
                     "Your document '{$document->title}' is awaiting admin review for both its classification confidence " .
@@ -490,6 +518,37 @@ class WorkflowService
     }
 
     /**
+     * The single decision point for "this document just became ready to
+     * route" — called from ingest() once validation/classification first
+     * clear, and from AdminController's classification/readability
+     * review confirmations once whichever hold THEY were covering
+     * clears. A document routed the normal way (desired_routing ===
+     * 'auto', the default) goes straight into routeToWorkflow() exactly
+     * as before this feature existed. One originator-directed
+     * (desired_routing 'custom' or 'unrelated' — see DocumentController::
+     * store()) instead waits here for the originator to actually pick
+     * approver(s) themselves (see routeToCustomApprovers()) rather than
+     * being auto-routed — pending_custom_routing_at records that it's
+     * waiting.
+     */
+    public function routeOrAwaitApproverSelection(DocumentRepository $document): void
+    {
+        if ($document->desired_routing === 'auto') {
+            $this->routeToWorkflow($document);
+
+            return;
+        }
+
+        $document->pending_custom_routing_at = now();
+        $document->save();
+
+        NotificationRecord::send($document->originator_id, $document->document_id,
+            "'{$document->title}' is ready — select the approver(s) you'd like to route it to directly.");
+
+        event(new DocumentStatusChanged($document));
+    }
+
+    /**
      * Process 4.0 — Workflow Routing.
      *
      * Every configured stage is assigned to its own single, load-balanced
@@ -509,12 +568,16 @@ class WorkflowService
     {
         $this->extendDueDateIfReviewQueueAteTheBuffer($document);
 
-        $stages = WorkflowStage::forCategory($document->ml_category)->where('is_archived', false)->get();
+        $stages = WorkflowStage::configured()->forCategory($document->ml_category)->where('is_archived', false)->get();
 
         if ($stages->isEmpty()) {
             // No configured pipeline for this category — create a single generic stage.
+            // document_id explicitly in the search half, not just the create
+            // half — without it, this could match (and wrongly reuse) some
+            // OTHER document's one-off custom stage that happens to share
+            // this same guessed category (see routeToCustomApprovers()).
             $stages = collect([WorkflowStage::firstOrCreate(
-                ['document_category' => $document->ml_category, 'sequence_order' => 1],
+                ['document_category' => $document->ml_category, 'sequence_order' => 1, 'document_id' => null],
                 ['stage_name' => 'General Review']
             )]);
         }
@@ -596,13 +659,13 @@ class WorkflowService
      * second, independent guarantee at the point routing actually happens,
      * not because the first check is expected to fail.
      */
-    private function eligibleApproversForStage(DocumentRepository $document, WorkflowStage $stage): Collection
+    private function eligibleApproversForStage(string $category, WorkflowStage $stage): Collection
     {
         $stageDepartments = $stage->departmentNames();
 
         return User::where('role', 'approver')
             ->where('is_active', true)
-            ->where('assigned_category', $document->ml_category)
+            ->where('assigned_category', $category)
             ->get()
             ->filter(function (User $approver) use ($stage, $stageDepartments) {
                 if ($stageDepartments !== [] && !in_array($approver->department, $stageDepartments, true)) {
@@ -821,32 +884,74 @@ class WorkflowService
      */
     private function assignStage(DocumentRepository $document, WorkflowStage $stage, Carbon $slaExpiresAt): void
     {
-        $approvers = $this->eligibleApproversForStage($document, $stage);
+        $approvers = $this->eligibleApproversForStage($document->ml_category, $stage);
 
         if ($approvers->isEmpty()) {
-            AuditLog::record(null, $document->document_id, 'route_no_approver',
-                "No active approver is eligible for stage '{$stage->stage_name}' (category '{$document->ml_category}'). " .
-                'An Admin must create/assign an approver for this category and stage.');
+            // Same fallback every OTHER "nobody's eligible" case in this
+            // app already gets (see markNeedsApprover()'s docblock) —
+            // Admin is always the fallback, on the same clock, visible on
+            // Unassigned Documents. This used to just log a notice and
+            // give up, leaving the document permanently stuck with no SLA
+            // deadline and nothing to ever retry it, even after an Admin
+            // later added an eligible approver for this category/stage —
+            // a real gap, since every OTHER path into "no eligible
+            // approver" already gets the full fallback treatment.
+            $assignment = DocumentAssignment::create([
+                'document_id' => $document->document_id,
+                'stage_id' => $stage->stage_id,
+                'user_id' => null,
+                'due_date' => $document->due_date,
+                'priority_rank' => $this->computePriority($document->due_date),
+                'individual_status' => 'pending',
+                'needs_approver' => true,
+                'needs_approver_at' => now(),
+                'sla_expires_at' => $slaExpiresAt,
+            ]);
+
+            EscalateAssignmentJob::dispatch($assignment->assignment_id, $slaExpiresAt)->delay($slaExpiresAt);
+
+            AuditLog::record(null, $document->document_id, 'needs_approver',
+                "Stage '{$stage->stage_name}' on '{$document->title}' has no eligible approver — nobody is currently " .
+                "assigned to this category/stage. Moved to the Unassigned Documents queue, due {$slaExpiresAt->toDayDateTimeString()}.");
 
             foreach (User::where('role', 'admin')->where('is_active', true)->get() as $admin) {
                 NotificationRecord::send($admin->user_id, $document->document_id,
-                    "'{$document->title}' is stuck at stage '{$stage->stage_name}' — no eligible approver is available.",
-                    'high');
+                    "'{$document->title}' (stage '{$stage->stage_name}') needs an approver — nobody is currently " .
+                    'eligible for this category/stage. See Unassigned Documents.', 'high');
             }
+
+            event(new DocumentStatusChanged($document));
+
             return;
         }
 
+        $this->createAssignmentsForApprovers($document, $stage, $approvers, $slaExpiresAt,
+            "Stage '{$stage->stage_name}': assigned to all {$approvers->count()} eligible approver(s) " .
+            "(category '{$document->ml_category}') — {$approvers->pluck('full_name')->implode(', ')}. " .
+            "SLA window expires {$slaExpiresAt->toDayDateTimeString()} for each; the stage completes once every one has responded.");
+    }
+
+    /**
+     * The actual per-seat work shared by every way a stage gets its
+     * approvers — automatic, eligibility-driven routing (assignStage()
+     * above) and an originator's own hand-picked selection
+     * (routeToCustomApprovers() below) both end up here, since from this
+     * point on a seat is a seat regardless of how its holder was chosen.
+     *
+     * Wrapped in its own transaction — this creates one DocumentAssignment
+     * row per approver in a loop; a failure partway through (e.g. seat 2
+     * of 3) would otherwise leave a stage only PARTIALLY routed, with no
+     * error surfaced to explain why some approvers never got a seat. A
+     * nested transaction is safe here regardless of whether the caller
+     * already has one open — Laravel uses a savepoint for the inner one.
+     *
+     * @param  Collection<int, User>  $approvers
+     */
+    private function createAssignmentsForApprovers(DocumentRepository $document, WorkflowStage $stage, Collection $approvers, Carbon $slaExpiresAt, string $auditMessage): void
+    {
         $priorityRank = $this->computePriority($document->due_date);
 
-        // Wrapped in its own transaction — this creates one DocumentAssignment
-        // row per eligible approver in a loop; a failure partway through
-        // (e.g. seat 2 of 3) would otherwise leave a stage only PARTIALLY
-        // routed, with no error surfaced to explain why some eligible
-        // approvers never got a seat. A nested transaction is safe here
-        // regardless of whether the caller already has one open (ingest()'s
-        // normal routing path does; completeStage()'s next-stage safety net
-        // does not) — Laravel uses a savepoint for the inner one.
-        DB::transaction(function () use ($document, $stage, $slaExpiresAt, $approvers, $priorityRank) {
+        DB::transaction(function () use ($document, $stage, $slaExpiresAt, $approvers, $priorityRank, $auditMessage) {
             foreach ($approvers as $approver) {
                 $assignment = DocumentAssignment::create([
                     'document_id' => $document->document_id,
@@ -886,11 +991,107 @@ class WorkflowService
                 }
             }
 
-            AuditLog::record(null, $document->document_id, 'route',
-                "Stage '{$stage->stage_name}': assigned to all {$approvers->count()} eligible approver(s) " .
-                "(category '{$document->ml_category}') — {$approvers->pluck('full_name')->implode(', ')}. " .
-                "SLA window expires {$slaExpiresAt->toDayDateTimeString()} for each; the stage completes once every one has responded.");
+            AuditLog::record(null, $document->document_id, 'route', $auditMessage);
         });
+    }
+
+    /**
+     * Feature: originator-directed approval routing — the originator
+     * hand-picks the approver(s) for THIS document instead of letting
+     * the automatic, category-driven pipeline decide (see
+     * routeToWorkflow()). Creates one document-scoped WorkflowStage
+     * (document_id set — see that column's migration docblock) with
+     * exactly the chosen approvers as its seats, then reuses the exact
+     * same assignment/notification/SLA/escalation machinery every other
+     * stage already goes through via createAssignmentsForApprovers() —
+     * from DocumentAssignment/completeStage()'s point of view this is an
+     * ordinary stage, it just happens to belong to one document rather
+     * than a whole category. Approval still needs every seat to agree;
+     * a rejection still needs a majority (DocumentAssignment::
+     * stageRejectionStatus() already generalizes to any seat count) —
+     * no separate voting logic needed for this path.
+     *
+     * $approverIds is trusted here — the caller (DocumentController::
+     * routeCustom()) is responsible for validating each id is a real,
+     * active approver actually eligible for this document (or, for a
+     * document flagged desired_routing 'unrelated', any active approver at
+     * all — see eligibleApproversForCategory()'s docblock).
+     *
+     * @param  array<int>  $approverIds
+     */
+    /**
+     * What to call the one-off stage routeToCustomApprovers() creates —
+     * the real stage(s) the picked approvers are actually tied to (the
+     * same info DocumentController::stagesLabelFor() already shows in the
+     * approver picker), not a generic placeholder. Approvers picked with
+     * no stage restriction of their own contribute nothing here (they're
+     * eligible for a category's whole pipeline, not one named stage), so
+     * this only ever falls back to "Direct Approval" when NONE of the
+     * picked approvers have a specific stage to point to.
+     */
+    private function deriveCustomStageName(Collection $approvers): string
+    {
+        $stageNames = $approvers
+            ->flatMap(fn (User $approver) => $approver->workflowStages()->pluck('stage_name'))
+            ->unique()
+            ->values();
+
+        return $stageNames->isNotEmpty() ? $stageNames->implode(', ') : 'Direct Approval';
+    }
+
+    public function routeToCustomApprovers(DocumentRepository $document, array $approverIds, User $originator): void
+    {
+        $this->extendDueDateIfReviewQueueAteTheBuffer($document);
+
+        $approvers = User::where('role', 'approver')->where('is_active', true)->whereIn('user_id', $approverIds)->get();
+
+        $stage = WorkflowStage::create([
+            'document_id' => $document->document_id,
+            'document_category' => $document->ml_category,
+            'stage_name' => $this->deriveCustomStageName($approvers),
+            'sequence_order' => 1,
+        ]);
+
+        $slaExpiresAt = $this->computeApproverSlaExpiry($document);
+
+        $this->createAssignmentsForApprovers($document, $stage, $approvers, $slaExpiresAt,
+            "'{$document->title}' routed directly by {$originator->full_name} to {$approvers->count()} hand-picked " .
+            "approver(s), bypassing the standard pipeline — {$approvers->pluck('full_name')->implode(', ')}. " .
+            "SLA window expires {$slaExpiresAt->toDayDateTimeString()} for each; approval still needs every one of " .
+            'them, a rejection still needs a majority.');
+
+        $document->pending_custom_routing_at = null;
+        $document->custom_routed = true;
+        $document->save();
+
+        event(new DocumentStatusChanged($document));
+    }
+
+    /**
+     * Every approver eligible for AT LEAST ONE configured stage of
+     * $category — the pool an originator picks from when routing a
+     * known-category document directly (routeToCustomApprovers()). A
+     * union across every stage rather than one specific stage's own
+     * eligible list (eligibleApproversForStage()), since the originator
+     * is choosing who handles the WHOLE document, not seating one
+     * particular stage. Falls back to every active approver assigned to
+     * the category at all if it has no configured pipeline yet (mirrors
+     * routeToWorkflow()'s own "no configured pipeline" fallback).
+     *
+     * @return Collection<int, User>
+     */
+    public function eligibleApproversForCategory(string $category): Collection
+    {
+        $stages = WorkflowStage::configured()->forCategory($category)->where('is_archived', false)->get();
+
+        if ($stages->isEmpty()) {
+            return User::where('role', 'approver')->where('is_active', true)->where('assigned_category', $category)->get();
+        }
+
+        return $stages
+            ->flatMap(fn (WorkflowStage $stage) => $this->eligibleApproversForStage($category, $stage))
+            ->unique('user_id')
+            ->values();
     }
 
     /**
@@ -914,7 +1115,7 @@ class WorkflowService
             ->where('assignment_id', '!=', $assignment->assignment_id)
             ->pluck('user_id');
 
-        $candidates = $this->eligibleApproversForStage($assignment->document, $assignment->stage)
+        $candidates = $this->eligibleApproversForStage($assignment->document->ml_category, $assignment->stage)
             ->reject(fn (User $approver) => $alreadyHoldingASeat->contains($approver->user_id))
             ->values();
 
@@ -1054,7 +1255,39 @@ class WorkflowService
      */
     public function adminDecideUnassigned(DocumentAssignment $assignment, User $admin, string $decision, ?string $comments = null): void
     {
-        DB::transaction(function () use ($assignment, $admin, $decision, $comments) {
+        $this->applyAdminDecision($assignment, $admin, $decision, $comments,
+            "Admin {$admin->full_name} decided stage '{$assignment->stage->stage_name}' directly (no approver " .
+            "was eligible) -> {$decision}." . ($comments ? " Notes: {$comments}" : ''));
+    }
+
+    /**
+     * The Workflow Config page's own "decide this pending assignment
+     * directly" action — unlike adminDecideUnassigned() above, this
+     * applies to an assignment that DOES have a real, eligible approver
+     * already holding it; an Admin is stepping in ahead of them (e.g. to
+     * unblock something without waiting for SLA escalation), not
+     * covering for a stage nobody could be assigned to. Distinct audit
+     * wording from adminDecideUnassigned() so the two cases never read
+     * as the same thing in the trail.
+     */
+    public function adminOverrideAssignment(DocumentAssignment $assignment, User $admin, string $decision, ?string $comments = null): void
+    {
+        $this->applyAdminDecision($assignment, $admin, $decision, $comments,
+            "Admin {$admin->full_name} decided stage '{$assignment->stage->stage_name}' directly, overriding " .
+            ($assignment->approver->full_name ?? 'the assigned approver') . " -> {$decision}." .
+            ($comments ? " Notes: {$comments}" : ''));
+    }
+
+    /**
+     * Shared by both "Admin decides a pending assignment directly" paths
+     * above — same mechanics either way (mark it decided, close out
+     * whatever review session was open, log it, run it through the same
+     * completeStage() every other decision goes through, notify the
+     * originator), just different circumstances and audit wording.
+     */
+    private function applyAdminDecision(DocumentAssignment $assignment, User $admin, string $decision, ?string $comments, string $auditMessage): void
+    {
+        DB::transaction(function () use ($assignment, $admin, $decision, $comments, $auditMessage) {
             $assignment->admin_override_at = now();
             $assignment->admin_override_by = $admin->user_id;
             $assignment->individual_status = $decision;
@@ -1065,9 +1298,7 @@ class WorkflowService
 
             $document = $assignment->document;
             DocumentReviewSession::closeFor($document, $admin);
-            AuditLog::record($admin->user_id, $document->document_id, 'admin_override',
-                "Admin {$admin->full_name} decided stage '{$assignment->stage->stage_name}' directly (no approver " .
-                "was eligible) -> {$decision}." . ($comments ? " Notes: {$comments}" : ''));
+            AuditLog::record($admin->user_id, $document->document_id, 'admin_override', $auditMessage);
 
             $this->completeStage($assignment, $decision);
 
@@ -1165,6 +1396,134 @@ class WorkflowService
     }
 
     /**
+     * Request Revision — creates the DocumentAnnotation and notifies the
+     * originator with exactly what was flagged. Deliberately does not
+     * touch $assignment's individual_status or call completeStage(): the
+     * requesting approver hasn't decided yet (and may never need to
+     * reject — that's the whole point), and nothing about the rest of
+     * the document's review is affected.
+     */
+    public function requestRevision(DocumentAssignment $assignment, User $approver, array $data): DocumentAnnotation
+    {
+        return DB::transaction(function () use ($assignment, $approver, $data) {
+            $document = $assignment->document;
+            $stage = $assignment->stage;
+
+            $annotation = DocumentAnnotation::create([
+                'document_id' => $document->document_id,
+                'assignment_id' => $assignment->assignment_id,
+                'raised_by' => $approver->user_id,
+                'start_offset' => $data['start_offset'],
+                'end_offset' => $data['end_offset'],
+                'selected_text' => $data['selected_text'],
+                'comment' => $data['comment'],
+            ]);
+
+            AuditLog::record($approver->user_id, $document->document_id, 'revision_requested',
+                "Stage '{$stage->stage_name}' — {$approver->full_name} flagged a passage of '{$document->title}' for " .
+                "revision: \"{$data['comment']}\"");
+
+            NotificationRecord::send($document->originator_id, $document->document_id,
+                "{$approver->full_name} flagged a passage of '{$document->title}' (stage '{$stage->stage_name}') needing " .
+                "revision: \"{$data['comment']}\" — the flagged text: \"{$data['selected_text']}\"", 'high');
+
+            // Reuses the same broadcast saveDocumentRevision() below
+            // already fires, rather than a new event — without this, the
+            // originator's Document Tracking page (and any approver with
+            // "Review & Comment" already open on this document — see the
+            // matching live-sync listener in approver/dashboard.blade.php)
+            // wouldn't notice this new flag until their next background
+            // poll instead of right away.
+            event(new DocumentStatusChanged($document));
+
+            return $annotation;
+        });
+    }
+
+    /**
+     * An approver retracts their own not-yet-addressed flag (Feature:
+     * "I flagged the wrong thing" / "never mind" — the mirror image of
+     * requestRevision() above). Deleted outright rather than soft-marked
+     * resolved — a withdrawal was never actually addressed by the
+     * originator, so it shouldn't read as one in the Document Tracker;
+     * see DocumentMovementTimeline's 'revision_withdrawn' action_type,
+     * which carries its own distinct audit trail entry regardless.
+     *
+     * Authorization (only the approver who raised it, and only while
+     * it's still open) is the caller's responsibility — see
+     * DocumentAnnotationPolicy::withdraw(), checked in
+     * ApprovalController::withdrawAnnotation() before this is ever
+     * called, same division of responsibility every other Workflow
+     * Service method here already assumes.
+     */
+    public function withdrawAnnotation(DocumentAnnotation $annotation, User $approver): void
+    {
+        DB::transaction(function () use ($annotation, $approver) {
+            $document = $annotation->document;
+            $stage = $annotation->assignment->stage;
+            $comment = $annotation->comment;
+
+            $annotation->delete();
+
+            AuditLog::record($approver->user_id, $document->document_id, 'revision_withdrawn',
+                "Stage '{$stage->stage_name}' — {$approver->full_name} withdrew their flagged revision request on " .
+                "'{$document->title}': \"{$comment}\"");
+
+            NotificationRecord::send($document->originator_id, $document->document_id,
+                "{$approver->full_name} withdrew their revision request on '{$document->title}' (stage " .
+                "'{$stage->stage_name}') — the flagged passage no longer needs addressing: \"{$comment}\"", 'normal');
+
+            event(new DocumentStatusChanged($document));
+        });
+    }
+
+    /**
+     * The originator edits the document's plain text directly (Feature:
+     * "editable document" — see requestRevision()'s docblock) and marks
+     * which open annotations this save addresses. Only ids that are (a)
+     * on THIS document and (b) still unresolved get closed — anything
+     * else in $resolvedAnnotationIds (already resolved, or belonging to
+     * a different document entirely) is silently ignored rather than
+     * erroring, since the originator's own UI only ever offers the
+     * annotations that are actually open on this document to begin with.
+     */
+    public function saveDocumentRevision(DocumentRepository $document, User $originator, string $text, array $resolvedAnnotationIds): void
+    {
+        DB::transaction(function () use ($document, $originator, $text, $resolvedAnnotationIds) {
+            // A submitted <textarea> value can reintroduce \r\n depending
+            // on the browser — see TextExtractionService::
+            // normalizeLineEndings()'s docblock for why leaving that in
+            // would throw off every future flagged-passage offset again.
+            $document->ocr_text = TextExtractionService::normalizeLineEndings($text);
+            $document->save();
+
+            AuditLog::record($originator->user_id, $document->document_id, 'revision_saved',
+                "{$originator->full_name} revised the text of '{$document->title}'.");
+
+            $resolved = DocumentAnnotation::where('document_id', $document->document_id)
+                ->whereNull('resolved_at')
+                ->whereIn('annotation_id', $resolvedAnnotationIds)
+                ->with(['raisedBy', 'assignment.stage'])
+                ->get();
+
+            foreach ($resolved as $annotation) {
+                $annotation->resolved_at = now();
+                $annotation->save();
+
+                // Straight to the specific approver who raised THIS
+                // annotation — not every approver on the document, and
+                // not a blanket "document resubmitted" notice, since
+                // that's exactly the noise this feature exists to avoid.
+                NotificationRecord::send($annotation->raised_by, $document->document_id,
+                    "'{$document->title}' (stage '{$annotation->assignment->stage->stage_name}') was revised to address " .
+                    "your flagged concern: \"{$annotation->comment}\" — please re-review.", 'high');
+            }
+
+            event(new DocumentStatusChanged($document));
+        });
+    }
+
+    /**
      * Resolves a stage once one of its seats has been decided (by an
      * approver in decide(), by an Admin in SlaService::adminOverride(), or
      * automatically by SlaService::autoApproveOne()). Since a stage can now
@@ -1183,14 +1542,38 @@ class WorkflowService
         $stage = $assignment->stage;
 
         if ($decision === 'rejected') {
+            // Majority vote (Feature: one lone reject on a multi-approver
+            // stage no longer terminates the document out from under
+            // whoever else is still reviewing it — see
+            // DocumentAssignment::stageRejectionStatus()'s docblock for
+            // the exact threshold math). A single-approver stage is
+            // unaffected: threshold is 1, so this decision already IS
+            // the whole vote, same as always.
+            $voteStatus = $assignment->stageRejectionStatus();
+
+            if (!$voteStatus['majorityReached']) {
+                // Not enough reject votes yet — record stays as this
+                // seat's own decision (already saved by decide() before
+                // calling here), but nothing cascades. The rest of this
+                // stage (and the document) stays exactly as it was,
+                // still able to go either way once the remaining seats
+                // decide.
+                NotificationRecord::send($assignment->user_id, $document->document_id,
+                    "Your rejection of '{$document->title}' (stage '{$stage->stage_name}') needs support from other " .
+                    "reviewers on this stage before it takes effect — {$voteStatus['rejected']} of {$voteStatus['threshold']} " .
+                    'needed. If you have a specific problem, consider flagging it instead of rejecting outright.');
+
+                return;
+            }
+
             // Rejection terminates the WHOLE document — close every other
             // pending assignment across ALL stages (including any other
             // still-pending seat on THIS SAME stage — this query has no
             // stage_id filter, so it already correctly cascades to
             // same-stage siblings, not just other stages), since every
             // stage is routed up front and more than one can be pending at
-            // once. Any single rejection, from any seat on any stage,
-            // kills the whole document — unchanged behavior.
+            // once. Majority having been reached above, this now cascades
+            // exactly like the old any-single-reject behavior did.
             DocumentAssignment::where('document_id', $document->document_id)
                 ->where('individual_status', 'pending')
                 ->where('assignment_id', '!=', $assignment->assignment_id)
@@ -1226,6 +1609,43 @@ class WorkflowService
             return;
         }
 
+        // A fresh approval can strand an earlier minority reject on this
+        // same stage — majority was never reached for it, and now
+        // (thanks to THIS approval) it mathematically never can be
+        // either. Rather than leave that seat sitting on a reject that
+        // can no longer do anything — which would also permanently block
+        // the unanimous-approval finalize check below, since a stranded
+        // 'rejected' seat is neither pending nor approved — reset it back
+        // to pending so its holder decides what to do next themselves:
+        // approve it, or raise a real concern through Request Revision.
+        if ($decision === 'approved') {
+            $voteStatus = $assignment->stageRejectionStatus();
+
+            if ($voteStatus['rejected'] > 0 && !$voteStatus['rejectStillPossible']) {
+                DocumentAssignment::where('document_id', $document->document_id)
+                    ->where('stage_id', $stage->stage_id)
+                    ->where('individual_status', 'rejected')
+                    ->get()
+                    ->each(function (DocumentAssignment $stranded) use ($document, $stage, $voteStatus) {
+                        $stranded->individual_status = 'pending';
+                        $stranded->comments = null;
+                        $stranded->acted_at = null;
+                        $stranded->save();
+
+                        AuditLog::record(null, $document->document_id, 'reject_stranded',
+                            "Stage '{$stage->stage_name}' on '{$document->title}' — {$stranded->approver->full_name}'s " .
+                            "rejection could no longer take effect after {$voteStatus['approved']} other reviewer(s) " .
+                            'approved; reset to pending so they can decide again.');
+
+                        NotificationRecord::send($stranded->user_id, $document->document_id,
+                            "Your rejection of '{$document->title}' (stage '{$stage->stage_name}') can no longer take effect — " .
+                            "{$voteStatus['approved']} other reviewer(s) already approved it. You can approve it yourself, or " .
+                            'use Request Revision if you still have a specific concern to flag.',
+                            'high');
+                    });
+            }
+        }
+
         // NEW gate: this STAGE isn't done until every seat on it (every
         // approver assigned to this exact document+stage) is non-pending —
         // not just this one. Until then, nothing else below has anything
@@ -1250,8 +1670,13 @@ class WorkflowService
         // Safety net only: every stage is normally already assigned at
         // upload time (see routeToWorkflow()). This only fires if a stage
         // was added to the category's pipeline after this document was
-        // already routed, so it still gets picked up.
-        $nextStage = WorkflowStage::where('document_category', $document->ml_category)
+        // already routed, so it still gets picked up. A one-off,
+        // document-scoped stage (see routeToCustomApprovers()) never has
+        // a "next" one — it IS the whole pipeline for that document —
+        // and ->configured() below would incorrectly find a REAL next
+        // stage sharing the same document_category otherwise.
+        $nextStage = $stage->document_id ? null : WorkflowStage::configured()
+            ->where('document_category', $document->ml_category)
             ->where('is_archived', false)
             ->where('sequence_order', '>', $stage->sequence_order)
             ->orderBy('sequence_order')
